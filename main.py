@@ -444,6 +444,22 @@ def _message_text(message: dict) -> str:
     return ""
 
 
+def _extract_client_system_text(messages: list) -> str:
+    """提取客户端自带的 system 消息文本（兼容字符串与多模态数组格式）。
+
+    部分客户端（如 rikkahub 及其二改版）把工具列表和使用指引写在 system prompt 里，
+    分区模式重建 messages 时若直接丢弃，会导致模型"不知道有什么工具"。
+    """
+    parts = []
+    for message in messages:
+        if message.get("role") != "system":
+            continue
+        text = _message_text(message).strip()
+        if text:
+            parts.append(text)
+    return "\n\n".join(parts)
+
+
 def _is_title_generation_request(messages: list) -> bool:
     """Detect client-side title generation prompts that must not enter chat history."""
     user_texts = [
@@ -1241,6 +1257,11 @@ async def _chat_completions_inner(request: Request):
         partition_prompt = SYSTEM_PROMPT
         if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and MAX_MEMORIES_INJECT > 0:
             partition_prompt = (SYSTEM_PROMPT or "") + MEMORY_USAGE_GUIDE
+        # 保留客户端自带的 system（工具说明等），拼接到网关 prompt 之后，
+        # 与非分区路径的行为对齐（前端 system 稳定时不影响 BP1 缓存命中）
+        client_system_text = _extract_client_system_text(messages)
+        if client_system_text:
+            partition_prompt = ((partition_prompt or "") + "\n\n" + client_system_text).strip()
         messages = await build_partitioned_messages(
             session_id, all_msgs, partition_prompt, user_message
         )
