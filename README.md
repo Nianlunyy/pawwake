@@ -98,8 +98,8 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 |---------|------|------|
 | `DATABASE_URL` | PostgreSQL 连接字符串 | `postgresql://user:pass@host:port/db` |
 | `MEMORY_ENABLED` | 开启记忆 | `true` |
-| `MEMORY_MODEL` | 提取记忆用的模型（推荐便宜的小模型）。用推理模型时思考会占掉输出额度，需同时调高 `MEMORY_MAX_TOKENS`，否则 JSON 收尾前被截断 | `anthropic/claude-haiku-4.5` |
-| `MEMORY_MAX_TOKENS（可选）` | 记忆提取的输出上限。日志出现"未找到JSON数组"且提示可能被截断时调高此项 | `4000` |
+| `MEMORY_MODEL` | 记忆提取、评分、整理共用的模型（推荐便宜的小模型），留空回退到内置默认 | `anthropic/claude-haiku-4.5` |
+| `MEMORY_MAX_TOKENS（可选）` | 记忆提取、评分和整理的输出上限。日志出现"未找到JSON数组"且提示可能被截断时调高此项 | `4000` |
 | `MAX_MEMORIES_INJECT` | 每次注入的最大记忆条数 | `15` |
 | `MIN_SCORE_THRESHOLD` | 记忆搜索最低分数阈值，低于此分数的记忆不注入（0=不过滤） | `0.15` |
 | `MEMORY_EXTRACT_INTERVAL` | 记忆提取间隔（0=禁用/1=每轮/N=每N轮） | `1` |
@@ -150,6 +150,7 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 | `CACHE_PARTITION_ENABLED` | 分区缓存开关 | `true` |
 | `CACHE_PARTITION_X` | 轮转周期（轮数）。1轮 = 一次用户发言 + AI回复。B 区攒满 X 轮触发，首次需先装满 A、B 两区共 2X 轮 | `15` |
 | `CACHE_SUMMARY_MODEL` | 摘要模型。**留空 = 不生成摘要**，轮转时旧消息直接滑出上下文（纯轮转模式）。从旧版本升级的用户注意：旧版此项有默认模型，新版默认为空，需要摘要请显式配置。不建议使用推理模型（思考可能耗尽输出token导致摘要为空） | 空 |
+| `CACHE_SUMMARY_MAX_TOKENS`（可选） | 摘要的输出上限，日志出现"摘要生成失败: 模型返回空content"且 `finish_reason=length` 时调高此项 | `2000` |
 | `PARTITION_SESSION_ID` | 固定的 session ID | `my-thread` |
 | `CACHE_PARTITION_TRIGGER`（可选） | 轮转触发方式：`rounds`（按轮次，默认）或 `time`（按时间窗口，适合微信等消息频率高的场景） | `rounds` |
 | `CACHE_PARTITION_WINDOW`（可选） | 时间窗口（分钟），仅 `trigger=time` 时生效。窗口内的消息不触发摘要压缩 | `30` |

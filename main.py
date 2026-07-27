@@ -71,6 +71,7 @@ MEMORY_EXTRACT_ENABLED = os.getenv("MEMORY_EXTRACT_ENABLED", "true").lower() == 
 CACHE_PARTITION_ENABLED = os.getenv("CACHE_PARTITION_ENABLED", "false").lower() == "true"
 CACHE_PARTITION_X = int(os.getenv("CACHE_PARTITION_X", "15"))
 CACHE_SUMMARY_MODEL = os.getenv("CACHE_SUMMARY_MODEL", "")  # 留空=不生成摘要，轮转时A区直接滑出（纯轮转模式）
+CACHE_SUMMARY_MAX_TOKENS = int(os.getenv("CACHE_SUMMARY_MAX_TOKENS", "2000"))  # 摘要输出上限，跟记忆提取的 MEMORY_MAX_TOKENS 各管各的。失败日志拿它当分母
 CACHE_PARTITION_TRIGGER = os.getenv("CACHE_PARTITION_TRIGGER", "rounds")  # rounds=按轮次 | time=按时间窗口
 CACHE_PARTITION_WINDOW = int(os.getenv("CACHE_PARTITION_WINDOW", "30"))  # 时间窗口（分钟），仅 trigger=time 时生效
 CACHE_TTL = os.getenv("CACHE_TTL", "5m")  # 缓存TTL：5m(默认) | 1h。1h写入费2x(5m是1.25x)读都0.1x，消息间隔常超5分钟的慢聊场景1h更划算
@@ -105,6 +106,18 @@ MEMORY_API_KEY = os.getenv("MEMORY_API_KEY", "")
 
 def get_memory_api_key() -> str:
     return MEMORY_API_KEY or API_KEY
+
+def sync_memory_extractor_config():
+    """把配置推给 memory_extractor：它在 import 时就把这几个读成了自己的模块级全局，
+    之后改 os.environ 或 main 的 globals 都够不着，面板换了模型/换了 key，提取那边
+    还拿启动时那份跑。数据库恢复完和面板保存完各调一次。
+    MEMORY_MODEL 落回 DEFAULT_MEMORY_MODEL 而不是当前值：面板上这项写着"留空用默认"，
+    清空写进的是空串，落回当前值会让热更新沿用旧模型、重启后却变默认，前后分裂。"""
+    import memory_extractor as _me_mod
+    _me_mod.API_KEY = API_KEY
+    _me_mod.API_BASE_URL = API_BASE_URL
+    _me_mod.MEMORY_API_KEY = MEMORY_API_KEY
+    _me_mod.MEMORY_MODEL = os.environ.get("MEMORY_MODEL") or _me_mod.DEFAULT_MEMORY_MODEL
 
 # 额外的请求头（有些 API 需要，比如 OpenRouter 需要 Referer）
 EXTRA_REFERER = os.getenv("EXTRA_REFERER", "https://ai-memory-gateway.local")
@@ -214,6 +227,16 @@ async def lifespan(app: FastAPI):
                             if key in _ALLOW_EMPTY and key in _RESTORE_MAIN:
                                 globals()[key] = _RESTORE_MAIN[key]("")
                                 restored.append(key + "(显式空)")
+                            elif key == "MEMORY_MODEL":
+                                # 面板上这项写着"留空用默认"，重启后也得保持空，
+                                # 否则部署环境里的旧 MEMORY_MODEL 会把用户清空的操作顶回去
+                                os.environ["MEMORY_MODEL"] = ""
+                                restored.append(key + "(显式空)")
+                            elif key == "MEMORY_API_KEY":
+                                # 清空 = 回退到主 API_KEY（get_memory_api_key 的 or 分支）。
+                                # 只清全局值就够，各处读的都是它，os.environ 仅启动时读一次
+                                globals()[key] = ""
+                                restored.append(key + "(显式空)")
                             continue
                         if key in _RESTORE_MAIN:
                             globals()[key] = _RESTORE_MAIN[key](val)
@@ -230,6 +253,7 @@ async def lifespan(app: FastAPI):
                             _me_mod.MEMORY_API_KEY = str(val)
                             restored.append(key)
                     if restored:
+                        sync_memory_extractor_config()
                         print(f"🔄 从数据库恢复 {len(restored)} 项面板配置: {', '.join(restored)}")
             except Exception as e:
                 print(f"[warning] 恢复面板配置失败: {e}")
@@ -565,22 +589,45 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
             response = await client.post(API_BASE_URL, headers=headers, json={
                 "model": CACHE_SUMMARY_MODEL,
                 # 推理模型的思考也消耗max_tokens，给足空间避免content为空
-                "max_tokens": 2000,
+                "max_tokens": CACHE_SUMMARY_MAX_TOKENS,
                 "messages": [{"role": "user", "content": prompt}],
             })
             if response.status_code == 200:
                 data = response.json()
                 if "choices" in data:
                     # 推理模型偶发返回content为None（思考吃光token或只返回reasoning_content）
-                    content = data["choices"][0]["message"].get("content") or ""
+                    # 空列表和缺字段都得接住：这条路走下去就是异常日志，它自己不能再抛
+                    choice = (data.get("choices") or [{}])[0]
+                    message = choice.get("message") or {}
+                    content = message.get("content") or ""
                     summary = content.strip()
                     if summary:
                         print(f"📝 摘要生成完成: {len(summary)}字 (压缩{len(messages)}条消息)")
                         return summary
-                    print(f"⚠️ 摘要生成失败: 模型返回空content（推理模型思考可能吃光了max_tokens），本次轮转将推迟重试")
+
+                    # 空content分不清是额度被思考吃光还是模型没给答案，把上游的判据一起打出来
+                    finish_reason = choice.get("finish_reason")
+                    usage = data.get("usage") or {}
+                    completion_tokens = usage.get("completion_tokens")
+                    reasoning_tokens = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+                    usage_part = (
+                        f"，completion_tokens={completion_tokens}/{CACHE_SUMMARY_MAX_TOKENS}"
+                        if completion_tokens is not None else "，usage 未提供"
+                    )
+                    # 推理 0 是上游给的答案，不是没给。用 or 判断会把它退化成拿字符数瞎猜
+                    if reasoning_tokens is not None:
+                        usage_part += f"（其中推理 {reasoning_tokens}）"
+                    else:
+                        reasoning_text = message.get("reasoning_content") or message.get("reasoning") or ""
+                        if reasoning_text:
+                            usage_part += f"（上游未给推理token，reasoning正文 {len(reasoning_text)} 字符）"
+                    print(
+                        f"⚠️ 摘要生成失败: 模型返回空content, model={CACHE_SUMMARY_MODEL}, "
+                        f"finish_reason={finish_reason}{usage_part}，本次轮转将推迟重试"
+                    )
                     return ""
 
-        print(f"⚠️ 摘要生成失败: HTTP {response.status_code}")
+        print(f"⚠️ 摘要生成失败: HTTP {response.status_code}, model={CACHE_SUMMARY_MODEL}: {response.text[:500]}")
         return ""
     except Exception as e:
         print(f"⚠️ 摘要生成异常: {e}")
@@ -1724,8 +1771,13 @@ async def consolidate_memories_for_date_range(start_date, end_date):
     # 调用 AI 进行整理
     prompt = CONSOLIDATION_PROMPT.format(fragments=fragments_text)
     
-    # 使用环境变量配置的模型，默认 haiku 节省成本
-    consolidation_model = os.getenv("MEMORY_MODEL", "") or os.getenv("DEFAULT_MODEL", "anthropic/claude-haiku-4.5")
+    # 跟提取、评分共用同一份模型配置，面板热更新也一起跟。
+    # 别 fallback 到 DEFAULT_MODEL，那是主聊天模型，拿它跑后台批处理会按主力模型计价
+    import memory_extractor as _me_mod
+    consolidation_model = _me_mod.MEMORY_MODEL
+    # 跟提取、评分同一个模型同一类活（都输出 JSON 数组），共用 MEMORY_MAX_TOKENS。
+    # 这里现取不缓存，跟上面取模型一个路子，配置改了下次调用就生效
+    consolidation_max_tokens = int(os.getenv("MEMORY_MAX_TOKENS", "4000"))
     
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
@@ -1741,7 +1793,7 @@ async def consolidate_memories_for_date_range(start_date, end_date):
                     json={
                         "model": consolidation_model,
                         "messages": [{"role": "user", "content": prompt}],
-                        "max_tokens": 2000
+                        "max_tokens": consolidation_max_tokens
                     }
                 )
 
@@ -1793,7 +1845,7 @@ async def consolidate_memories_for_date_range(start_date, end_date):
                                 json={
                                     "model": consolidation_model,
                                     "messages": [{"role": "user", "content": f"请修复以下JSON的语法错误，只输出修复后的JSON数组，不要其他内容：\n{json_str[:2000]}"}],
-                                    "max_tokens": 2000
+                                    "max_tokens": consolidation_max_tokens
                                 }
                             )
                             if fix_resp.status_code == 200:
@@ -2753,6 +2805,9 @@ async def save_settings(request: Request):
 
             else:
                 skipped.append(key)
+
+        if updated:
+            sync_memory_extractor_config()
 
         return {
             "status": "ok",

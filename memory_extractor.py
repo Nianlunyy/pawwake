@@ -20,11 +20,14 @@ API_BASE_URL = os.getenv("API_BASE_URL", "https://openrouter.ai/api/v1/chat/comp
 MEMORY_API_KEY = os.getenv("MEMORY_API_KEY", "")
 
 # 用来提取记忆的模型（便宜的就行）
-MEMORY_MODEL = os.getenv("MEMORY_MODEL", "anthropic/claude-haiku-4")
+# 面板上这项写着"留空用默认"，清空会写进一个空串，os.getenv 的默认值这时不生效，
+# 所以默认值单独拎出来用 or 兜，热更新和重启后行为才一致
+DEFAULT_MEMORY_MODEL = "anthropic/claude-haiku-4.5"
+MEMORY_MODEL = os.getenv("MEMORY_MODEL") or DEFAULT_MEMORY_MODEL
 
 # 记忆提取的输出上限，原先硬编码 1000。部分上游会把 reasoning token
 # 也算进这条额度，JSON 可能在收尾前被截断，表面只报"未找到JSON数组"
-MEMORY_MAX_TOKENS = int(os.getenv("MEMORY_MAX_TOKENS", "2000"))
+MEMORY_MAX_TOKENS = int(os.getenv("MEMORY_MAX_TOKENS", "4000"))
 
 def get_memory_api_key() -> str:
     return MEMORY_API_KEY or API_KEY
@@ -39,7 +42,7 @@ def _diagnose_incomplete(finish_reason, completion_tokens, reasoning_tokens) -> 
         )
 
     if isinstance(completion_tokens, int) and completion_tokens >= MEMORY_MAX_TOKENS:
-        extra = f"，其中推理 {reasoning_tokens}" if reasoning_tokens else ""
+        extra = f"，其中推理 {reasoning_tokens}" if reasoning_tokens is not None else ""
         return (
             f"输出很可能被切断（completion_tokens={completion_tokens}{extra}，已顶到上限 {MEMORY_MAX_TOKENS}）。"
             "先调高 MEMORY_MAX_TOKENS 再看。注意各家 usage 口径不一，这条是强证据但不是铁证"
@@ -167,7 +170,7 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
             )
 
             if response.status_code != 200:
-                print(f"⚠️  记忆提取请求失败: {response.status_code}")
+                print(f"⚠️  记忆提取请求失败: {response.status_code}, model={MEMORY_MODEL}: {response.text[:500]}")
                 return []
 
             data = response.json()
@@ -182,7 +185,7 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
 
             # 正文截断防刷屏，但长度和停止原因要给全，否则分不清是日志截断还是真截断
             usage_part = f"，completion_tokens={completion_tokens}/{MEMORY_MAX_TOKENS}" if completion_tokens is not None else "，usage 未提供"
-            if reasoning_tokens:
+            if reasoning_tokens is not None:
                 usage_part += f"（其中推理 {reasoning_tokens}）"
             print(
                 f"📝 记忆模型原始返回（{len(text)} 字符，finish_reason={finish_reason}{usage_part}）:\n{text[:500]}",
@@ -294,12 +297,13 @@ async def score_memories(texts: List[str]) -> List[Dict]:
                     "model": MEMORY_MODEL,
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0,
-                    "max_tokens": 4000,
+                    # 跟提取同一个模型同一类活，跟着同一个配置走；写死会让用户调了也不生效
+                    "max_tokens": MEMORY_MAX_TOKENS,
                 },
             )
 
             if response.status_code != 200:
-                print(f"⚠️  记忆评分请求失败: {response.status_code}")
+                print(f"⚠️  记忆评分请求失败: {response.status_code}, model={MEMORY_MODEL}: {response.text[:500]}")
                 # 失败时返回默认分数
                 return [{"content": t, "importance": 5} for t in texts]
 
