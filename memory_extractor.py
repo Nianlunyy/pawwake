@@ -24,7 +24,7 @@ MEMORY_MODEL = os.getenv("MEMORY_MODEL", "anthropic/claude-haiku-4")
 
 # 记忆提取的输出上限，原先硬编码 1000。部分上游会把 reasoning token
 # 也算进这条额度，JSON 可能在收尾前被截断，表面只报"未找到JSON数组"
-MEMORY_MAX_TOKENS = int(os.getenv("MEMORY_MAX_TOKENS", "4000"))
+MEMORY_MAX_TOKENS = int(os.getenv("MEMORY_MAX_TOKENS", "2000"))
 
 def get_memory_api_key() -> str:
     return MEMORY_API_KEY or API_KEY
