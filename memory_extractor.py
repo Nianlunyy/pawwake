@@ -22,8 +22,36 @@ MEMORY_API_KEY = os.getenv("MEMORY_API_KEY", "")
 # 用来提取记忆的模型（便宜的就行）
 MEMORY_MODEL = os.getenv("MEMORY_MODEL", "anthropic/claude-haiku-4")
 
+# 记忆提取的输出上限，原先硬编码 1000。部分上游会把 reasoning token
+# 也算进这条额度，JSON 可能在收尾前被截断，表面只报"未找到JSON数组"
+MEMORY_MAX_TOKENS = int(os.getenv("MEMORY_MAX_TOKENS", "4000"))
+
 def get_memory_api_key() -> str:
     return MEMORY_API_KEY or API_KEY
+
+
+def _diagnose_incomplete(finish_reason, completion_tokens, reasoning_tokens) -> str:
+    """JSON 收不了尾时，判断是截断还是格式不符。证据不足就返回"无法判定"，不硬猜"""
+    if finish_reason == "length":
+        return (
+            f"输出被上限切断（上游明确报 finish_reason=length，当前 MEMORY_MAX_TOKENS={MEMORY_MAX_TOKENS}）。"
+            "调高该值；模型若带推理模式，推理 token 也占这条额度"
+        )
+
+    if isinstance(completion_tokens, int) and completion_tokens >= MEMORY_MAX_TOKENS:
+        extra = f"，其中推理 {reasoning_tokens}" if reasoning_tokens else ""
+        return (
+            f"输出很可能被切断（completion_tokens={completion_tokens}{extra}，已顶到上限 {MEMORY_MAX_TOKENS}）。"
+            "先调高 MEMORY_MAX_TOKENS 再看。注意各家 usage 口径不一，这条是强证据但不是铁证"
+        )
+
+    if finish_reason == "stop":
+        return "上游报正常结束，是模型没按 JSON 格式输出。检查提示词，或换一个更听话的模型"
+
+    return (
+        f"原因无法判定：上游没给 finish_reason（={finish_reason}），usage 也证明不了是否触顶。"
+        "先确认中转站是否返回这两个字段，再谈是截断还是格式问题"
+    )
 
 
 EXTRACTION_PROMPT = """你是信息提取专家，负责从对话中识别并提取值得长期记住的关键信息。
@@ -130,7 +158,7 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
                 },
                 json={
                     "model": MEMORY_MODEL,
-                    "max_tokens": 1000,
+                    "max_tokens": MEMORY_MAX_TOKENS,
                     "messages": [
                         {"role": "system", "content": prompt},
                         {"role": "user", "content": f"请从以下对话中提取新的记忆：\n\n{conversation_text}"},
@@ -143,12 +171,26 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
                 return []
 
             data = response.json()
-            text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            choice = (data.get("choices") or [{}])[0]
+            text = (choice.get("message") or {}).get("content") or ""
+            finish_reason = choice.get("finish_reason")
 
-            # 打印模型原始返回（截断防刷屏）
-            print(f"📝 记忆模型原始返回:\n{text[:500]}", flush=True)
+            # usage 各家口径不同（推理 token 有的单列有的算进 completion），只当佐证
+            usage = data.get("usage") or {}
+            completion_tokens = usage.get("completion_tokens")
+            reasoning_tokens = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
 
-            # 清理可能的 markdown 格式
+            # 正文截断防刷屏，但长度和停止原因要给全，否则分不清是日志截断还是真截断
+            usage_part = f"，completion_tokens={completion_tokens}/{MEMORY_MAX_TOKENS}" if completion_tokens is not None else "，usage 未提供"
+            if reasoning_tokens:
+                usage_part += f"（其中推理 {reasoning_tokens}）"
+            print(
+                f"📝 记忆模型原始返回（{len(text)} 字符，finish_reason={finish_reason}{usage_part}）:\n{text[:500]}",
+                flush=True,
+            )
+
+            # 清理可能的 markdown 格式（原始长度留给报错用，免得日志里两个数对不上）
+            raw_len = len(text)
             text = text.strip()
             if text.startswith("```json"):
                 text = text[7:]
@@ -173,11 +215,25 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
                         print(f"⚠️  记忆提取结果解析失败: {e}")
                         return []
                 else:
-                    print(f"⚠️  记忆提取结果中未找到JSON数组")
+                    # 不要补上收尾的 ]：断掉的可能是半个字符串，
+                    # 补完只会把残缺内容伪装成一条有效记忆存进库
+                    print(
+                        f"⚠️  记忆提取结果中未找到完整 JSON 数组（共 {raw_len} 字符），本轮跳过\n"
+                        f"    {_diagnose_incomplete(finish_reason, completion_tokens, reasoning_tokens)}"
+                    )
                     return []
 
             if not isinstance(memories, list):
                 return []
+
+            # 模型可能先吐完一个完整数组再被切断，解析成功也未必没丢东西
+            if finish_reason == "length" or (
+                isinstance(completion_tokens, int) and completion_tokens >= MEMORY_MAX_TOKENS
+            ):
+                print(
+                    f"⚠️  本次解析成功，但上游显示输出已顶到上限 {MEMORY_MAX_TOKENS}，"
+                    "后面可能还有没写完的记忆。建议调高 MEMORY_MAX_TOKENS"
+                )
 
             # 验证格式
             valid_memories = []
