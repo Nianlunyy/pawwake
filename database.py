@@ -1514,6 +1514,109 @@ async def deactivate_memories(memory_ids: list):
         """, memory_ids)
 
 
+async def create_consolidated_events(events: list, expected_fragment_ids: list):
+    """原子地创建整理事件并归档被完整覆盖的来源碎片。
+
+    模型结果必须完整且唯一地覆盖 expected_fragment_ids。事务开始后再次锁定并
+    验证所有来源仍是活跃碎片，避免并发整理或手动操作造成部分提交。
+    """
+    expected_ids = [int(memory_id) for memory_id in expected_fragment_ids]
+    expected_set = set(expected_ids)
+    if not expected_ids:
+        return []
+    if len(expected_ids) != len(expected_set):
+        raise ValueError("expected_fragment_ids 存在重复")
+
+    merged_ids = []
+    seen_ids = set()
+    for event in events:
+        if not isinstance(event, dict):
+            raise ValueError("整理事件必须是JSON对象")
+        if not isinstance(event.get("content"), str) or not event["content"].strip():
+            raise ValueError("整理事件缺少 content")
+        event_ids = event.get("merged_ids", [])
+        if not event_ids:
+            raise ValueError("整理事件缺少 merged_ids")
+        for memory_id in event_ids:
+            if isinstance(memory_id, bool) or not isinstance(memory_id, int):
+                raise ValueError(f"整理事件包含非法碎片ID: {memory_id}")
+            if memory_id not in expected_set:
+                raise ValueError(f"整理事件引用了范围外碎片: {memory_id}")
+            if memory_id in seen_ids:
+                raise ValueError(f"碎片被多个事件重复引用: {memory_id}")
+            seen_ids.add(memory_id)
+            merged_ids.append(memory_id)
+
+    missing_ids = expected_set - seen_ids
+    if missing_ids:
+        raise ValueError(f"整理事件未覆盖全部碎片: {sorted(missing_ids)}")
+
+    pool = await get_pool()
+    created = []
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            rows = await conn.fetch("""
+                SELECT id
+                FROM memories
+                WHERE id = ANY($1::int[])
+                  AND layer = 1
+                  AND is_active = TRUE
+                FOR UPDATE
+            """, expected_ids)
+            active_ids = {int(row["id"]) for row in rows}
+            if active_ids != expected_set:
+                unavailable = sorted(expected_set - active_ids)
+                raise RuntimeError(f"部分来源碎片已被其他操作修改: {unavailable}")
+
+            for event in events:
+                row = await conn.fetchrow("""
+                    INSERT INTO memories (
+                        content, importance, layer, title,
+                        is_active, merged_from, event_date
+                    )
+                    VALUES ($1, $2, 2, $3, TRUE, $4, $5)
+                    RETURNING id
+                """,
+                    event.get("content", ""),
+                    event.get("importance", 5),
+                    event.get("title", ""),
+                    event["merged_ids"],
+                    event.get("event_date"),
+                )
+                if not row:
+                    raise RuntimeError("创建事件记忆失败")
+                created.append({
+                    "id": int(row["id"]),
+                    "content": event.get("content", ""),
+                })
+
+            result = await conn.execute("""
+                UPDATE memories
+                SET is_active = FALSE
+                WHERE id = ANY($1::int[])
+                  AND layer = 1
+                  AND is_active = TRUE
+            """, merged_ids)
+            updated = int(result.split()[-1]) if result else 0
+            if updated != len(expected_ids):
+                raise RuntimeError(
+                    f"归档来源碎片数量不符: expected={len(expected_ids)}, updated={updated}"
+                )
+
+    # embedding 失败不影响事件与来源碎片的原子提交，和旧逻辑保持一致。
+    if MEMORY_VECTOR_ENABLED and created:
+        async with pool.acquire() as conn:
+            for event in created:
+                try:
+                    embedding = await compute_embedding(event["content"])
+                    if embedding:
+                        await save_memory_embedding(conn, event["id"], embedding)
+                except Exception as exc:
+                    print(f"⚠️ 事件记忆embedding计算失败（id={event['id']}）: {exc}")
+
+    return [event["id"] for event in created]
+
+
 async def promote_to_core(memory_id: int, title: str = None):
     """将记忆升级为核心记忆"""
     pool = await get_pool()

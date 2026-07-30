@@ -99,7 +99,7 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 | `DATABASE_URL` | PostgreSQL 连接字符串 | `postgresql://user:pass@host:port/db` |
 | `MEMORY_ENABLED` | 开启记忆 | `true` |
 | `MEMORY_MODEL` | 记忆提取、评分、整理共用的模型（推荐便宜的小模型），留空回退到内置默认 | `anthropic/claude-haiku-4.5` |
-| `MEMORY_MAX_TOKENS（可选）` | 记忆提取、评分和整理的输出上限。日志出现"未找到JSON数组"且提示可能被截断时调高此项 | `4000` |
+| `MEMORY_MAX_TOKENS（可选）` | 记忆提取、评分和整理单批次的输出上限。整理达到上限时会自动拆小批次；提取日志提示截断时可调高此项 | `4000` |
 | `MAX_MEMORIES_INJECT` | 每次注入的最大记忆条数 | `15` |
 | `MIN_SCORE_THRESHOLD` | 记忆搜索最低分数阈值，低于此分数的记忆不注入（0=不过滤） | `0.15` |
 | `MEMORY_EXTRACT_INTERVAL` | 记忆提取间隔（0=禁用/1=每轮/N=每N轮） | `1` |
@@ -294,6 +294,13 @@ A: 打开 `https://你的网关地址/dashboard`，在「导出备份」页面�
 A: 能。这个项目的第一个部署者就是不会写代码的——代码是 AI 写的，部署是她自己看文档搞定的。
 
 ## 📋 更新日志
+
+### v3.8（2026-07-30）
+
+- **跨日记忆整理安全分批** — 日期范围按本地日期逐日处理；单日输出达到上限或碎片 ID 覆盖不完整时自动二分重试，避免多天内容挤进同一个 JSON 数组后被截断
+- **截断检测与完整性校验** — 读取 `finish_reason` 和 completion usage，截断响应不再进入 JSON 修复；每个批次必须完整且唯一地覆盖输入碎片 ID
+- **原子写入与准确日期** — 全范围整理成功后才在一个数据库事务中创建事件并归档来源碎片；任何批次或写入失败都保留全部原始碎片。事件日期按碎片实际本地日期记录
+- **JSON 修复不再裁切** — 需要修复语法时传入完整模型响应，移除会静默丢弃后半段的 2000 字符裁切
 
 ### v3.7（2026-07-07）
 
