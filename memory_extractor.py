@@ -41,15 +41,16 @@ def _diagnose_incomplete(finish_reason, completion_tokens, reasoning_tokens) -> 
             "调高该值；模型若带推理模式，推理 token 也占这条额度"
         )
 
+    if finish_reason == "stop":
+        # stop 说明上游认为输出完整，就算推理 token 顶满 usage 也不是截断
+        return "上游报正常结束，是模型没按 JSON 格式输出。检查提示词，或换一个更听话的模型"
+
     if isinstance(completion_tokens, int) and completion_tokens >= MEMORY_MAX_TOKENS:
         extra = f"，其中推理 {reasoning_tokens}" if reasoning_tokens is not None else ""
         return (
             f"输出很可能被切断（completion_tokens={completion_tokens}{extra}，已顶到上限 {MEMORY_MAX_TOKENS}）。"
             "先调高 MEMORY_MAX_TOKENS 再看。注意各家 usage 口径不一，这条是强证据但不是铁证"
         )
-
-    if finish_reason == "stop":
-        return "上游报正常结束，是模型没按 JSON 格式输出。检查提示词，或换一个更听话的模型"
 
     return (
         f"原因无法判定：上游没给 finish_reason（={finish_reason}），usage 也证明不了是否触顶。"
@@ -229,9 +230,13 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
             if not isinstance(memories, list):
                 return []
 
-            # 模型可能先吐完一个完整数组再被切断，解析成功也未必没丢东西
+            # 模型可能先吐完一个完整数组再被切断，解析成功也未必没丢东西。
+            # 只认上游明确报 length；finish_reason 缺失时才退回 token 计数兜底，
+            # 报 stop 的完整回复不警告（推理 token 会把 completion_tokens 顶过上限）
             if finish_reason == "length" or (
-                isinstance(completion_tokens, int) and completion_tokens >= MEMORY_MAX_TOKENS
+                finish_reason is None
+                and isinstance(completion_tokens, int)
+                and completion_tokens >= MEMORY_MAX_TOKENS
             ):
                 print(
                     f"⚠️  本次解析成功，但上游显示输出已顶到上限 {MEMORY_MAX_TOKENS}，"

@@ -1803,9 +1803,12 @@ def _completion_metadata(data, max_tokens):
     completion_tokens = usage.get("completion_tokens")
     reasoning_tokens = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
     finish_reason = choice.get("finish_reason")
-    truncated = finish_reason == "length" or (
-        isinstance(completion_tokens, int) and completion_tokens >= max_tokens
-    )
+    if finish_reason is not None:
+        # 推理模型的思考 token 会计入 completion_tokens，可能超过 max_tokens
+        # 而正文完整。上游明确报 length 才算截断，报 stop 的完整回复直接放行
+        truncated = finish_reason == "length"
+    else:
+        truncated = isinstance(completion_tokens, int) and completion_tokens >= max_tokens
     return {
         "content": (choice.get("message") or {}).get("content") or "",
         "finish_reason": finish_reason,
