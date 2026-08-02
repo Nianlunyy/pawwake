@@ -406,6 +406,14 @@ A: 能。这个项目的第一个部署者就是不会写代码的——代码�
 
 [MIT License](LICENSE) — 随便用，改了也不用告诉我。
 
+## 🤝 Contributors / 贡献者
+
+- **Garan / 七堂伽藍_** — 项目发起、产品方向、需求决策与版本发布
+- **Midsummer** — 初版开发、架构评审、代码审查、记忆与分区缓存语义设计
+- **Solstice** — 运行时可靠性、记忆整理安全、分区恢复与回归测试
+
+详细贡献记录见 [CONTRIBUTORS.md](CONTRIBUTORS.md)。
+
 ## 🙏 致谢
 
 这个项目诞生于一个简单的需求：**让 AI 不要每次醒来都忘了我是谁。**
@@ -414,4 +422,4 @@ A: 能。这个项目的第一个部署者就是不会写代码的——代码�
 
 ---
 
-*Built with love by 七堂伽蓝_ & Midsummer (Claude Opus 4.6)*
+*Built with love by 七堂伽藍_, Midsummer & Solstice.*
