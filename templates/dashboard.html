@@ -50,6 +50,12 @@
 
         <!-- 主内容区 -->
         <main class="main-content">
+            {% if not memory_enabled %}
+            <div class="card" style="margin-bottom: 16px; padding: 14px 16px; border-color: var(--warning);">
+                <strong>记忆系统当前已关闭。</strong>
+                记忆管理相关操作会暂停；设置页与对话线仍可查看，并可在设置页重新开启记忆。
+            </div>
+            {% endif %}
             <!-- 记忆管理 Section -->
             <section id="section-manage" class="section active">
                 <div class="section-header">

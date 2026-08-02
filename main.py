@@ -9,7 +9,8 @@ AI Memory Gateway — 带记忆系统的 LLM 转发网关
 3. 转发给 LLM API（支持 OpenRouter / OpenAI / 任何兼容接口）
 4. 后台自动存储对话 + 用 AI 提取新记忆
 
-环境变量 MEMORY_ENABLED=false 时退化为纯转发网关（第一阶段）。
+环境变量 MEMORY_ENABLED=false 时关闭记忆检索、注入与提取；
+若分区缓存仍开启，对话落库与摘要轮转继续工作。
 """
 
 import os
@@ -55,7 +56,7 @@ PORT = int(os.getenv("PORT", "8080"))
 # 不设置则跳过鉴权（兼容旧部署，仅建议内网环境使用）
 GATEWAY_SECRET = os.getenv("GATEWAY_SECRET", "")
 
-# 记忆系统开关（数据库出问题时可以临时关掉）
+# 记忆系统开关（只控制记忆能力；Dashboard 配置与分区缓存独立）
 MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "false").lower() == "true"
 
 # 每次注入的最大记忆条数
@@ -86,6 +87,11 @@ def make_cache_control() -> dict:
 
 def get_active_session_id() -> str:
     return PARTITION_SESSION_ID
+
+
+def conversation_persistence_enabled() -> bool:
+    """对话落库服务于记忆与分区轮转，任一功能开启都需要保留历史。"""
+    return MEMORY_ENABLED or CACHE_PARTITION_ENABLED
 
 # 时区偏移（小时），用于记忆注入时的日期显示，默认 UTC+8
 TIMEZONE_HOURS = int(os.getenv("TIMEZONE_HOURS", "8"))
@@ -162,16 +168,18 @@ async def get_system_prompt() -> str:
         db_prompt = await get_gateway_config("systemPrompt", "")
         if db_prompt:
             _cached_system_prompt = db_prompt
+            prompt_source = "Dashboard DB"
         else:
             _cached_system_prompt = _DEFAULT_SYSTEM_PROMPT
-            if _DEFAULT_SYSTEM_PROMPT:
-                await set_gateway_config("systemPrompt", _DEFAULT_SYSTEM_PROMPT)
+            prompt_source = "system_prompt.txt 默认值"
         _cached_system_prompt_loaded = True
+        print(f"📝 System Prompt 已解析: source={prompt_source}, length={len(_cached_system_prompt or '')}")
         return _cached_system_prompt or ""
-    except Exception:
-        _cached_system_prompt = _DEFAULT_SYSTEM_PROMPT
-        _cached_system_prompt_loaded = True
-        return _cached_system_prompt or ""
+    except Exception as e:
+        # DB 短暂故障时用文件默认值完成当前请求，不缓存失败结果，
+        # 让后续请求能在 DB 恢复后自动重试 Dashboard 人设。
+        print(f"⚠️  读取 Dashboard System Prompt 失败，本次使用文件默认值: {e}")
+        return _DEFAULT_SYSTEM_PROMPT or ""
 
 def invalidate_system_prompt_cache():
     """清除 system prompt 缓存（设置面板更新后调用）"""
@@ -186,101 +194,98 @@ def invalidate_system_prompt_cache():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用启动时初始化数据库，关闭时断开连接"""
+    """初始化持久化配置；记忆关闭时仍保留 Dashboard 与对话线状态。"""
     global PARTITION_SESSION_ID
-    if MEMORY_ENABLED:
+    try:
+        await init_tables()
+        await ensure_token_usage_table()
+
+        # 从数据库恢复面板配置。这一步不能受 MEMORY_ENABLED 控制，
+        # 否则 Dashboard 写入 false 后将无法重新开启记忆。
         try:
-            await init_tables()
-            await ensure_token_usage_table()
+            db_cfg = await get_all_gateway_config()
+            if db_cfg:
+                _RESTORE_MAIN = {
+                    "API_BASE_URL": str, "API_KEY": str, "DEFAULT_MODEL": str,
+                    "MEMORY_ENABLED": lambda v: _parse_bool(v),
+                    "MAX_MEMORIES_INJECT": int, "MEMORY_EXTRACT_INTERVAL": int,
+                    "CACHE_PARTITION_ENABLED": lambda v: _parse_bool(v),
+                    "CACHE_PARTITION_X": int, "CACHE_PARTITION_TRIGGER": str,
+                    "CACHE_PARTITION_WINDOW": int, "CACHE_SUMMARY_MODEL": str,
+                    "CACHE_TTL": str,
+                    "FORCE_STREAM": lambda v: _parse_bool(v),
+                    "REASONING_EFFORT": str,
+                }
+                _RESTORE_DB = {
+                    "EMBEDDING_API_KEY": str, "EMBEDDING_BASE_URL": str,
+                    "EMBEDDING_MODEL": str, "EMBEDDING_DIM": int,
+                    "MIN_SCORE_THRESHOLD": float,
+                    "MEMORY_VECTOR_ENABLED": lambda v: _parse_bool(v),
+                    "MEMORY_HW_KEYWORD": float, "MEMORY_HW_SEMANTIC": float,
+                    "MEMORY_HW_IMPORTANCE": float, "MEMORY_HW_RECENCY": float,
+                    "MEMORY_SEMANTIC_THRESHOLD": float,
+                }
+                # 显式空值也要恢复，否则重启时环境默认会覆盖面板上的清空操作。
+                _ALLOW_EMPTY = {"CACHE_SUMMARY_MODEL"}
+                restored = []
+                for key, val in db_cfg.items():
+                    if not val:
+                        if key in _ALLOW_EMPTY and key in _RESTORE_MAIN:
+                            globals()[key] = _RESTORE_MAIN[key]("")
+                            restored.append(key + "(显式空)")
+                        elif key == "MEMORY_MODEL":
+                            os.environ["MEMORY_MODEL"] = ""
+                            restored.append(key + "(显式空)")
+                        elif key == "MEMORY_API_KEY":
+                            globals()[key] = ""
+                            restored.append(key + "(显式空)")
+                        continue
+                    if key in _RESTORE_MAIN:
+                        globals()[key] = _RESTORE_MAIN[key](val)
+                        restored.append(key)
+                    elif key in _RESTORE_DB:
+                        setattr(_db_module, key, _RESTORE_DB[key](val))
+                        restored.append(key)
+                    elif key == "MEMORY_MODEL":
+                        os.environ["MEMORY_MODEL"] = str(val)
+                        restored.append(key)
+                    elif key == "MEMORY_API_KEY":
+                        globals()[key] = str(val)
+                        restored.append(key)
+                if restored:
+                    sync_memory_extractor_config()
+                    print(f"🔄 从数据库恢复 {len(restored)} 项面板配置: {', '.join(restored)}")
+        except Exception as e:
+            print(f"[warning] 恢复面板配置失败: {e}")
+
+        if MEMORY_ENABLED:
             count = await get_all_memories_count()
             print(f"✅ 记忆系统已启动，当前记忆数量：{count}")
-            
-            # 从数据库恢复面板配置（重启后保持Dashboard修改过的值）
-            try:
-                db_cfg = await get_all_gateway_config()
-                if db_cfg:
-                    _RESTORE_MAIN = {
-                        "API_BASE_URL": str, "API_KEY": str, "DEFAULT_MODEL": str,
-                        "MEMORY_ENABLED": lambda v: _parse_bool(v),
-                        "MAX_MEMORIES_INJECT": int, "MEMORY_EXTRACT_INTERVAL": int,
-                        "CACHE_PARTITION_ENABLED": lambda v: _parse_bool(v),
-                        "CACHE_PARTITION_X": int, "CACHE_PARTITION_TRIGGER": str,
-                        "CACHE_PARTITION_WINDOW": int, "CACHE_SUMMARY_MODEL": str,
-                        "CACHE_TTL": str,
-                        "FORCE_STREAM": lambda v: _parse_bool(v),
-                        "REASONING_EFFORT": str,
-                    }
-                    _RESTORE_DB = {
-                        "EMBEDDING_API_KEY": str, "EMBEDDING_BASE_URL": str,
-                        "EMBEDDING_MODEL": str, "EMBEDDING_DIM": int,
-                        "MIN_SCORE_THRESHOLD": float,
-                        "MEMORY_VECTOR_ENABLED": lambda v: _parse_bool(v),
-                        "MEMORY_HW_KEYWORD": float, "MEMORY_HW_SEMANTIC": float,
-                        "MEMORY_HW_IMPORTANCE": float, "MEMORY_HW_RECENCY": float,
-                        "MEMORY_SEMANTIC_THRESHOLD": float,
-                    }
-                    # 显式空值也要恢复的字段：面板清空=关闭该功能，重启后应保持关闭而不是回退到环境变量
-                    _ALLOW_EMPTY = {"CACHE_SUMMARY_MODEL"}
-                    restored = []
-                    for key, val in db_cfg.items():
-                        if not val:
-                            if key in _ALLOW_EMPTY and key in _RESTORE_MAIN:
-                                globals()[key] = _RESTORE_MAIN[key]("")
-                                restored.append(key + "(显式空)")
-                            elif key == "MEMORY_MODEL":
-                                # 面板上这项写着"留空用默认"，重启后也得保持空，
-                                # 否则部署环境里的旧 MEMORY_MODEL 会把用户清空的操作顶回去
-                                os.environ["MEMORY_MODEL"] = ""
-                                restored.append(key + "(显式空)")
-                            elif key == "MEMORY_API_KEY":
-                                # 清空 = 回退到主 API_KEY（get_memory_api_key 的 or 分支）。
-                                # 只清全局值就够，各处读的都是它，os.environ 仅启动时读一次
-                                globals()[key] = ""
-                                restored.append(key + "(显式空)")
-                            continue
-                        if key in _RESTORE_MAIN:
-                            globals()[key] = _RESTORE_MAIN[key](val)
-                            restored.append(key)
-                        elif key in _RESTORE_DB:
-                            setattr(_db_module, key, _RESTORE_DB[key](val))
-                            restored.append(key)
-                        elif key == "MEMORY_MODEL":
-                            os.environ["MEMORY_MODEL"] = str(val)
-                            restored.append(key)
-                        elif key == "MEMORY_API_KEY":
-                            globals()[key] = str(val)
-                            import memory_extractor as _me_mod
-                            _me_mod.MEMORY_API_KEY = str(val)
-                            restored.append(key)
-                    if restored:
-                        sync_memory_extractor_config()
-                        print(f"🔄 从数据库恢复 {len(restored)} 项面板配置: {', '.join(restored)}")
-            except Exception as e:
-                print(f"[warning] 恢复面板配置失败: {e}")
-            
             if not MEMORY_EXTRACT_ENABLED:
                 print(f"ℹ️  记忆提取+注入已关闭（MEMORY_EXTRACT_ENABLED=false）")
-            
-            # 分区缓存：从DB读取活跃对话线ID
-            if CACHE_PARTITION_ENABLED:
-                db_sid = await get_gateway_config("partition_session_id", "")
-                if db_sid:
-                    PARTITION_SESSION_ID = db_sid
-                    print(f"🔗 活跃对话线(DB): {PARTITION_SESSION_ID}")
-                elif PARTITION_SESSION_ID:
-                    await set_gateway_config("partition_session_id", PARTITION_SESSION_ID)
-                    print(f"🔗 活跃对话线(ENV→DB): {PARTITION_SESSION_ID}")
-                print(f"🔒 分区缓存已启用: X={CACHE_PARTITION_X}, 摘要模型={CACHE_SUMMARY_MODEL or '（未配置，纯轮转模式）'}")
-        except Exception as e:
-            print(f"⚠️  数据库初始化失败: {e}")
-            print("⚠️  记忆系统将不可用，但网关仍可正常转发")
-    else:
-        print("ℹ️  记忆系统已关闭（设置 MEMORY_ENABLED=true 开启）")
+        else:
+            print("ℹ️  记忆系统已关闭；Dashboard 配置与对话线状态仍可用")
+
+        # 活跃对话线属于分区缓存状态，必须独立于记忆开关恢复。
+        db_sid = await get_gateway_config("partition_session_id", "")
+        if db_sid:
+            PARTITION_SESSION_ID = db_sid
+            print(f"🔗 活跃对话线(DB): {PARTITION_SESSION_ID}")
+        elif PARTITION_SESSION_ID:
+            await set_gateway_config("partition_session_id", PARTITION_SESSION_ID)
+            print(f"🔗 活跃对话线(ENV→DB): {PARTITION_SESSION_ID}")
+        if CACHE_PARTITION_ENABLED:
+            print(f"🔒 分区缓存已启用: X={CACHE_PARTITION_X}, 摘要模型={CACHE_SUMMARY_MODEL or '（未配置，纯轮转模式）'}")
+    except Exception as e:
+        print(f"⚠️  数据库初始化失败: {e}")
+        if CACHE_PARTITION_ENABLED:
+            print("⚠️  分区缓存需要数据库；聊天请求将返回 503，避免丢失历史")
+        else:
+            print("⚠️  持久化配置与记忆能力暂停；网关继续纯转发")
     
     yield
     
-    if MEMORY_ENABLED:
-        await close_pool()
+    await close_pool()
 
 
 app = FastAPI(title="AI Memory Gateway", version="2.0.0", lifespan=lifespan)
@@ -341,23 +346,23 @@ async def gateway_auth_middleware(request: Request, call_next):
 # 记忆注入
 # ============================================================
 
-async def build_system_prompt_with_memories(user_message: str) -> str:
+async def build_system_prompt_with_memories(user_message: str, base_prompt: str) -> str:
     """
     构建带记忆的 system prompt
     1. 用用户消息搜索相关记忆
     2. 格式化成文本拼接到人设后面
     """
     if not MEMORY_ENABLED or not MEMORY_EXTRACT_ENABLED:
-        return SYSTEM_PROMPT
+        return base_prompt
     
     if MAX_MEMORIES_INJECT <= 0:
-        return SYSTEM_PROMPT
+        return base_prompt
     
     try:
         memories = await search_memories(user_message, limit=MAX_MEMORIES_INJECT)
         
         if not memories:
-            return SYSTEM_PROMPT
+            return base_prompt
         
         # 格式化记忆文本（带日期，帮助模型判断新旧）
         memory_lines = []
@@ -374,7 +379,7 @@ async def build_system_prompt_with_memories(user_message: str) -> str:
             memory_lines.append(f"- {date_str}{mem['content']}")
         memory_text = "\n".join(memory_lines)
         
-        enhanced_prompt = f"""{SYSTEM_PROMPT}
+        enhanced_prompt = f"""{base_prompt}
 
 【从过往对话中检索到的相关记忆】
 {memory_text}
@@ -398,7 +403,7 @@ async def build_system_prompt_with_memories(user_message: str) -> str:
         
     except Exception as e:
         print(f"⚠️  记忆检索失败: {e}，使用纯人设")
-        return SYSTEM_PROMPT
+        return base_prompt
 
 
 # ============================================================
@@ -1038,6 +1043,10 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
                     await save_message(session_id, "assistant", assistant_msg, model, metadata=assistant_meta)
         
         # 2. 检查是否需要提取记忆
+        if not MEMORY_ENABLED:
+            print(f"⏭️  记忆系统已关闭；仅保留分区缓存所需的对话记录")
+            return
+
         if not MEMORY_EXTRACT_ENABLED:
             print(f"⏭️  记忆提取已关闭（MEMORY_EXTRACT_ENABLED=false）")
             return
@@ -1117,6 +1126,7 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
 @app.get("/")
 async def health_check():
     """健康检查"""
+    resolved_system_prompt = await get_system_prompt()
     memory_count = 0
     if MEMORY_ENABLED:
         try:
@@ -1127,8 +1137,8 @@ async def health_check():
     return {
         "status": "running",
         "gateway": "AI Memory Gateway v2.0",
-        "system_prompt_loaded": len(SYSTEM_PROMPT) > 0,
-        "system_prompt_length": len(SYSTEM_PROMPT),
+        "system_prompt_loaded": len(resolved_system_prompt) > 0,
+        "system_prompt_length": len(resolved_system_prompt),
         "memory_enabled": MEMORY_ENABLED,
         "memory_count": memory_count,
         "memory_extract_interval": MEMORY_EXTRACT_INTERVAL,
@@ -1200,6 +1210,7 @@ async def _chat_completions_inner(request: Request):
     # ---------- 构建 system prompt ----------
     # 先保存原始对话消息（不含 system prompt），用于记忆提取
     original_messages = [msg for msg in messages if msg.get("role") != "system"]
+    resolved_system_prompt = "" if skip_conversation_log else await get_system_prompt()
     
     # ---------- 检测工具调用消息 ----------
     tool_messages = [m for m in messages if m.get("role") == "tool"]
@@ -1224,8 +1235,16 @@ async def _chat_completions_inner(request: Request):
                 msg['created_at'] = m.get('created_at')  # 保留时间戳供分区时间窗口判断
                 db_msgs.append(msg)
         except Exception as e:
-            print(f"[warning] 分区模式读取历史失败: {e}")
-            db_msgs = []
+            print(f"❌ 分区缓存不可用：读取对话历史失败: {e}")
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": {
+                        "message": "分区缓存需要数据库，当前无法读取对话历史。请检查数据库连接或暂时关闭 CACHE_PARTITION_ENABLED。",
+                        "type": "partition_database_unavailable",
+                    }
+                },
+            )
         
         # 提取客户端新消息（非system），可能是user、tool、或带tool_calls的assistant
         client_new_msgs = [m for m in messages if m.get("role") != "system"]
@@ -1301,26 +1320,41 @@ async def _chat_completions_inner(request: Request):
         
         print(f"📦 分区模式: DB历史{len(db_msgs)}条 + 客户端消息{len(client_new_msgs)}条")
         
-        partition_prompt = SYSTEM_PROMPT
+        partition_prompt = resolved_system_prompt
         if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and MAX_MEMORIES_INJECT > 0:
-            partition_prompt = (SYSTEM_PROMPT or "") + MEMORY_USAGE_GUIDE
+            partition_prompt = (resolved_system_prompt or "") + MEMORY_USAGE_GUIDE
         # 保留客户端自带的 system（工具说明等），拼接到网关 prompt 之后，
         # 与非分区路径的行为对齐（前端 system 稳定时不影响 BP1 缓存命中）
         client_system_text = _extract_client_system_text(messages)
         if client_system_text:
             partition_prompt = ((partition_prompt or "") + "\n\n" + client_system_text).strip()
-        messages = await build_partitioned_messages(
-            session_id, all_msgs, partition_prompt, user_message
-        )
+        try:
+            messages = await build_partitioned_messages(
+                session_id, all_msgs, partition_prompt, user_message
+            )
+        except Exception as e:
+            print(f"❌ 分区缓存不可用：读取轮转状态失败: {e}")
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": {
+                        "message": "分区缓存需要数据库，当前无法读取轮转状态。请检查数据库连接或暂时关闭 CACHE_PARTITION_ENABLED。",
+                        "type": "partition_database_unavailable",
+                    }
+                },
+            )
         body["messages"] = messages
     
     else:
         # ---------- 原有逻辑：system prompt + 记忆注入 ----------
-        if not skip_conversation_log and (SYSTEM_PROMPT or (MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and user_message)):
+        if not skip_conversation_log and (resolved_system_prompt or (MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and user_message)):
             if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and user_message:
-                enhanced_prompt = await build_system_prompt_with_memories(user_message)
+                enhanced_prompt = await build_system_prompt_with_memories(
+                    user_message,
+                    resolved_system_prompt,
+                )
             else:
-                enhanced_prompt = SYSTEM_PROMPT
+                enhanced_prompt = resolved_system_prompt
             
             if enhanced_prompt:
                 has_system = any(msg.get("role") == "system" for msg in messages)
@@ -1405,7 +1439,7 @@ async def _chat_completions_inner(request: Request):
                 except (KeyError, IndexError):
                     pass
                 
-                if MEMORY_ENABLED and (user_message or tool_messages):
+                if conversation_persistence_enabled() and (user_message or tool_messages):
                     asyncio.create_task(
                         process_memories_background(session_id, user_message, assistant_msg, model, 
                                                     context_messages=original_messages, skip_conversation_log=skip_conversation_log,
@@ -1520,7 +1554,7 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
             asyncio.create_task(save_token_usage(session_id, model, pt, ct, tt))
             print(f"📊 Stream Token: {pt} + {ct} = {tt}")
     
-    if MEMORY_ENABLED and (user_message or tool_messages):
+    if conversation_persistence_enabled() and (user_message or tool_messages):
         asyncio.create_task(
             process_memories_background(session_id, user_message, assistant_msg, model, 
                                         context_messages=original_messages, skip_conversation_log=skip_conversation_log,
@@ -1575,10 +1609,11 @@ async def export_memories():
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_page(request: Request):
     """Dashboard - 整合的记忆管理界面"""
-    if not MEMORY_ENABLED:
-        return HTMLResponse("<h3>记忆系统未启用（设置 MEMORY_ENABLED=true 开启）</h3>")
-    
-    return templates.TemplateResponse(request, "dashboard.html")
+    return templates.TemplateResponse(
+        request,
+        "dashboard.html",
+        {"memory_enabled": MEMORY_ENABLED},
+    )
 
 
 

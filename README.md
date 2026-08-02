@@ -10,7 +10,7 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 
 ## ✨ 功能
 
-- **自定义人设** — 把你的 system prompt 写在 `system_prompt.txt`，每次对话自动注入
+- **自定义人设** — 可用 `system_prompt.txt` 提供默认人设，也可在 Dashboard 热更新运行时人设
 - **长期记忆** — 自动从对话中提取关键信息，下次聊天时自动回忆相关内容
 - **三层记忆架构** — 碎片（自动提取的原始记忆）→ 事件（整理合并后的完整事件）→ 核心（手动标记的重要记忆），支持 AI 自动整理、手动合并、撤回合并、查看合并来源
 - **分区缓存** — 自动管理对话上下文，通过 A/B 区轮转 + 摘要压缩，利用 prompt caching 大幅节省 token 费用。兼容 tool 调用消息
@@ -54,7 +54,7 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 
 **2. 修改人设**
 
-编辑 `system_prompt.txt`，写入你想要的 AI 性格设定。
+编辑 `system_prompt.txt`，写入你想要的 AI 性格设定。Dashboard「设置」中保存的 System Prompt 会覆盖文件默认值，并从下一次请求开始生效。
 
 **3. 部署到 Render（推荐）**
 
@@ -157,7 +157,7 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 | `CACHE_MAX_ROTATIONS`（可选） | 时间窗口模式下单次请求最大轮转次数 | `2` |
 | `CACHE_TTL`（可选） | 缓存有效期：`5m`（默认）或 `1h`。Anthropic 官方定价：5m 写入 1.25x、1h 写入 2x，读取都是 0.1x。消息间隔经常超过 5 分钟的慢聊场景（比如挂着微信/TG 等回复）建议 `1h`，缓存不会中途过期。OpenRouter 会原样透传此参数。设置面板可热更新 | `5m` |
 
-> 💡 **不需要记忆功能也能用分区缓存。** 设置 `MEMORY_ENABLED=true`（连数据库存消息）+ `MEMORY_EXTRACT_ENABLED=false`（关闭记忆提取）+ `CACHE_PARTITION_ENABLED=true`，就能只用分区缓存不用记忆系统。
+> 💡 **记忆与分区缓存可以独立开关。** `MEMORY_ENABLED=false` 会停止记忆检索、注入和提取；只要 `CACHE_PARTITION_ENABLED=true`，对话仍会落库并继续摘要轮转。分区模式由网关托管历史，因此必须保持数据库可用。
 
 **管理面板：**
 
@@ -170,7 +170,7 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 
 ### 第四阶段：关闭记忆（应急）
 
-如果记忆系统出问题，把环境变量 `MEMORY_ENABLED` 改回 `false` 即可退回纯转发模式。不需要改代码。
+如果记忆系统出问题，把 `MEMORY_ENABLED` 改为 `false` 即可停止记忆检索、注入和提取；Dashboard 设置与活跃对话线仍会从数据库恢复。若要进入不保存对话的纯转发模式，请同时关闭 `CACHE_PARTITION_ENABLED`。
 
 ## 📁 文件说明
 
@@ -279,7 +279,7 @@ ai-memory-gateway/
 A: 检查端口设置。Render 默认用 `PORT` 环境变量，确保设置为 `8000`（和 Dockerfile 里一致）。如果用其他平台，注意端口是否匹配。
 
 **Q: 数据库连接失败？**
-A: 如果数据库和网关不在同一个平台，连接字符串末尾可能需要加 `?sslmode=require`。
+A: 如果数据库和网关不在同一个平台，连接字符串末尾可能需要加 `?sslmode=require`。分区缓存开启时，数据库不可用会让聊天端点返回明确的 `503 partition_database_unavailable`，避免用残缺历史继续对话。分区缓存关闭时，网关会用文件默认人设继续纯转发。
 
 **Q: 记忆会越来越多影响性能吗？**
 A: 每次最多注入 15 条记忆（可调），不会无限增长地消耗 token。提取记忆时会用客户端发来的完整上下文，token 用量比单轮提取大一些，可以通过 `MEMORY_EXTRACT_INTERVAL` 降低提取频率来控制成本。
@@ -294,6 +294,14 @@ A: 打开 `https://你的网关地址/dashboard`，在「导出备份」页面�
 A: 能。这个项目的第一个部署者就是不会写代码的——代码是 AI 写的，部署是她自己看文档搞定的。
 
 ## 📋 更新日志
+
+### v3.9（2026-08-02）
+
+- **关闭记忆后仍可管理配置** — Dashboard 不再因 `MEMORY_ENABLED=false` 整页消失；数据库初始化、面板 override 恢复和活跃对话线恢复均与记忆开关解耦
+- **System Prompt 热更新修复** — 每次聊天请求只解析一次 DB 优先的 System Prompt，分区、记忆增强和纯人设路径共用同一个最终值
+- **记忆与分区缓存独立** — 关闭记忆后，只要分区缓存开启，对话仍会落库并继续摘要轮转
+- **分区故障响亮失败** — 分区缓存开启且数据库不可用时立即返回 503，避免静默丢历史与上下文
+- **摘要失败可重试** — 配置了摘要模型且生成失败时保留当前 A 区；摘要模型留空时仍按原语义执行纯轮转
 
 ### v3.8（2026-07-30）
 
