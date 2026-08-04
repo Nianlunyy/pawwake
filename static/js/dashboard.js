@@ -226,7 +226,7 @@ function renderTable(mems, startIndex) {
             '<td class="col-title"><input type="text" class="title-input" id="t_' + m.id + '" value="' + escHtml(titleDisplay) + '" placeholder="无标题"></td>' +
             '<td class="col-content"><textarea class="content-textarea" id="c_' + m.id + '">' + escHtml(m.content) + '</textarea></td>' +
             '<td class="col-importance"><input type="number" class="importance-input" id="i_' + m.id + '" value="' + m.importance + '" min="1" max="10"></td>' +
-            '<td class="col-time">' + fmtTime(m.created_at) + '</td>' +
+            '<td class="col-time">' + fmtTime(m.event_date || m.created_at) + '</td>' +
             '<td class="col-actions"><div class="row-actions">' +
                 '<button class="btn btn-primary btn-sm" onclick="saveMem(' + m.id + ')">保存</button>' +
                 revertBtn +
@@ -255,7 +255,10 @@ function filterAndSort() {
     if (currentLayer !== 'all') mems = mems.filter(m => (m.layer || 1) == currentLayer);
     if (!showInactive) mems = mems.filter(m => m.is_active !== false);
     if (q) mems = mems.filter(m => m.content.toLowerCase().includes(q) || (m.title && m.title.toLowerCase().includes(q)));
-    if (dateVal) mems = mems.filter(m => m.created_at && fmtTime(m.created_at).slice(0, 10) === dateVal);
+    if (dateVal) mems = mems.filter(m => {
+        const d = m.event_date || (m.created_at && fmtTime(m.created_at).slice(0, 10));
+        return d && String(d).slice(0, 10) === dateVal;
+    });
     
     mems = [...mems].sort((a, b) => {
         if (sort === 'id-desc') return b.id - a.id;
@@ -850,7 +853,11 @@ async function previewJson() {
     const file = document.getElementById('jsonFile').files[0];
     const text = document.getElementById('jsonInput').value.trim();
     const preview = document.getElementById('jsonPreview');
-    
+
+    // 渲染前清旧状态；渲染后不能再调 clearImportResult()，它会把刚画好的预览一并清掉
+    clearImportResult();
+    pendingJsonData = null;
+
     let jsonStr = '';
     if (file) {
         jsonStr = await file.text();
@@ -886,7 +893,6 @@ async function previewJson() {
         }
         html += '<br><button class="btn btn-primary" onclick="confirmJsonImport()">确认导入</button>';
         preview.innerHTML = html;
-        clearImportResult();
     } catch(e) {
         showImportResult('error', '❌ JSON 格式错误：' + e.message);
         preview.innerHTML = '';
