@@ -883,7 +883,10 @@ async function previewJson() {
         }
         
         pendingJsonData = parsed;
-        let html = '<p><b>预览：共 ' + mems.length + ' 条记忆</b></p>';
+        const verTag = parsed.schema_version === 2
+            ? '（v2 完整备份，含层级/日期/合并关系）'
+            : '（旧版备份，将按碎片导入）';
+        let html = '<p><b>预览：共 ' + mems.length + ' 条记忆</b>' + verTag + '</p>';
         const show = mems.slice(0, 10);
         show.forEach(m => {
             html += '<div class="preview-item">权重 ' + (m.importance || '?') + ' | ' + (m.content || '').substring(0, 80) + '</div>';
@@ -921,7 +924,19 @@ async function confirmJsonImport() {
         if (data.error) {
             showImportResult('error', '❌ ' + data.error);
         } else {
-            showImportResult('success', '✅ 导入完成！新增 ' + data.imported + ' 条，跳过 ' + data.skipped + ' 条（已存在），总计 ' + data.total + ' 条');
+            let msg = '✅ 导入完成！新增 ' + data.imported + ' 条，跳过 ' + data.skipped + ' 条（已存在），总计 ' + data.total + ' 条';
+            if (data.conflicts && data.conflicts.length) {
+                msg += '<br>⚠️ ' + data.conflicts.length + ' 条内容与库中多条记忆重复，未导入也未挂关系：' +
+                    data.conflicts.map(c => '备份#' + c.backup_id + '→库内#' + c.matched_ids.join('/#')).join('，');
+            }
+            if (data.degraded && data.degraded.length) {
+                msg += '<br>⚠️ ' + data.degraded.length + ' 条合并关系因来源冲突未恢复（记忆本身已导入）：' +
+                    data.degraded.map(d => '备份#' + d.backup_id).join('，');
+            }
+            if (data.pending_embeddings) {
+                msg += '<br>ℹ️ ' + data.pending_embeddings + ' 条记忆待重算向量，可在维护面板执行 embedding 回填';
+            }
+            showImportResult(data.conflicts && data.conflicts.length || data.degraded && data.degraded.length ? 'info' : 'success', msg);
             loadMemories();
         }
         document.getElementById('jsonPreview').innerHTML = '';
