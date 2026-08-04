@@ -26,6 +26,7 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from database import import_memories_v2, _parse_backup_datetime
 from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, create_consolidated_events, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories
@@ -1599,12 +1600,17 @@ async def export_memories():
     
     try:
         memories = await get_all_memories()
-        # 把 datetime 转成字符串
+        # 库内 id 在备份里叫 backup_id：只是恢复时重建 merged_from 关系的映射键，
+        # 不承诺导入后保持同一 id；日期转成字符串
         for mem in memories:
+            mem["backup_id"] = mem.pop("id")
             if mem.get("created_at"):
                 mem["created_at"] = str(mem["created_at"])
-        
+            if mem.get("event_date"):
+                mem["event_date"] = str(mem["event_date"])
+
         return {
+            "schema_version": 2,
             "total": len(memories),
             "exported_at": str(__import__("datetime").datetime.now()),
             "memories": memories,
@@ -2353,35 +2359,44 @@ async def import_memories(request: Request):
     try:
         data = await request.json()
         memories = data.get("memories", [])
-        
+
         if not memories:
             return {"error": "没有找到记忆数据，请确认 JSON 格式正确"}
-        
+
+        # v2 版本化备份：完整恢复三层结构、日期和合并关系
+        if data.get("schema_version") == 2:
+            try:
+                return await import_memories_v2(memories)
+            except ValueError as e:
+                return {"error": f"备份校验失败：{e}"}
+
+        # v1 旧格式（无 schema_version）：按碎片导入，尽量保留原 created_at
         imported = 0
         skipped = 0
-        
+
         for mem in memories:
             content = mem.get("content", "")
             if not content:
                 continue
-            
+
             pool = await get_pool()
             async with pool.acquire() as conn:
                 existing = await conn.fetchval(
                     "SELECT COUNT(*) FROM memories WHERE content = $1", content
                 )
-            
+
             if existing > 0:
                 skipped += 1
                 continue
-            
+
             await save_memory(
                 content=content,
                 importance=mem.get("importance", 5),
                 source_session=mem.get("source_session", "json-import"),
+                created_at=_parse_backup_datetime(mem.get("created_at")),
             )
             imported += 1
-        
+
         total = await get_all_memories_count()
         return {
             "status": "done",

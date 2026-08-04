@@ -10,7 +10,7 @@
 import os
 import re
 from typing import Optional, List
-from datetime import datetime, timedelta, timezone as dt_timezone
+from datetime import datetime, date, timedelta, timezone as dt_timezone
 
 import asyncpg
 
@@ -599,12 +599,15 @@ async def delete_single_message(message_id: int):
 # 记忆操作
 # ============================================================
 
-async def save_memory(content: str, importance: int = 5, source_session: str = ""):
+async def save_memory(content: str, importance: int = 5, source_session: str = "",
+                      created_at: datetime = None):
+    """created_at 传入时保留原时间（备份恢复用），否则落库默认 NOW()"""
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "INSERT INTO memories (content, importance, source_session) VALUES ($1, $2, $3) RETURNING id",
-            content, importance, source_session,
+            "INSERT INTO memories (content, importance, source_session, created_at) "
+            "VALUES ($1, $2, $3, COALESCE($4, NOW())) RETURNING id",
+            content, importance, source_session, created_at,
         )
         
         # MEMORY_VECTOR_ENABLED 时自动计算 embedding
@@ -971,13 +974,160 @@ async def get_all_memories_count():
 
 
 async def get_all_memories():
-    """导出所有记忆（用于备份）"""
+    """导出所有记忆（用于备份，含归档记录与三层结构字段）
+
+    embedding/embedding_json 和 last_accessed 是可重算的派生数据与访问状态，不进备份。
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT content, importance, source_session, created_at FROM memories ORDER BY id"
-        )
+        rows = await conn.fetch("""
+            SELECT id, content, importance, source_session, created_at,
+                   layer, title, is_active, merged_from, event_date
+            FROM memories ORDER BY id
+        """)
         return [dict(r) for r in rows]
+
+
+def _parse_backup_datetime(value):
+    """解析备份里的时间字符串；解析不了返回 None（落库走默认 NOW()）"""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=dt_timezone.utc)
+    try:
+        dt = datetime.fromisoformat(str(value))
+        return dt if dt.tzinfo else dt.replace(tzinfo=dt_timezone.utc)
+    except ValueError:
+        try:
+            return datetime.strptime(str(value)[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt_timezone.utc)
+        except ValueError:
+            return None
+
+
+def _parse_backup_date(value):
+    """解析备份里的日期字符串（event_date 用），解析不了返回 None"""
+    if value is None or value == "":
+        return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+async def import_memories_v2(memories: list):
+    """恢复 v2 版本化备份：单事务两遍，先插入建映射，再回填合并关系。
+
+    - 同内容且库中唯一 → 跳过并映射到已有行（同一份备份重复导入幂等）
+    - 同内容但库中多行 → 不猜挂哪条，计入 conflicts 回执，引用它的合并链降级
+    - merged_from 引用了备份中不存在的 backup_id → 备份损坏，抛错整批回滚
+    - embedding 不随导入计算，恢复后由 backfill 重算
+    """
+    # ---- 事务外纯格式校验：先收集全部 backup_id，再验证引用封闭性 ----
+    backup_ids = set()
+    for mem in memories:
+        if not isinstance(mem, dict):
+            raise ValueError("记忆条目必须是 JSON 对象")
+        bid = mem.get("backup_id")
+        if isinstance(bid, bool) or not isinstance(bid, int):
+            raise ValueError(f"backup_id 缺失或非法: {bid!r}")
+        if bid in backup_ids:
+            raise ValueError(f"backup_id 重复: {bid}")
+        backup_ids.add(bid)
+        if not isinstance(mem.get("content"), str) or not mem["content"].strip():
+            raise ValueError(f"记忆 {bid} 缺少 content")
+        if mem.get("layer", 1) not in (1, 2, 3):
+            raise ValueError(f"记忆 {bid} 层级非法: {mem.get('layer')!r}")
+    for mem in memories:
+        for ref in (mem.get("merged_from") or []):
+            if isinstance(ref, bool) or not isinstance(ref, int):
+                raise ValueError(f"记忆 {mem['backup_id']} 的 merged_from 含非法引用: {ref!r}")
+            if ref not in backup_ids:
+                raise ValueError(
+                    f"记忆 {mem['backup_id']} 的 merged_from 引用了备份中不存在的 {ref}，备份不完整"
+                )
+
+    pool = await get_pool()
+    imported = 0
+    skipped = 0
+    conflicts = []
+    degraded = []
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            # ---- 第一遍：插入并建立 旧 backup_id → 新库 id 映射 ----
+            id_map = {}
+            for mem in memories:
+                bid = mem["backup_id"]
+                content = mem["content"]
+                rows = await conn.fetch(
+                    "SELECT id FROM memories WHERE content = $1", content
+                )
+                if len(rows) == 1:
+                    id_map[bid] = int(rows[0]["id"])
+                    skipped += 1
+                    continue
+                if len(rows) > 1:
+                    conflicts.append({
+                        "backup_id": bid,
+                        "matched_ids": sorted(int(r["id"]) for r in rows),
+                    })
+                    skipped += 1
+                    continue
+                row = await conn.fetchrow("""
+                    INSERT INTO memories (content, importance, source_session, created_at,
+                                          layer, title, is_active, event_date)
+                    VALUES ($1, $2, $3, COALESCE($4, NOW()), $5, $6, $7, $8)
+                    RETURNING id
+                """,
+                    content,
+                    mem.get("importance", 5),
+                    mem.get("source_session") or "json-import",
+                    _parse_backup_datetime(mem.get("created_at")),
+                    mem.get("layer", 1),
+                    mem.get("title") or "",
+                    bool(mem.get("is_active", True)),
+                    _parse_backup_date(mem.get("event_date")),
+                )
+                id_map[bid] = int(row["id"])
+                imported += 1
+
+            # ---- 第二遍：用映射回填 merged_from ----
+            for mem in memories:
+                refs = mem.get("merged_from") or []
+                if not refs:
+                    continue
+                bid = mem["backup_id"]
+                new_id = id_map.get(bid)
+                if new_id is None:
+                    # 父条本身因内容冲突被跳过，没有落库行可回填
+                    continue
+                unresolved = [ref for ref in refs if ref not in id_map]
+                if unresolved:
+                    # 来源条目因冲突未建立映射：不猜关系，保持 NULL 并回执降级
+                    degraded.append({"backup_id": bid, "unresolved": unresolved})
+                    continue
+                await conn.execute(
+                    "UPDATE memories SET merged_from = $1 WHERE id = $2",
+                    [id_map[ref] for ref in refs], new_id,
+                )
+
+    total = await get_all_memories_count()
+    result = {
+        "status": "done",
+        "schema_version": 2,
+        "imported": imported,
+        "skipped": skipped,
+        "conflicts": conflicts,
+        "degraded": degraded,
+        "total": total,
+    }
+    if MEMORY_VECTOR_ENABLED:
+        try:
+            result["pending_embeddings"] = await get_pending_memory_embedding_count()
+        except Exception:
+            pass
+    return result
 
 
 async def get_all_memories_detail(limit: int = None, layer: int = None, active_only: bool = None):
@@ -1661,9 +1811,9 @@ async def merge_memories(memory_ids: list, new_title: str, new_content: str,
     
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # 获取原记忆的日期（取最早的）
+        # 获取原记忆的日期（取最早的；来源含事件记忆时优先其真实发生日，而非整理日）
         rows = await conn.fetch("""
-            SELECT MIN(DATE(created_at)) as event_date
+            SELECT MIN(COALESCE(event_date, DATE(created_at))) as event_date
             FROM memories WHERE id = ANY($1::int[])
         """, memory_ids)
         event_date = rows[0]['event_date'] if rows else None
