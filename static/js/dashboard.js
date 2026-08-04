@@ -829,6 +829,10 @@ async function doTextImport() {
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({lines: lines, skip_scoring: skip})
         });
+        if (!resp.ok) {
+            showImportResult('error', '❌ 导入失败：HTTP ' + resp.status + (resp.status === 401 ? '（鉴权失败，请用带 ?gateway_key=你的密钥 的地址打开本页）' : ''));
+            return;
+        }
         const data = await resp.json();
         if (data.error) {
             showImportResult('error', '❌ ' + data.error);
@@ -859,6 +863,11 @@ async function previewJson() {
     
     try {
         const parsed = JSON.parse(jsonStr);
+        if (parsed.error) {
+            showImportResult('error', '❌ 这份文件不是备份，是一条错误响应（' + parsed.error + '）。请回导出页面重新导出一份');
+            preview.innerHTML = '';
+            return;
+        }
         const mems = parsed.memories || [];
         if (mems.length === 0) {
             showImportResult('error', '❌ 没有找到 memories 字段，请确认这是从导出功能导出的文件');
@@ -898,6 +907,10 @@ async function confirmJsonImport() {
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify(pendingJsonData)
         });
+        if (!resp.ok) {
+            showImportResult('error', '❌ 导入失败：HTTP ' + resp.status + (resp.status === 401 ? '（鉴权失败，请用带 ?gateway_key=你的密钥 的地址打开本页）' : ''));
+            return;
+        }
         const data = await resp.json();
         if (data.error) {
             showImportResult('error', '❌ ' + data.error);
@@ -937,9 +950,33 @@ async function loadExportStats() {
     }
 }
 
-function doExport() {
-    // 直接跳转到导出接口，浏览器会下载文件
-    window.location.href = '/export/memories';
+async function doExport() {
+    // 用 fetch 走鉴权补丁（location.href 跳转不带 X-Gateway-Key，开启鉴权时会 401）
+    try {
+        const resp = await fetch('/export/memories');
+        if (!resp.ok) {
+            alert('导出失败：HTTP ' + resp.status + (resp.status === 401 ? '（鉴权失败，请用带 ?gateway_key=你的密钥 的地址打开本页）' : ''));
+            return;
+        }
+        const data = await resp.json();
+        if (data.error) { alert('导出失败: ' + data.error); return; }
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        const now = new Date();
+        const ts = now.getFullYear() +
+            String(now.getMonth()+1).padStart(2,'0') +
+            String(now.getDate()).padStart(2,'0') + '_' +
+            String(now.getHours()).padStart(2,'0') +
+            String(now.getMinutes()).padStart(2,'0') +
+            String(now.getSeconds()).padStart(2,'0');
+        a.href = url;
+        a.download = 'memories_backup_' + ts + '.json';
+        a.click();
+        URL.revokeObjectURL(url);
+    } catch(e) {
+        alert('导出失败: ' + e.message);
+    }
 }
 
 
