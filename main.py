@@ -365,10 +365,14 @@ async def build_system_prompt_with_memories(user_message: str, base_prompt: str)
             return base_prompt
         
         # 格式化记忆文本（带日期，帮助模型判断新旧）
+        # event_date 优先：整理产物的 created_at 是整理当天，真实发生日存在 event_date 里。
+        # event_date 本身就是本地日期，不做时区换算
         memory_lines = []
         for mem in memories:
             date_str = ""
-            if mem.get("created_at"):
+            if mem.get("event_date"):
+                date_str = f"[{str(mem['event_date'])[:10]}] "
+            elif mem.get("created_at"):
                 try:
                     utc_str = str(mem['created_at'])[:19]
                     utc_dt = datetime.strptime(utc_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
@@ -939,7 +943,10 @@ async def build_memory_text(user_message: str) -> str:
         memory_lines = []
         for mem in memories:
             date_str = ""
-            if mem.get("created_at"):
+            if mem.get("event_date"):
+                # 事件日期优先，本身是本地日期不做时区换算
+                date_str = f"[{str(mem['event_date'])[:10]}] "
+            elif mem.get("created_at"):
                 try:
                     utc_str = str(mem['created_at'])[:19]
                     utc_dt = datetime.strptime(utc_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)

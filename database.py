@@ -653,18 +653,26 @@ async def search_memories(query: str, limit: int = 10):
         limit_idx = len(keywords) + 1
         params.append(limit)
         
+        # 时效天数：事件记忆按本地日历日差（AT TIME ZONE 'UTC' 拿到无时区的 UTC 挂钟，
+        # 加偏移后取日期，不依赖数据库会话时区）；普通碎片按 created_at 精确时长
+        recency_days_expr = (
+            "CASE WHEN event_date IS NOT NULL "
+            f"THEN GREATEST(0, ((NOW() AT TIME ZONE 'UTC' + INTERVAL '{TIMEZONE_HOURS} hours')::date - event_date))::float "
+            "ELSE GREATEST(0, EXTRACT(EPOCH FROM (NOW() - created_at))) / 86400.0 END"
+        )
         sql = f"""
-            SELECT 
-                id, content, importance, created_at,
+            SELECT
+                id, content, importance, created_at, event_date,
                 ({hit_count_expr}) AS hit_count,
+                ({recency_days_expr}) AS effective_days,
                 (
                     {WEIGHT_KEYWORD} * ({hit_count_expr})::float / {max_hits}.0 +
                     {WEIGHT_IMPORTANCE} * importance::float / 10.0 +
-                    {WEIGHT_RECENCY} * (1.0 / (1.0 + EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400.0))
+                    {WEIGHT_RECENCY} * (1.0 / (1.0 + ({recency_days_expr})))
                 ) AS score
             FROM memories
             WHERE {where_clause}
-            ORDER BY score DESC, importance DESC, created_at DESC
+            ORDER BY score DESC, importance DESC, effective_days ASC
             LIMIT ${limit_idx}
         """
         
@@ -692,6 +700,15 @@ async def search_memories(query: str, limit: int = 10):
             print(f"🔍 搜索 '{query}' → 关键词 {keywords[:8]} → 无结果" + (f"（{filtered} 条被分数阈值过滤）" if filtered else ""))
         
         return results
+
+
+def _effective_days_ago(event_date, created_at, now_utc):
+    """时效天数：事件记忆按本地日历日差（event_date 是本地日期，不做 UTC 换算），
+    普通碎片按 created_at 精确时长"""
+    if event_date:
+        local_today = (now_utc + timedelta(hours=TIMEZONE_HOURS)).date()
+        return max(0.0, float((local_today - event_date).days))
+    return max(0.0, (now_utc - created_at).total_seconds() / 86400.0)
 
 
 async def search_memories_hybrid(query: str, limit: int = 10):
@@ -729,7 +746,7 @@ async def search_memories_hybrid(query: str, limit: int = 10):
             params.append(limit * 3)
             
             kw_sql = f"""
-                SELECT id, content, importance, created_at,
+                SELECT id, content, importance, created_at, event_date,
                        ({hit_count_expr}) AS hit_count,
                        ({hit_count_expr})::float / {max_hits}.0 AS kw_score
                 FROM memories
@@ -744,6 +761,7 @@ async def search_memories_hybrid(query: str, limit: int = 10):
                     'content': r['content'],
                     'importance': r['importance'],
                     'created_at': r['created_at'],
+                    'event_date': r['event_date'],
                     'hit_count': r['hit_count'],
                     'kw_score': float(r['kw_score']),
                     'similarity': 0.0,
@@ -754,7 +772,7 @@ async def search_memories_hybrid(query: str, limit: int = 10):
             if HAS_PGVECTOR:
                 vec_str = '[' + ','.join(str(f) for f in query_embedding) + ']'
                 sem_rows = await conn.fetch("""
-                    SELECT id, content, importance, created_at,
+                    SELECT id, content, importance, created_at, event_date,
                            1 - (embedding <=> $1::vector) as similarity
                     FROM memories
                     WHERE embedding IS NOT NULL AND is_active = TRUE
@@ -765,7 +783,7 @@ async def search_memories_hybrid(query: str, limit: int = 10):
                 # Python端计算cosine
                 import json
                 all_mem = await conn.fetch("""
-                    SELECT id, content, importance, created_at, embedding_json
+                    SELECT id, content, importance, created_at, event_date, embedding_json
                     FROM memories WHERE embedding_json IS NOT NULL AND is_active = TRUE
                 """)
                 
@@ -792,6 +810,7 @@ async def search_memories_hybrid(query: str, limit: int = 10):
                         'content': r['content'],
                         'importance': r['importance'],
                         'created_at': r['created_at'],
+                        'event_date': r['event_date'],
                         'hit_count': 0,
                         'kw_score': 0.0,
                         'similarity': sim,
@@ -820,7 +839,7 @@ async def search_memories_hybrid(query: str, limit: int = 10):
             kw = kw_norm.get(mid, 0.0)
             sem = sem_norm.get(mid, 0.0)
             imp = info['importance'] / 10.0
-            days = (now - info['created_at']).total_seconds() / 86400.0
+            days = _effective_days_ago(info.get('event_date'), info['created_at'], now)
             rec = 1.0 / (1.0 + days)
             
             score = (MEMORY_HW_KEYWORD * kw +
@@ -833,6 +852,7 @@ async def search_memories_hybrid(query: str, limit: int = 10):
                 'content': info['content'],
                 'importance': info['importance'],
                 'created_at': info['created_at'],
+                'event_date': info.get('event_date'),
                 'hit_count': info['hit_count'],
                 'similarity': info['similarity'],
                 'score': score,
