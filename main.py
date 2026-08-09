@@ -28,6 +28,7 @@ from fastapi.templating import Jinja2Templates
 
 from database import import_memories_v2, _parse_backup_datetime
 from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, create_consolidated_events, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
+from database import search_chat_fragments, rebuild_content_tsv, kick_embedding_backfill, get_embedding_backfill_status, mark_fragments_seen
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories
 
@@ -63,6 +64,15 @@ MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "false").lower() == "true"
 # 每次注入的最大记忆条数
 MAX_MEMORIES_INJECT = int(os.getenv("MAX_MEMORIES_INJECT", "15"))
 
+# 分区模式自动注入的最大历史对话片段数。raw API 可逐请求覆盖。
+MAX_CONVERSATIONS_INJECT = int(os.getenv("MAX_CONVERSATIONS_INJECT", "3"))
+
+# 同一历史片段在分区模式中的自动去重窗口。0 = 不保留 seen 去重状态。
+CONVERSATION_SEEN_TTL_HOURS = max(
+    0.0,
+    float(os.getenv("CONVERSATION_SEEN_TTL_HOURS", "6")),
+)
+
 # 记忆提取间隔（0 = 禁用自动提取，1 = 每轮提取，N = 每 N 轮提取一次）
 MEMORY_EXTRACT_INTERVAL = int(os.getenv("MEMORY_EXTRACT_INTERVAL", "1"))
 
@@ -91,8 +101,8 @@ def get_active_session_id() -> str:
 
 
 def conversation_persistence_enabled() -> bool:
-    """对话落库服务于记忆与分区轮转，任一功能开启都需要保留历史。"""
-    return MEMORY_ENABLED or CACHE_PARTITION_ENABLED
+    """记忆、分区或对话召回任一开启时都需要保留历史。"""
+    return MEMORY_ENABLED or CACHE_PARTITION_ENABLED or _db_module.CONVERSATION_RECALL_ENABLED
 
 # 时区偏移（小时），用于记忆注入时的日期显示，默认 UTC+8
 TIMEZONE_HOURS = int(os.getenv("TIMEZONE_HOURS", "8"))
@@ -209,7 +219,9 @@ async def lifespan(app: FastAPI):
                 _RESTORE_MAIN = {
                     "API_BASE_URL": str, "API_KEY": str, "DEFAULT_MODEL": str,
                     "MEMORY_ENABLED": lambda v: _parse_bool(v),
-                    "MAX_MEMORIES_INJECT": int, "MEMORY_EXTRACT_INTERVAL": int,
+                    "MAX_MEMORIES_INJECT": int, "MAX_CONVERSATIONS_INJECT": int,
+                    "CONVERSATION_SEEN_TTL_HOURS": lambda v: max(0.0, float(v)),
+                    "MEMORY_EXTRACT_INTERVAL": int,
                     "CACHE_PARTITION_ENABLED": lambda v: _parse_bool(v),
                     "CACHE_PARTITION_X": int, "CACHE_PARTITION_TRIGGER": str,
                     "CACHE_PARTITION_WINDOW": int, "CACHE_SUMMARY_MODEL": str,
@@ -222,6 +234,11 @@ async def lifespan(app: FastAPI):
                     "EMBEDDING_MODEL": str, "EMBEDDING_DIM": int,
                     "MIN_SCORE_THRESHOLD": float,
                     "MEMORY_VECTOR_ENABLED": lambda v: _parse_bool(v),
+                    "CONVERSATION_RECALL_ENABLED": lambda v: _parse_bool(v),
+                    "CONVERSATION_MIN_SCORE_THRESHOLD": float,
+                    "CONVERSATION_HW_KEYWORD": float,
+                    "CONVERSATION_HW_SEMANTIC": float,
+                    "CONVERSATION_HW_RECENCY": float,
                     "MEMORY_HW_KEYWORD": float, "MEMORY_HW_SEMANTIC": float,
                     "MEMORY_HW_IMPORTANCE": float, "MEMORY_HW_RECENCY": float,
                     "MEMORY_SEMANTIC_THRESHOLD": float,
@@ -266,6 +283,14 @@ async def lifespan(app: FastAPI):
                 print(f"ℹ️  记忆提取+注入已关闭（MEMORY_EXTRACT_ENABLED=false）")
         else:
             print("ℹ️  记忆系统已关闭；Dashboard 配置与对话线状态仍可用")
+
+        if _db_module.CONVERSATION_RECALL_ENABLED:
+            updated_tsv = await rebuild_content_tsv()
+            started = kick_embedding_backfill()
+            print(
+                f"🔎 对话召回已启动: TSV补齐{updated_tsv}条, "
+                f"向量补算={'已唤醒' if started else '无需重复唤醒'}"
+            )
 
         # 活跃对话线属于分区缓存状态，必须独立于记忆开关恢复。
         db_sid = await get_gateway_config("partition_session_id", "")
@@ -724,6 +749,7 @@ async def build_partitioned_messages(
     all_messages: list,
     base_prompt: str,
     user_message: str,
+    conversation_recall_text: str = "",
 ) -> list:
     """
     分区缓存模式：构建带breakpoint的messages数组。
@@ -773,7 +799,14 @@ async def build_partitioned_messages(
     a_start_round = state['a_start_round']
     
     if total_rounds < X:
-        return await _build_basic_cached(history, base_prompt, user_message, current_user_msg, summary_parts)
+        return await _build_basic_cached(
+            history,
+            base_prompt,
+            user_message,
+            current_user_msg,
+            summary_parts,
+            conversation_recall_text,
+        )
     
     # 计算A/B区（按逻辑轮切片）
     a_end_round = a_start_round + X
@@ -867,6 +900,9 @@ async def build_partitioned_messages(
             mem_text = await build_memory_text(user_message)
             if mem_text:
                 parts.append(mem_text)
+
+        if conversation_recall_text:
+            parts.append(conversation_recall_text)
         
         result.append(_assemble_current_user_message(parts, current_user_msg['content']))
 
@@ -884,6 +920,7 @@ async def _build_basic_cached(
     user_message: str,
     current_user_msg: dict,
     summary_parts: list = None,
+    conversation_recall_text: str = "",
 ) -> list:
     """基础版prompt caching（历史不够分区时的降级模式）"""
     summary_parts = summary_parts or []
@@ -923,6 +960,9 @@ async def _build_basic_cached(
             mem_text = await build_memory_text(user_message)
             if mem_text:
                 parts.append(mem_text)
+
+        if conversation_recall_text:
+            parts.append(conversation_recall_text)
         
         result.append(_assemble_current_user_message(parts, current_user_msg['content']))
 
@@ -967,6 +1007,64 @@ async def build_memory_text(user_message: str) -> str:
     except Exception as e:
         print(f"⚠️ 记忆检索失败: {e}")
         return ""
+
+
+async def build_conversation_recall_text(user_message: str, session_id: str):
+    """为分区模式检索未注入过的对话片段，并返回待确认的 fragment_id。"""
+    if (
+        not _db_module.CONVERSATION_RECALL_ENABLED
+        or MAX_CONVERSATIONS_INJECT <= 0
+        or not user_message.strip()
+    ):
+        return "", []
+    try:
+        state = await get_session_cache_state(
+            session_id,
+            CONVERSATION_SEEN_TTL_HOURS,
+        )
+        results, _ = await search_chat_fragments(
+            user_message,
+            max_sessions=MAX_CONVERSATIONS_INJECT,
+            max_matches_per_session=1,
+            context=1,
+            mode="hybrid",
+            exclude_session_ids=[session_id],
+            exclude_fragment_ids=state.get("seen_fragment_ids", []),
+        )
+        if not results:
+            return "", []
+
+        blocks = []
+        fragment_ids = []
+        role_labels = {"user": "用户", "assistant": "AI", "tool": "工具"}
+        for result in results:
+            for fragment, fragment_id in zip(
+                result.get("fragments", []),
+                result.get("fragment_ids", []),
+            ):
+                lines = []
+                for message in fragment:
+                    date_prefix = ""
+                    if message.get("created_at"):
+                        date_prefix = f"[{str(message['created_at'])[:10]}] "
+                    role = role_labels.get(message.get("role"), message.get("role", "消息"))
+                    lines.append(f"{date_prefix}{role}: {message.get('content', '')}")
+                if lines and fragment_id:
+                    blocks.append("\n".join(lines))
+                    fragment_ids.append(fragment_id)
+
+        if not blocks:
+            return "", []
+        return (
+            "<retrieved_conversations>\n"
+            "以下是网关检索的相关历史对话片段，供参考，非用户本次输入：\n"
+            + "\n\n".join(blocks)
+            + "\n</retrieved_conversations>",
+            fragment_ids,
+        )
+    except Exception as e:
+        print(f"⚠️ 对话召回失败: {e}")
+        return "", []
 
 
 # ============================================================
@@ -1052,7 +1150,7 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
         
         # 2. 检查是否需要提取记忆
         if not MEMORY_ENABLED:
-            print(f"⏭️  记忆系统已关闭；仅保留分区缓存所需的对话记录")
+            print(f"⏭️  记忆系统已关闭；仅保留分区缓存或对话召回所需的对话记录")
             return
 
         if not MEMORY_EXTRACT_ENABLED:
@@ -1192,6 +1290,7 @@ async def chat_completions(request: Request):
 async def _chat_completions_inner(request: Request):
     body = await request.json()
     messages = body.get("messages", [])
+    pending_fragment_ids = []
     
     # ---------- 检测是否应跳过对话存储 ----------
     # 优先尊重客户端显式声明；无法加 header 的客户端则识别其标题生成模板。
@@ -1337,8 +1436,15 @@ async def _chat_completions_inner(request: Request):
         if client_system_text:
             partition_prompt = ((partition_prompt or "") + "\n\n" + client_system_text).strip()
         try:
+            conversation_recall_text, pending_fragment_ids = (
+                await build_conversation_recall_text(user_message, session_id)
+            )
             messages = await build_partitioned_messages(
-                session_id, all_msgs, partition_prompt, user_message
+                session_id,
+                all_msgs,
+                partition_prompt,
+                user_message,
+                conversation_recall_text,
             )
         except Exception as e:
             print(f"❌ 分区缓存不可用：读取轮转状态失败: {e}")
@@ -1422,7 +1528,17 @@ async def _chat_completions_inner(request: Request):
     
     if is_stream:
         return StreamingResponse(
-            stream_and_capture(headers, body, session_id, user_message, model, original_messages, skip_conversation_log, tool_messages),
+            stream_and_capture(
+                headers,
+                body,
+                session_id,
+                user_message,
+                model,
+                original_messages,
+                skip_conversation_log,
+                tool_messages,
+                pending_fragment_ids,
+            ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
@@ -1446,6 +1562,16 @@ async def _chat_completions_inner(request: Request):
                         print(f"🧠 Response 包含 reasoning_content ({len(assistant_reasoning)}字符)")
                 except (KeyError, IndexError):
                     pass
+
+                if pending_fragment_ids:
+                    try:
+                        await mark_fragments_seen(
+                            session_id,
+                            pending_fragment_ids,
+                            CONVERSATION_SEEN_TTL_HOURS,
+                        )
+                    except Exception as e:
+                        print(f"⚠️ 对话召回 seen 写入失败，保留待下次重试: {e}")
                 
                 if conversation_persistence_enabled() and (user_message or tool_messages):
                     asyncio.create_task(
@@ -1464,13 +1590,14 @@ async def _chat_completions_inner(request: Request):
                 return JSONResponse(status_code=response.status_code, content=error_content)
 
 
-async def stream_and_capture(headers: dict, body: dict, session_id: str, user_message: str, model: str, original_messages: list = None, skip_conversation_log: bool = False, tool_messages: list = None):
+async def stream_and_capture(headers: dict, body: dict, session_id: str, user_message: str, model: str, original_messages: list = None, skip_conversation_log: bool = False, tool_messages: list = None, pending_fragment_ids: list = None):
     """流式响应 + 捕获完整回复（原始字节透传，确保SSE格式和thinking数据完整）"""
     full_response = []
     full_reasoning = []
     stream_usage = {}
     line_buffer = ""
     accumulated_tool_calls = {}  # index -> {id, type, function: {name, arguments}}
+    stream_succeeded = False
     
     async with httpx.AsyncClient(timeout=300) as client:
         async with client.stream("POST", API_BASE_URL, headers=headers, json=body) as response:
@@ -1538,6 +1665,7 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
                                             accumulated_tool_calls[idx]["function"]["arguments"] += fn["arguments"]
                         except (json.JSONDecodeError, KeyError, IndexError):
                             pass
+            stream_succeeded = response.status_code == 200
     
     assistant_msg = "".join(full_response)
     assistant_reasoning = "".join(full_reasoning) if full_reasoning else None
@@ -1553,6 +1681,16 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
     
     if assistant_tool_calls:
         print(f"🔧 Stream response 包含 {len(assistant_tool_calls)} 个工具调用")
+
+    if stream_succeeded and pending_fragment_ids:
+        try:
+            await mark_fragments_seen(
+                session_id,
+                pending_fragment_ids,
+                CONVERSATION_SEEN_TTL_HOURS,
+            )
+        except Exception as e:
+            print(f"⚠️ 对话召回 seen 写入失败，保留待下次重试: {e}")
     
     if stream_usage:
         pt = stream_usage.get("prompt_tokens", 0)
@@ -2414,8 +2552,8 @@ async def import_memories(request: Request):
 
 @app.get("/api/conversations")
 async def api_conversations(page: int = 1, per_page: int = 20):
-    if not MEMORY_ENABLED:
-        return {"error": "记忆系统未启用"}
+    if not conversation_persistence_enabled():
+        return {"error": "对话持久化未启用"}
     try:
         results, total = await get_conversations_paginated(page, per_page)
         total_pages = max(1, -(-total // per_page))  # 向上取整
@@ -2426,8 +2564,8 @@ async def api_conversations(page: int = 1, per_page: int = 20):
 
 @app.get("/api/conversations/{session_id}/messages")
 async def api_conversation_messages(session_id: str, limit: int = 50, offset: int = 0):
-    if not MEMORY_ENABLED:
-        return {"error": "记忆系统未启用"}
+    if not conversation_persistence_enabled():
+        return {"error": "对话持久化未启用"}
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
@@ -2449,8 +2587,8 @@ async def api_conversation_messages(session_id: str, limit: int = 50, offset: in
 
 @app.delete("/api/conversations/{session_id}")
 async def api_delete_conversation(session_id: str):
-    if not MEMORY_ENABLED:
-        return {"error": "记忆系统未启用"}
+    if not conversation_persistence_enabled():
+        return {"error": "对话持久化未启用"}
     try:
         await delete_conversation(session_id)
         return {"status": "ok"}
@@ -2460,8 +2598,8 @@ async def api_delete_conversation(session_id: str):
 
 @app.post("/api/conversations/batch-delete")
 async def api_batch_delete(request: Request):
-    if not MEMORY_ENABLED:
-        return {"error": "记忆系统未启用"}
+    if not conversation_persistence_enabled():
+        return {"error": "对话持久化未启用"}
     try:
         body = await request.json()
         ids = body.get("session_ids", [])
@@ -2474,8 +2612,8 @@ async def api_batch_delete(request: Request):
 
 @app.post("/api/admin/merge-sessions")
 async def api_merge_sessions(request: Request):
-    if not MEMORY_ENABLED:
-        return {"error": "记忆系统未启用"}
+    if not conversation_persistence_enabled():
+        return {"error": "对话持久化未启用"}
     try:
         body = await request.json()
         source_ids = [s for s in body.get("source_ids", []) if s != body.get("target_id", "")]
@@ -2491,8 +2629,8 @@ async def api_merge_sessions(request: Request):
 @app.get("/api/chat/search")
 async def api_search_conversations(q: str = "", limit: int = 20, offset: int = 0):
     """搜索对话内容"""
-    if not MEMORY_ENABLED:
-        return {"error": "记忆系统未启用"}
+    if not conversation_persistence_enabled():
+        return {"error": "对话持久化未启用"}
     if not q.strip():
         return {"error": "搜索关键词不能为空", "results": [], "total": 0}
     try:
@@ -2502,11 +2640,137 @@ async def api_search_conversations(q: str = "", limit: int = 20, offset: int = 0
         return {"error": str(e), "results": [], "total": 0}
 
 
+def _bounded_int(value, default: int, lower: int, upper: int) -> int:
+    try:
+        return min(upper, max(lower, int(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+async def _run_fragment_search(
+    query: str,
+    max_sessions,
+    max_matches,
+    context,
+    mode: str,
+    exclude_session_ids: list,
+    exclude_fragment_ids: list,
+):
+    query = query.strip()
+    if not query:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "搜索关键词不能为空", "results": [], "total_sessions": 0},
+        )
+    if not _db_module.CONVERSATION_RECALL_ENABLED:
+        return JSONResponse(
+            status_code=409,
+            content={"error": "对话召回未启用", "results": [], "total_sessions": 0},
+        )
+    mode = mode if mode in {"keyword", "hybrid"} else "hybrid"
+    default_limit = max(1, MAX_CONVERSATIONS_INJECT)
+    max_sessions = _bounded_int(max_sessions, default_limit, 1, 50)
+    max_matches = _bounded_int(max_matches, 1, 1, 5)
+    context = _bounded_int(context, 1, 0, 5)
+    try:
+        results, total_sessions = await search_chat_fragments(
+            query,
+            max_sessions=max_sessions,
+            max_matches_per_session=max_matches,
+            context=context,
+            mode=mode,
+            exclude_session_ids=exclude_session_ids,
+            exclude_fragment_ids=exclude_fragment_ids,
+        )
+        return {
+            "results": results,
+            "total_sessions": total_sessions,
+            "query": query,
+            "mode": mode,
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e), "results": [], "total_sessions": 0},
+        )
+
+
+@app.get("/api/chat/search-fragments")
+async def api_chat_search_fragments(
+    q: str = "",
+    max_sessions: int = None,
+    max_matches: int = 1,
+    context: int = 1,
+    mode: str = "hybrid",
+    exclude_session_ids: str = "",
+    exclude_fragment_ids: str = "",
+):
+    """无状态 raw 召回；排除项用逗号分隔，敏感查询优先使用 POST。"""
+    return await _run_fragment_search(
+        q,
+        max_sessions,
+        max_matches,
+        context,
+        mode,
+        [value for value in exclude_session_ids.split(",") if value],
+        [value for value in exclude_fragment_ids.split(",") if value],
+    )
+
+
+@app.post("/api/chat/search-fragments")
+async def api_chat_search_fragments_post(request: Request):
+    """POST 变体避免查询原文进入 URL 与浏览器历史。"""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "请求体必须是 JSON"})
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400, content={"error": "请求体必须是 JSON 对象"})
+
+    exclude_session_ids = body.get("exclude_session_ids", [])
+    exclude_fragment_ids = body.get("exclude_fragment_ids", [])
+    if not isinstance(exclude_session_ids, list) or not isinstance(exclude_fragment_ids, list):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "exclude_session_ids 和 exclude_fragment_ids 必须是数组"},
+        )
+    return await _run_fragment_search(
+        body.get("q", "") if isinstance(body.get("q", ""), str) else "",
+        body.get("max_sessions"),
+        body.get("max_matches", 1),
+        body.get("context", 1),
+        body.get("mode", "hybrid") if isinstance(body.get("mode", ""), str) else "hybrid",
+        [str(value) for value in exclude_session_ids if value],
+        [str(value) for value in exclude_fragment_ids if value],
+    )
+
+
+@app.post("/api/admin/rebuild-conversation-search")
+async def api_rebuild_conversation_search():
+    if not _db_module.CONVERSATION_RECALL_ENABLED:
+        return JSONResponse(status_code=409, content={"error": "对话召回未启用"})
+    try:
+        updated_tsv = await rebuild_content_tsv()
+        started = kick_embedding_backfill()
+        return {
+            "status": "started" if started else "already_running_or_not_configured",
+            "content_tsv_updated": updated_tsv,
+            "backfill": await get_embedding_backfill_status(),
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/api/admin/conversation-embedding-status")
+async def api_conversation_embedding_status():
+    return await get_embedding_backfill_status()
+
+
 @app.patch("/api/chat/messages/{message_id}")
 async def api_update_message(message_id: int, request: Request):
     """编辑单条消息内容"""
-    if not MEMORY_ENABLED:
-        return {"error": "记忆系统未启用"}
+    if not conversation_persistence_enabled():
+        return {"error": "对话持久化未启用"}
     try:
         body = await request.json()
         content = body.get("content", "").strip()
@@ -2523,8 +2787,8 @@ async def api_update_message(message_id: int, request: Request):
 @app.delete("/api/chat/messages/{message_id}")
 async def api_delete_message(message_id: int):
     """删除单条消息"""
-    if not MEMORY_ENABLED:
-        return {"error": "记忆系统未启用"}
+    if not conversation_persistence_enabled():
+        return {"error": "对话持久化未启用"}
     try:
         deleted = await delete_single_message(message_id)
         if deleted == 0:
@@ -2537,8 +2801,8 @@ async def api_delete_message(message_id: int):
 @app.get("/api/conversations/export")
 async def api_export_conversations():
     """导出所有对话记录"""
-    if not MEMORY_ENABLED:
-        return {"error": "记忆系统未启用"}
+    if not conversation_persistence_enabled():
+        return {"error": "对话持久化未启用"}
     try:
         data = await export_all_conversations()
         return JSONResponse(content=data)
@@ -2549,8 +2813,8 @@ async def api_export_conversations():
 @app.post("/api/conversations/import")
 async def api_import_conversations(request: Request):
     """导入对话记录（JSON格式，自动去重）"""
-    if not MEMORY_ENABLED:
-        return {"error": "记忆系统未启用"}
+    if not conversation_persistence_enabled():
+        return {"error": "对话持久化未启用"}
     try:
         records = await request.json()
         if not isinstance(records, list):
@@ -2904,6 +3168,13 @@ async def get_settings():
             "MEMORY_API_KEY":          _mask_key(memory_key_raw),
             "MEMORY_MODEL":            db.get("MEMORY_MODEL") or os.environ.get("MEMORY_MODEL", ""),
             "MAX_MEMORIES_INJECT":     int(db.get("MAX_MEMORIES_INJECT") or MAX_MEMORIES_INJECT),
+            "MAX_CONVERSATIONS_INJECT": int(
+                db.get("MAX_CONVERSATIONS_INJECT") or MAX_CONVERSATIONS_INJECT
+            ),
+            "CONVERSATION_SEEN_TTL_HOURS": float(
+                db.get("CONVERSATION_SEEN_TTL_HOURS")
+                or CONVERSATION_SEEN_TTL_HOURS
+            ),
             "MIN_SCORE_THRESHOLD":     float(db.get("MIN_SCORE_THRESHOLD") or _db_module.MIN_SCORE_THRESHOLD),
             "MEMORY_EXTRACT_INTERVAL": int(db.get("MEMORY_EXTRACT_INTERVAL") or MEMORY_EXTRACT_INTERVAL),
 
@@ -2917,12 +3188,32 @@ async def get_settings():
 
             # 向量搜索（开源版用 EMBEDDING_API_KEY + EMBEDDING_BASE_URL）
             "MEMORY_VECTOR_ENABLED":   _parse_bool(db.get("MEMORY_VECTOR_ENABLED"), _db_module.MEMORY_VECTOR_ENABLED),
+            "CONVERSATION_RECALL_ENABLED": _parse_bool(
+                db.get("CONVERSATION_RECALL_ENABLED"),
+                _db_module.CONVERSATION_RECALL_ENABLED,
+            ),
+            "CONVERSATION_MIN_SCORE_THRESHOLD": float(
+                db.get("CONVERSATION_MIN_SCORE_THRESHOLD")
+                or _db_module.CONVERSATION_MIN_SCORE_THRESHOLD
+            ),
+            "CONVERSATION_HW_KEYWORD": float(
+                db.get("CONVERSATION_HW_KEYWORD")
+                or _db_module.CONVERSATION_HW_KEYWORD
+            ),
+            "CONVERSATION_HW_SEMANTIC": float(
+                db.get("CONVERSATION_HW_SEMANTIC")
+                or _db_module.CONVERSATION_HW_SEMANTIC
+            ),
+            "CONVERSATION_HW_RECENCY": float(
+                db.get("CONVERSATION_HW_RECENCY")
+                or _db_module.CONVERSATION_HW_RECENCY
+            ),
             "EMBEDDING_API_KEY":       _mask_key(embedding_key_raw),
             "EMBEDDING_BASE_URL":      db.get("EMBEDDING_BASE_URL") or str(_db_module.EMBEDDING_BASE_URL),
             "EMBEDDING_MODEL":         db.get("EMBEDDING_MODEL") or str(_db_module.EMBEDDING_MODEL),
             "EMBEDDING_DIM":           int(db.get("EMBEDDING_DIM") or _db_module.EMBEDDING_DIM),
 
-            # 搜索权重
+            # 记忆搜索权重
             "MEMORY_HW_KEYWORD":        float(db.get("MEMORY_HW_KEYWORD") or _db_module.MEMORY_HW_KEYWORD),
             "MEMORY_HW_SEMANTIC":       float(db.get("MEMORY_HW_SEMANTIC") or _db_module.MEMORY_HW_SEMANTIC),
             "MEMORY_HW_IMPORTANCE":     float(db.get("MEMORY_HW_IMPORTANCE") or _db_module.MEMORY_HW_IMPORTANCE),
@@ -2959,6 +3250,8 @@ async def save_settings(request: Request):
             "MEMORY_API_KEY":        str,
             "MEMORY_ENABLED":        lambda v: _parse_bool(v),
             "MAX_MEMORIES_INJECT":   int,
+            "MAX_CONVERSATIONS_INJECT": int,
+            "CONVERSATION_SEEN_TTL_HOURS": lambda v: max(0.0, float(v)),
             "MEMORY_EXTRACT_INTERVAL": int,
             "CACHE_PARTITION_ENABLED": lambda v: _parse_bool(v),
             "CACHE_PARTITION_X":     int,
@@ -2978,6 +3271,11 @@ async def save_settings(request: Request):
             "EMBEDDING_DIM":           int,
             "MIN_SCORE_THRESHOLD":     float,
             "MEMORY_VECTOR_ENABLED":   lambda v: _parse_bool(v),
+            "CONVERSATION_RECALL_ENABLED": lambda v: _parse_bool(v),
+            "CONVERSATION_MIN_SCORE_THRESHOLD": float,
+            "CONVERSATION_HW_KEYWORD": float,
+            "CONVERSATION_HW_SEMANTIC": float,
+            "CONVERSATION_HW_RECENCY": float,
             "MEMORY_HW_KEYWORD":       float,
             "MEMORY_HW_SEMANTIC":      float,
             "MEMORY_HW_IMPORTANCE":    float,
@@ -3050,6 +3348,12 @@ async def save_settings(request: Request):
 
         if updated:
             sync_memory_extractor_config()
+        if (
+            "CONVERSATION_RECALL_ENABLED" in updated
+            and _db_module.CONVERSATION_RECALL_ENABLED
+        ):
+            await rebuild_content_tsv()
+            kick_embedding_backfill()
 
         return {
             "status": "ok",

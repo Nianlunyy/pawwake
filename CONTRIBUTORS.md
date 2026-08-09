@@ -16,4 +16,4 @@ Reliability developer and reviewer. Works on memory-consolidation safety, runtim
 
 ## Contribution Policy
 
-Contributions are released under the license in [LICENSE](LICENSE). Public credits use contributor names only; private email addresses are intentionally excluded.
+Contributions are released under the [GNU Affero General Public License v3.0 only](LICENSE) (`AGPL-3.0-only`). Public credits use contributor names only; private email addresses are intentionally excluded.

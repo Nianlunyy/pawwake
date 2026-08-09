@@ -1,4 +1,10 @@
-# 🧸 AI Memory Gateway
+# 🐾 Pawwake · 爪迹
+
+**4.0 · Madeleine**
+
+*Follow the pawprints back.*
+
+Formerly AI Memory Gateway.
 
 **让你的 AI 拥有长期记忆。**
 
@@ -21,6 +27,7 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 - **预置记忆** — 把你想让 AI "一开始就知道"的事情批量导入
 - **兼容性强** — 支持所有 OpenAI 格式的客户端和 API 服务商
 - **记忆向量搜索（可选）** — 关键词 + 语义向量四维混合搜索，说"过年"能搜到"春节"。支持 OpenAI 兼容的 Embedding API
+- **原始对话召回（可选）** — 从历史消息检索带上下文的稳定片段；分区模式按可配置 TTL 自动去重，raw API 支持调用方传入 session 与片段排除集合
 - **设置面板** — 在 Dashboard 中直接管理所有运行时配置，热更新无需重启。支持模型列表动态拉取、可搜索下拉选择
 - **零成本起步** — 可部署在 Render、Zeabur 等平台的免费额度内
 
@@ -29,7 +36,7 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 ```
 你的客户端（Kelivo / ChatBox / ...）
         ↓
-   AI Memory Gateway（本项目）
+   Pawwake · 爪迹（本项目）
    ├── 注入 system prompt（人设）
    ├── 搜索相关记忆 → 注入上下文
    ├── 转发请求 → LLM API
@@ -175,7 +182,7 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 ## 📁 文件说明
 
 ```
-ai-memory-gateway/
+pawwake/
 ├── main.py                    # 网关主程序
 ├── database.py                # 数据库操作（PostgreSQL）
 ├── memory_extractor.py        # AI 记忆提取
@@ -189,7 +196,7 @@ ai-memory-gateway/
 ├── static/                    # 静态资源
 │   ├── css/                   # 样式文件
 │   └── js/                    # 前端脚本
-├── LICENSE                    # MIT 许可证
+├── LICENSE                    # GNU AGPLv3 许可证
 └── README.md                  # 本文件
 ```
 
@@ -218,7 +225,10 @@ ai-memory-gateway/
 | `/api/conversations/{id}/messages` | GET | 获取指定对话的消息列表 |
 | `/api/conversations/{id}` | DELETE | 删除指定对话 |
 | `/api/conversations/batch-delete` | POST | 批量删除对话 |
+| `/api/chat/search-fragments` | GET/POST | 无状态检索历史对话片段；POST 支持数组形式的排除参数 |
 | `/api/admin/merge-sessions` | POST | 合并多个 session 到目标 session |
+| `/api/admin/rebuild-conversation-search` | POST | 补齐对话 TSV 并唤醒向量补算 |
+| `/api/admin/conversation-embedding-status` | GET | 查询对话检索索引与向量补算状态 |
 | `/api/admin/backfill-memory-embeddings` | POST | 启动记忆 embedding 补算（后台异步） |
 | `/api/admin/backfill-memory-embeddings/status` | GET | 查询补算进度 |
 | `/api/models` | GET | 获取可用模型列表（根据 API 服务商自动适配） |
@@ -273,6 +283,34 @@ ai-memory-gateway/
 
 开启后，新记忆会自动计算 embedding。已有记忆可以在 Dashboard 记忆管理页面点击「开始补算」一键补算。
 
+**原始对话召回（可选）：**
+
+对话召回默认关闭。开启后，新写入、编辑、重复提交覆盖和导入都会同步维护关键词索引，旧向量会失效并由可续跑 worker 补算。混合排序使用关键词、语义和新近度；语义候选先按原始余弦相似度过滤，再做 min-max 归一化，避免弱候选池把无关头名拉成满分。
+
+| 环境变量 | 说明 | 默认值 |
+|---------|------|--------|
+| `CONVERSATION_RECALL_ENABLED` | 对话召回总开关；关闭时不写索引、不补算、不检索 | `false` |
+| `MAX_CONVERSATIONS_INJECT` | 分区模式每轮最多自动注入的历史对话片段数；`0` 关闭自动注入 | `3` |
+| `CONVERSATION_SEEN_TTL_HOURS` | 分区模式按 `fragment_id` 去重的小时数；过期后允许再次召回，`0` 关闭 seen 去重 | `6` |
+| `CONVERSATION_MIN_SCORE_THRESHOLD` | 对话语义候选的最低原始余弦相似度，与记忆阈值分开 | `0.7` |
+| `CONVERSATION_HW_KEYWORD` | 对话混合搜索：关键词权重 | `0.45` |
+| `CONVERSATION_HW_SEMANTIC` | 对话混合搜索：语义相似度权重 | `0.35` |
+| `CONVERSATION_HW_RECENCY` | 对话混合搜索：时间衰减权重 | `0.2` |
+
+分区模式会排除当前 session，并按 `CONVERSATION_SEEN_TTL_HOURS` 保存每个成功注入的稳定 `fragment_id` 及其独立时间戳。TTL 内不会重复注入同一片段，过期后会自动放行；`0` 关闭 seen 去重。普通非流式请求仅在上游返回 200 后标记；流式请求仅在 200 响应自然结束后标记，客户端取消或上游失败不会吞掉片段。非分区模式不会自动注入。
+
+raw API 不保存 seen 状态。调用方需要把上次返回的 `fragment_ids` 作为下次的 `exclude_fragment_ids` 传回，也可以用 `exclude_session_ids` 排除整条对话线。POST 示例：
+
+```json
+{
+  "q": "上次聊到的旅行计划",
+  "mode": "hybrid",
+  "max_sessions": 3,
+  "exclude_session_ids": ["current-thread"],
+  "exclude_fragment_ids": ["v1:0123456789abcdef0123456789abcdef"]
+}
+```
+
 ## ❓ 常见问题
 
 **Q: 部署后访问显示 502 或服务无响应？**
@@ -294,6 +332,16 @@ A: 打开 `https://你的网关地址/dashboard`，在「导出备份」页面�
 A: 能。这个项目的第一个部署者就是不会写代码的——代码是 AI 写的，部署是她自己看文档搞定的。
 
 ## 📋 更新日志
+
+### v4.0 · Madeleine（2026-08-10）
+
+- **原始对话召回** — 新增默认关闭的历史原文召回，可从过往对话中找回带上下文的稳定片段，与摘要记忆互补
+- **中文混合搜索** — 统一中文写入与查询词表，组合关键词、语义相似度和新近度排序；语义候选先过原始余弦阈值，减少弱结果被归一化抬高
+- **可续跑向量补算** — 新消息、编辑、重复提交覆盖和导入会同步维护关键词索引；旧对话的 embedding 可后台分批补算，失败可续跑
+- **两层召回去重** — 始终排除当前活跃 session；历史片段按稳定 `fragment_id` 和独立时间戳去重，TTL 可配置，`0` 可关闭 seen 去重
+- **成功后再记 seen** — 非流式请求只在上游返回 200 后标记，流式请求只在自然结束后标记；取消、断流或上游失败均保留重试机会
+- **Dashboard 对话召回设置** — 新增最大注入数、关键词/语义/时效性权重、语义阈值和片段去重时长，保存后热更新并在重启时恢复，所有数值均支持 `0`
+- **项目更名与协议更新** — AI Memory Gateway 正式更名为 **Pawwake · 爪迹**，4.0 代号 **Madeleine**，许可证更新为 GNU AGPLv3
 
 ### v3.9（2026-08-02）
 
@@ -327,7 +375,7 @@ A: 能。这个项目的第一个部署者就是不会写代码的——代码�
   - 记忆系统（开关、提取模型、注入条数、分数阈值、提取间隔）
   - 缓存分区（开关、轮转周期、摘要模型）
   - 向量搜索（开关、Embedding API Key/Base URL/模型/维度）
-  - 搜索权重（四维权重滑块 + 语义阈值）
+  - 记忆搜索权重（四维权重滑块 + 语义阈值）
   - 其他（强制流式、推理强度）
   - System Prompt（在线编辑，实时字数统计）
 - **模型列表 API** — 新增 `/api/models` 端点，根据 API 服务商（OpenRouter/Google/OpenAI）自动拉取可用模型列表，设置面板的模型选择框支持搜索过滤
@@ -404,7 +452,9 @@ A: 能。这个项目的第一个部署者就是不会写代码的——代码�
 
 ## 📄 许可证
 
-[MIT License](LICENSE) — 随便用，改了也不用告诉我。
+[GNU Affero General Public License v3.0 only](LICENSE)（`AGPL-3.0-only`）。
+
+Copyright (C) 2026 七堂伽藍_, Midsummer, and Solstice.
 
 ## 🤝 Contributors / 贡献者
 

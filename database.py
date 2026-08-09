@@ -9,6 +9,7 @@
 
 import os
 import re
+import json
 from typing import Optional, List
 from datetime import datetime, date, timedelta, timezone as dt_timezone
 
@@ -29,6 +30,21 @@ EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "256"))
 
 # 记忆向量搜索开关（需要同时设置 EMBEDDING_API_KEY）
 MEMORY_VECTOR_ENABLED = os.getenv("MEMORY_VECTOR_ENABLED", "false").lower() == "true"
+
+# 原始对话召回总开关。关闭时不写对话检索索引，也不触发对话向量补算。
+CONVERSATION_RECALL_ENABLED = os.getenv(
+    "CONVERSATION_RECALL_ENABLED", "false"
+).lower() == "true"
+
+# 对话召回使用原始余弦相似度做归一化前过滤，避免弱候选池被拉成满分。
+CONVERSATION_MIN_SCORE_THRESHOLD = float(
+    os.getenv("CONVERSATION_MIN_SCORE_THRESHOLD", "0.7")
+)
+
+CONVERSATION_HW_KEYWORD = float(os.getenv("CONVERSATION_HW_KEYWORD", "0.45"))
+CONVERSATION_HW_SEMANTIC = float(os.getenv("CONVERSATION_HW_SEMANTIC", "0.35"))
+CONVERSATION_HW_RECENCY = float(os.getenv("CONVERSATION_HW_RECENCY", "0.2"))
+_CONVERSATION_CANDIDATE_POOL = 20
 
 # 记忆搜索权重（纯关键词模式）
 WEIGHT_KEYWORD = float(os.getenv("WEIGHT_KEYWORD", "0.5"))
@@ -127,6 +143,15 @@ async def init_tables():
         await conn.execute("""
             ALTER TABLE conversations ALTER COLUMN content DROP NOT NULL;
         """)
+
+        # 原始对话召回索引。NULL 同时作为可恢复 backfill 的持久账本。
+        await conn.execute("""
+            ALTER TABLE conversations ADD COLUMN IF NOT EXISTS content_tsv TSVECTOR;
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_conversations_content_tsv
+            ON conversations USING GIN (content_tsv);
+        """)
         
         # 网关配置表（存储运行时可变配置）
         await conn.execute("""
@@ -142,8 +167,30 @@ async def init_tables():
                 session_id      TEXT PRIMARY KEY,
                 summary         TEXT DEFAULT '',
                 a_start_round   INTEGER DEFAULT 0,
+                seen_fragment_ids TEXT[] DEFAULT '{}',
+                seen_fragment_times JSONB DEFAULT '{}'::jsonb,
                 updated_at      TIMESTAMPTZ DEFAULT NOW()
             );
+        """)
+        await conn.execute("""
+            ALTER TABLE session_cache_state
+            ADD COLUMN IF NOT EXISTS seen_fragment_ids TEXT[] DEFAULT '{}';
+        """)
+        await conn.execute("""
+            ALTER TABLE session_cache_state
+            ADD COLUMN IF NOT EXISTS seen_fragment_times JSONB DEFAULT '{}'::jsonb;
+        """)
+        await conn.execute("""
+            UPDATE session_cache_state AS scs
+            SET seen_fragment_times = (
+                SELECT COALESCE(
+                    jsonb_object_agg(fragment_id, to_jsonb(scs.updated_at)),
+                    '{}'::jsonb
+                )
+                FROM unnest(COALESCE(scs.seen_fragment_ids, '{}'::text[])) AS fragment_id
+            )
+            WHERE COALESCE(scs.seen_fragment_times, '{}'::jsonb) = '{}'::jsonb
+              AND cardinality(COALESCE(scs.seen_fragment_ids, '{}'::text[])) > 0;
         """)
         
         # ---- 三层记忆架构字段（layer / title / is_active / merged_from / event_date）----
@@ -367,6 +414,54 @@ def extract_search_keywords(query: str) -> List[str]:
     return list(keywords)
 
 
+def jieba_tokenize_for_tsv(text: str) -> str:
+    """把文本转换为 PostgreSQL simple tsvector 的分词输入。"""
+    if not text:
+        return ""
+    return " ".join(
+        word.lower()
+        for raw_word in jieba.cut(text, cut_all=False)
+        if (word := raw_word.strip()) and word not in _STOP_WORDS
+    )
+
+
+def _conversation_query_terms(query: str) -> tuple[list[str], bool]:
+    """对话关键词统一词表；TF-IDF 失效时只保留连续未知中文词组。"""
+    keywords = sorted(extract_search_keywords(query))
+    if keywords:
+        return keywords, False
+
+    phrases = []
+    current = []
+    for raw_word in jieba.cut(query, cut_all=False):
+        word = raw_word.strip()
+        if (
+            len(word) == 1
+            and "\u4e00" <= word <= "\u9fff"
+            and word not in _STOP_WORDS
+        ):
+            current.append(word)
+            continue
+        if len(current) >= 2:
+            phrases.append("".join(current))
+        current = []
+    if len(current) >= 2:
+        phrases.append("".join(current))
+    return sorted(set(phrases)), True
+
+
+def build_tsquery(query: str) -> str:
+    """把对话搜索词编码成 tsquery；未知中文词组改走精确子串后备。"""
+    tokens, exact_phrase_fallback = _conversation_query_terms(query)
+    if exact_phrase_fallback:
+        return ""
+    escaped = [
+        "'" + token.replace("\\", "\\\\").replace("'", "''") + "'"
+        for token in tokens
+    ]
+    return " & ".join(escaped)
+
+
 # ============================================================
 # 向量搜索（OpenAI 兼容 Embedding API）
 # ============================================================
@@ -407,6 +502,87 @@ async def compute_embedding(text: str) -> list:
         return []
 
 
+# 搜索记忆与对话时复用同一条 query embedding。持久写入与 backfill 绕过缓存。
+QUERY_EMBED_CACHE_TTL = float(os.getenv("QUERY_EMBED_CACHE_TTL", "5"))
+QUERY_EMBED_CACHE_MAX = 128
+_query_embed_cache = {}
+_query_embed_inflight = {}
+_query_embed_locks = {}
+
+
+def _get_query_embed_lock():
+    import asyncio
+
+    loop = asyncio.get_running_loop()
+    lock = _query_embed_locks.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _query_embed_locks[loop] = lock
+    return lock
+
+
+async def _query_embed_worker(key, query: str) -> list:
+    import time
+
+    try:
+        vector = await compute_embedding(query)
+        if vector:
+            if len(_query_embed_cache) >= QUERY_EMBED_CACHE_MAX:
+                _query_embed_cache.pop(next(iter(_query_embed_cache)), None)
+            _query_embed_cache[key] = (
+                time.monotonic() + QUERY_EMBED_CACHE_TTL,
+                tuple(vector),
+            )
+        return vector
+    finally:
+        _query_embed_inflight.pop(key, None)
+
+
+async def get_query_embedding(query: str) -> list:
+    """短窗口复用 query 向量；失败和空向量不进入缓存。"""
+    import asyncio
+    import time
+
+    if not EMBEDDING_API_KEY:
+        return []
+    normalized_query = query.strip()
+    if not normalized_query:
+        return []
+
+    key = (
+        normalized_query,
+        EMBEDDING_BASE_URL.rstrip("/"),
+        EMBEDDING_MODEL,
+        EMBEDDING_DIM,
+    )
+    lock = _get_query_embed_lock()
+    async with lock:
+        hit = _query_embed_cache.get(key)
+        if hit is not None:
+            expires_at, vector = hit
+            if time.monotonic() < expires_at:
+                _query_embed_cache.pop(key, None)
+                _query_embed_cache[key] = (expires_at, vector)
+                return list(vector)
+            _query_embed_cache.pop(key, None)
+
+        task = _query_embed_inflight.get(key)
+        if task is None or task.done():
+            task = asyncio.get_running_loop().create_task(
+                _query_embed_worker(key, normalized_query)
+            )
+            _query_embed_inflight[key] = task
+
+    try:
+        result = await asyncio.shield(task)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        print(f"⚠️ query向量共享任务失败: {e}")
+        return []
+    return list(result)
+
+
 async def save_memory_embedding(conn, memory_id: int, embedding: list):
     """保存记忆向量到memories表"""
     if not embedding:
@@ -423,6 +599,27 @@ async def save_memory_embedding(conn, memory_id: int, embedding: list):
         await conn.execute(
             "UPDATE memories SET embedding_json = $1 WHERE id = $2",
             json.dumps(embedding), memory_id
+        )
+
+
+async def save_conversation_embedding(conn, message_id: int, embedding: list):
+    """保存单条原始对话向量。"""
+    if not embedding:
+        return
+    if HAS_PGVECTOR:
+        vector_text = "[" + ",".join(str(value) for value in embedding) + "]"
+        await conn.execute(
+            "UPDATE conversations SET embedding = $1::vector WHERE id = $2",
+            vector_text,
+            message_id,
+        )
+    else:
+        import json
+
+        await conn.execute(
+            "UPDATE conversations SET embedding_json = $1 WHERE id = $2",
+            json.dumps(embedding),
+            message_id,
         )
 
 
@@ -454,12 +651,33 @@ def _min_max_normalize(scores: dict) -> dict:
 # ============================================================
 
 async def save_message(session_id: str, role: str, content: str, model: str = "", metadata: str = None):
+    tsv_text = (
+        jieba_tokenize_for_tsv(content or "")
+        if CONVERSATION_RECALL_ENABLED
+        else None
+    )
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO conversations (session_id, role, content, model, metadata) VALUES ($1, $2, $3, $4, $5)",
-            session_id, role, content, model, metadata,
+        row = await conn.fetchrow(
+            """INSERT INTO conversations (
+                   session_id, role, content, model, metadata, content_tsv
+               ) VALUES (
+                   $1, $2, $3, $4, $5,
+                   array_to_tsvector(string_to_array($6, ' '))
+               )
+               RETURNING id""",
+            session_id, role, content, model, metadata, tsv_text,
         )
+    message_id = row["id"] if row else None
+    if (
+        message_id is not None
+        and CONVERSATION_RECALL_ENABLED
+        and EMBEDDING_API_KEY
+        and content
+        and content.strip()
+    ):
+        kick_embedding_backfill()
+    return message_id
 
 
 async def get_last_user_content(session_id: str) -> str:
@@ -486,10 +704,28 @@ async def update_last_assistant_message(session_id: str, new_content: str, model
             LIMIT 1
         """, session_id)
         if row:
-            await conn.execute(
-                "UPDATE conversations SET content = $1, model = $2 WHERE id = $3",
-                new_content, model, row['id']
+            embedding_column = "embedding" if HAS_PGVECTOR else "embedding_json"
+            tsv_text = (
+                jieba_tokenize_for_tsv(new_content or "")
+                if CONVERSATION_RECALL_ENABLED
+                else None
             )
+            await conn.execute(
+                f"""UPDATE conversations
+                   SET content = $1,
+                       model = $2,
+                       content_tsv = array_to_tsvector(string_to_array($3, ' ')),
+                       {embedding_column} = NULL
+                   WHERE id = $4""",
+                new_content, model, tsv_text, row['id']
+            )
+            if (
+                CONVERSATION_RECALL_ENABLED
+                and EMBEDDING_API_KEY
+                and new_content
+                and new_content.strip()
+            ):
+                kick_embedding_backfill()
             return True
         return False
 
@@ -575,13 +811,32 @@ async def search_conversations(query: str, limit: int = 20, offset: int = 0):
 
 async def update_message_content(message_id: int, new_content: str):
     """更新单条对话消息的内容"""
+    tsv_text = (
+        jieba_tokenize_for_tsv(new_content or "")
+        if CONVERSATION_RECALL_ENABLED
+        else None
+    )
     pool = await get_pool()
     async with pool.acquire() as conn:
+        embedding_column = "embedding" if HAS_PGVECTOR else "embedding_json"
         result = await conn.execute(
-            "UPDATE conversations SET content = $1 WHERE id = $2",
-            new_content, message_id,
+            f"""UPDATE conversations
+               SET content = $1,
+                   content_tsv = array_to_tsvector(string_to_array($2, ' ')),
+                   {embedding_column} = NULL
+               WHERE id = $3""",
+            new_content, tsv_text, message_id,
         )
-        return int(result.split()[-1]) if result else 0
+    updated = int(result.split()[-1]) if result else 0
+    if (
+        updated
+        and CONVERSATION_RECALL_ENABLED
+        and EMBEDDING_API_KEY
+        and new_content
+        and new_content.strip()
+    ):
+        kick_embedding_backfill()
+    return updated
 
 
 async def delete_single_message(message_id: int):
@@ -593,6 +848,396 @@ async def delete_single_message(message_id: int):
             message_id,
         )
         return int(result.split()[-1]) if result else 0
+
+
+# ============================================================
+# 原始对话片段召回
+# ============================================================
+
+def _fragment_id(anchor_ids) -> str | None:
+    """由命中消息的持久 conversations.id 生成稳定片段 ID。"""
+    import hashlib
+
+    ids = sorted({message_id for message_id in anchor_ids if message_id is not None})
+    if not ids:
+        return None
+    payload = "chat-fragment:v1:" + ",".join(str(message_id) for message_id in ids)
+    return f"v1:{hashlib.sha256(payload.encode()).hexdigest()[:32]}"
+
+
+def _assemble_fragments(all_messages, sorted_indices, matched_indices):
+    fragments = []
+    fragment_ids = []
+    current = []
+    current_anchors = []
+    previous_index = -2
+
+    for index in sorted_indices:
+        if index != previous_index + 1 and current:
+            fragments.append(current)
+            fragment_ids.append(_fragment_id(current_anchors))
+            current = []
+            current_anchors = []
+
+        message = all_messages[index]
+        content = message["content"] or ""
+        is_match = index in matched_indices
+        max_chars = 200 if is_match else 80
+        if len(content) > max_chars:
+            content = content[:max_chars] + "…（省略）"
+        created_at = message["created_at"]
+        if created_at is not None and hasattr(created_at, "isoformat"):
+            created_at = created_at.isoformat()
+        current.append({
+            "role": message["role"],
+            "content": content,
+            "created_at": created_at,
+            "is_match": is_match,
+        })
+        if is_match:
+            current_anchors.append(message["id"])
+        previous_index = index
+
+    if current:
+        fragments.append(current)
+        fragment_ids.append(_fragment_id(current_anchors))
+    return fragments, fragment_ids
+
+
+async def _conversation_tsv_ready(conn) -> bool:
+    pending = await conn.fetchval(
+        r"""SELECT COUNT(*) FROM conversations
+            WHERE content_tsv IS NULL
+              AND content IS NOT NULL AND content !~ '^\s*$'"""
+    )
+    return not pending
+
+
+def _session_exclusion_sql(exclude_session_ids: list, param_index: int) -> tuple[str, list]:
+    if not exclude_session_ids:
+        return "", []
+    return f" AND NOT (session_id = ANY(${param_index}::text[]))", [exclude_session_ids]
+
+
+async def _keyword_session_scores(conn, tsquery: str, keyword_terms: list[str],
+                                  pool_size: int, exclude_session_ids: list):
+    if not keyword_terms:
+        return {}
+
+    if not tsquery or not await _conversation_tsv_ready(conn):
+        conditions = [
+            f"content ILIKE '%' || ${index + 1} || '%'"
+            for index in range(len(keyword_terms))
+        ]
+        params = list(keyword_terms)
+        exclusion_sql, exclusion_params = _session_exclusion_sql(
+            exclude_session_ids, len(params) + 1
+        )
+        params.extend(exclusion_params)
+        rows = await conn.fetch(
+            f"""SELECT session_id, COUNT(*)::float AS score,
+                       MAX(created_at) AS latest_match
+                FROM conversations
+                WHERE ({' AND '.join(conditions)}) {exclusion_sql}
+                GROUP BY session_id
+                ORDER BY score DESC
+                LIMIT {int(pool_size)}""",
+            *params,
+        )
+    else:
+        params = [tsquery]
+        exclusion_sql, exclusion_params = _session_exclusion_sql(
+            exclude_session_ids, len(params) + 1
+        )
+        params.extend(exclusion_params)
+        params.append(pool_size)
+        rows = await conn.fetch(
+            f"""SELECT session_id,
+                       MAX(ts_rank(content_tsv, $1::tsquery, 2)) AS score,
+                       MAX(created_at) AS latest_match
+                FROM conversations
+                WHERE content_tsv @@ $1::tsquery {exclusion_sql}
+                GROUP BY session_id
+                ORDER BY score DESC
+                LIMIT ${len(params)}""",
+            *params,
+        )
+    return {
+        row["session_id"]: {
+            "score": float(row["score"]),
+            "latest": row["latest_match"],
+        }
+        for row in rows
+    }
+
+
+async def _semantic_session_scores(conn, query_embedding: list, pool_size: int,
+                                   exclude_session_ids: list):
+    """先按原始余弦阈值过滤，再交给融合层归一化。"""
+    if not query_embedding:
+        return {}
+
+    if HAS_PGVECTOR:
+        vector_text = "[" + ",".join(str(value) for value in query_embedding) + "]"
+        params = [vector_text]
+        exclusion_sql, exclusion_params = _session_exclusion_sql(
+            exclude_session_ids, len(params) + 1
+        )
+        params.extend(exclusion_params)
+        ranked_limit = max(100, pool_size * 10)
+        params.extend([ranked_limit, CONVERSATION_MIN_SCORE_THRESHOLD, pool_size])
+        ranked_limit_index = len(params) - 2
+        threshold_index = len(params) - 1
+        pool_index = len(params)
+        rows = await conn.fetch(
+            f"""WITH ranked AS (
+                    SELECT session_id,
+                           1 - (embedding <=> $1::vector) AS similarity,
+                           created_at
+                    FROM conversations
+                    WHERE embedding IS NOT NULL {exclusion_sql}
+                    ORDER BY embedding <=> $1::vector
+                    LIMIT ${ranked_limit_index}
+                )
+                SELECT session_id, MAX(similarity) AS score,
+                       MAX(created_at) AS latest_match
+                FROM ranked
+                WHERE similarity >= ${threshold_index}
+                GROUP BY session_id
+                ORDER BY score DESC
+                LIMIT ${pool_index}""",
+            *params,
+        )
+        return {
+            row["session_id"]: {
+                "score": float(row["score"]),
+                "latest": row["latest_match"],
+            }
+            for row in rows
+        }
+
+    import json
+
+    params = []
+    exclusion_sql, exclusion_params = _session_exclusion_sql(
+        exclude_session_ids, 1
+    )
+    params.extend(exclusion_params)
+    rows = await conn.fetch(
+        f"""SELECT session_id, created_at, embedding_json
+            FROM conversations
+            WHERE embedding_json IS NOT NULL {exclusion_sql}""",
+        *params,
+    )
+    session_best = {}
+    for row in rows:
+        try:
+            similarity = _cosine_sim(query_embedding, json.loads(row["embedding_json"]))
+        except Exception:
+            continue
+        if similarity < CONVERSATION_MIN_SCORE_THRESHOLD:
+            continue
+        current = session_best.get(row["session_id"])
+        if current is None or similarity > current["score"]:
+            session_best[row["session_id"]] = {
+                "score": similarity,
+                "latest": row["created_at"],
+            }
+        elif row["created_at"] and row["created_at"] > current["latest"]:
+            current["latest"] = row["created_at"]
+    return dict(
+        sorted(session_best.items(), key=lambda item: -item[1]["score"])[:pool_size]
+    )
+
+
+async def search_chat_fragments(
+    query: str,
+    max_sessions: int = 3,
+    max_matches_per_session: int = 1,
+    context: int = 1,
+    mode: str = "hybrid",
+    exclude_session_ids: list | None = None,
+    exclude_fragment_ids: list | None = None,
+):
+    """检索历史对话。raw API 无状态，排除集合完全由调用方传入。"""
+    from datetime import datetime, timezone
+
+    if not CONVERSATION_RECALL_ENABLED:
+        return [], 0
+    query = query.strip()
+    if not query or mode not in {"keyword", "hybrid"}:
+        return [], 0
+
+    exclude_session_ids = sorted({str(value) for value in (exclude_session_ids or []) if value})
+    excluded_fragments = {str(value) for value in (exclude_fragment_ids or []) if value}
+    max_sessions = min(50, max(1, int(max_sessions)))
+    max_matches_per_session = min(5, max(1, int(max_matches_per_session)))
+    context = min(5, max(0, int(context)))
+
+    keyword_terms, _ = _conversation_query_terms(query)
+    tsquery = build_tsquery(query)
+    query_embedding = (
+        await get_query_embedding(query)
+        if mode == "hybrid" and EMBEDDING_API_KEY
+        else []
+    )
+    pool_size = max(_CONVERSATION_CANDIDATE_POOL, max_sessions * 3)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        keyword_scores = await _keyword_session_scores(
+            conn, tsquery, keyword_terms, pool_size, exclude_session_ids
+        )
+        semantic_scores = (
+            await _semantic_session_scores(
+                conn, query_embedding, pool_size, exclude_session_ids
+            )
+            if mode == "hybrid"
+            else {}
+        )
+
+    session_ids = set(keyword_scores) | set(semantic_scores)
+    if not session_ids:
+        return [], 0
+
+    keyword_normalized = _min_max_normalize({
+        session_id: item["score"] for session_id, item in keyword_scores.items()
+    })
+    semantic_normalized = _min_max_normalize({
+        session_id: item["score"] for session_id, item in semantic_scores.items()
+    })
+    now = datetime.now(timezone.utc)
+    recency = {}
+    for session_id in session_ids:
+        timestamps = [
+            source[session_id]["latest"]
+            for source in (keyword_scores, semantic_scores)
+            if session_id in source and source[session_id]["latest"]
+        ]
+        if timestamps:
+            age_days = (now - max(timestamps)).total_seconds() / 86400.0
+            recency[session_id] = 1.0 / (1.0 + max(0.0, age_days))
+        else:
+            recency[session_id] = 0.0
+    recency_normalized = _min_max_normalize(recency)
+
+    if mode == "keyword":
+        final_scores = keyword_normalized
+    else:
+        final_scores = {
+            session_id: (
+                CONVERSATION_HW_KEYWORD * keyword_normalized.get(session_id, 0.0)
+                + CONVERSATION_HW_SEMANTIC * semantic_normalized.get(session_id, 0.0)
+                + CONVERSATION_HW_RECENCY * recency_normalized.get(session_id, 0.0)
+            )
+            for session_id in session_ids
+        }
+    ranked = sorted(final_scores.items(), key=lambda item: -item[1])
+
+    vector_text = None
+    if HAS_PGVECTOR and query_embedding:
+        vector_text = "[" + ",".join(str(value) for value in query_embedding) + "]"
+    results = []
+    async with pool.acquire() as conn:
+        for session_id, final_score in ranked:
+            if len(results) >= max_sessions:
+                break
+            if HAS_PGVECTOR and vector_text:
+                messages = await conn.fetch(
+                    """SELECT id, role, content, created_at,
+                              CASE WHEN embedding IS NOT NULL
+                                   THEN 1 - (embedding <=> $2::vector)
+                                   ELSE 0 END AS sem_sim
+                       FROM conversations
+                       WHERE session_id = $1
+                       ORDER BY created_at ASC, id ASC""",
+                    session_id, vector_text,
+                )
+            else:
+                embedding_column = "embedding_json" if not HAS_PGVECTOR else "NULL::text"
+                messages = await conn.fetch(
+                    f"""SELECT id, role, content, created_at,
+                               {embedding_column} AS embedding_json
+                        FROM conversations
+                        WHERE session_id = $1
+                        ORDER BY created_at ASC, id ASC""",
+                    session_id,
+                )
+
+            marked = []
+            for message in messages:
+                lowered = (message["content"] or "").lower()
+                keyword_match = bool(keyword_terms) and all(
+                    term.lower() in lowered for term in keyword_terms
+                )
+                semantic_similarity = 0.0
+                if HAS_PGVECTOR and vector_text:
+                    semantic_similarity = float(message["sem_sim"] or 0)
+                elif query_embedding and message["embedding_json"]:
+                    try:
+                        import json
+                        semantic_similarity = _cosine_sim(
+                            query_embedding, json.loads(message["embedding_json"])
+                        )
+                    except Exception:
+                        semantic_similarity = 0.0
+                semantic_match = (
+                    mode == "hybrid"
+                    and semantic_similarity >= CONVERSATION_MIN_SCORE_THRESHOLD
+                )
+                marked.append({
+                    "id": message["id"],
+                    "role": message["role"],
+                    "content": message["content"] or "",
+                    "created_at": message["created_at"],
+                    "is_match": keyword_match or semantic_match,
+                    "relevance": 1.0 if keyword_match else semantic_similarity,
+                })
+
+            match_candidates = [
+                (index, item["relevance"])
+                for index, item in enumerate(marked)
+                if item["is_match"]
+            ]
+            match_candidates.sort(key=lambda item: -item[1])
+            if not match_candidates:
+                continue
+            total_matched = len(match_candidates)
+            kept = []
+            for match_index, _ in match_candidates:
+                context_indices = range(
+                    max(0, match_index - context),
+                    min(len(marked), match_index + context + 1),
+                )
+                fragments, fragment_ids = _assemble_fragments(
+                    marked, list(context_indices), {match_index}
+                )
+                fragment_id = fragment_ids[0] if fragment_ids else None
+                if not fragment_id or fragment_id in excluded_fragments:
+                    continue
+                kept.append((fragments[0], fragment_id))
+                if len(kept) >= max_matches_per_session:
+                    break
+            if not kept:
+                continue
+            results.append({
+                "session_id": session_id,
+                "title": session_id,
+                "total_messages": len(marked),
+                "match_count": total_matched,
+                "fragments": [item[0] for item in kept],
+                "fragment_ids": [item[1] for item in kept],
+                "has_more_matches": total_matched > len(kept),
+                "hybrid_scores": {
+                    "kw_raw": round(keyword_scores.get(session_id, {}).get("score", 0.0), 6),
+                    "kw": round(keyword_normalized.get(session_id, 0.0), 3),
+                    "sem_raw": round(semantic_scores.get(session_id, {}).get("score", 0.0), 6),
+                    "sem": round(semantic_normalized.get(session_id, 0.0), 3),
+                    "rec": round(recency_normalized.get(session_id, 0.0), 3),
+                    "final": round(final_score, 3),
+                },
+            })
+
+    return results, len(results)
 
 
 # ============================================================
@@ -723,7 +1368,7 @@ async def search_memories_hybrid(query: str, limit: int = 10):
     from datetime import datetime, timezone
     
     keywords = extract_search_keywords(query)
-    query_embedding = await compute_embedding(query) if EMBEDDING_API_KEY else []
+    query_embedding = await get_query_embedding(query) if EMBEDDING_API_KEY else []
     
     if not keywords and not query_embedding:
         return []
@@ -955,6 +1600,223 @@ async def backfill_memory_embeddings(batch_size: int = 20):
     
     print(f"✅ 本批补算完成：{total_updated}/{len(rows)} 条成功" + (f"，剩余 {remaining} 条待处理" if remaining > 0 else ""))
     return total_updated
+
+
+# ============================================================
+# 对话检索索引与向量持续补算
+# ============================================================
+
+async def rebuild_content_tsv(batch_size: int = 200):
+    """以 content_tsv IS NULL 为持久账本，分批补齐关键词索引。"""
+    if not CONVERSATION_RECALL_ENABLED:
+        return 0
+    pool = await get_pool()
+    total_updated = 0
+    last_id = 0
+    while True:
+        if not CONVERSATION_RECALL_ENABLED:
+            break
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                r"""SELECT id, content FROM conversations
+                    WHERE content_tsv IS NULL AND id > $2
+                      AND content IS NOT NULL AND content !~ '^\s*$'
+                    ORDER BY id
+                    LIMIT $1""",
+                batch_size, last_id,
+            )
+        if not rows:
+            break
+        last_id = rows[-1]["id"]
+        row_ids = [row["id"] for row in rows]
+        tsv_texts = [jieba_tokenize_for_tsv(row["content"] or "") for row in rows]
+        if not CONVERSATION_RECALL_ENABLED:
+            break
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE conversations AS c
+                   SET content_tsv = array_to_tsvector(
+                       string_to_array(batch.tsv_text, ' ')
+                   )
+                   FROM UNNEST($1::int[], $2::text[]) AS batch(id, tsv_text)
+                   WHERE c.id = batch.id AND c.content_tsv IS NULL""",
+                row_ids, tsv_texts,
+            )
+        total_updated += len(rows)
+    return total_updated
+
+
+EMBED_BACKFILL_SLEEP = float(os.getenv("EMBED_BACKFILL_SLEEP", "0.7"))
+EMBED_BACKFILL_FAIL_LIMIT = int(os.getenv("EMBED_BACKFILL_FAIL_LIMIT", "10"))
+EMBED_BACKFILL_BATCH = int(os.getenv("EMBED_BACKFILL_BATCH", "50"))
+
+_embed_backfill_task = None
+_embed_backfill_rerun = False
+_embed_backfill_state = {
+    "running": False,
+    "done_count": 0,
+    "fail_count": 0,
+    "last_error": None,
+    "stopped_reason": None,
+    "last_run_at": None,
+}
+
+
+def _conversation_embedding_pending_condition() -> str:
+    column = "embedding" if HAS_PGVECTOR else "embedding_json"
+    return rf"{column} IS NULL AND content IS NOT NULL AND content !~ '^\s*$'"
+
+
+async def backfill_conversation_embeddings_once(
+    sleep_seconds: float | None = None,
+    fail_limit: int | None = None,
+):
+    """补算非空 NULL 向量；失败项保持 NULL，下一次可续跑。"""
+    import asyncio as _asyncio
+
+    state = _embed_backfill_state
+    state.update({
+        "running": True,
+        "done_count": 0,
+        "fail_count": 0,
+        "last_error": None,
+        "stopped_reason": None,
+    })
+    if sleep_seconds is None:
+        sleep_seconds = EMBED_BACKFILL_SLEEP
+    if fail_limit is None:
+        fail_limit = EMBED_BACKFILL_FAIL_LIMIT
+
+    try:
+        if not CONVERSATION_RECALL_ENABLED:
+            state["stopped_reason"] = "recall_disabled"
+            return 0, 0, None
+        if not EMBEDDING_API_KEY:
+            state["last_error"] = "EMBEDDING_API_KEY未设置"
+            state["stopped_reason"] = "no_api_key"
+            return 0, 0, state["last_error"]
+
+        pool = await get_pool()
+        condition = _conversation_embedding_pending_condition()
+        consecutive_failures = 0
+        last_id = 0
+        while True:
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    f"""SELECT id, content FROM conversations
+                        WHERE {condition} AND id > $2
+                        ORDER BY id
+                        LIMIT $1""",
+                    EMBED_BACKFILL_BATCH, last_id,
+                )
+            if not rows:
+                break
+            last_id = rows[-1]["id"]
+
+            for row in rows:
+                if not CONVERSATION_RECALL_ENABLED:
+                    state["stopped_reason"] = "recall_disabled"
+                    return state["done_count"], state["fail_count"], state["last_error"]
+                try:
+                    vector = await compute_embedding(row["content"] or "")
+                except Exception as exc:
+                    vector = []
+                    state["last_error"] = str(exc)
+
+                if vector:
+                    try:
+                        async with pool.acquire() as conn:
+                            await save_conversation_embedding(conn, row["id"], vector)
+                        state["done_count"] += 1
+                        consecutive_failures = 0
+                    except Exception as exc:
+                        state["fail_count"] += 1
+                        consecutive_failures += 1
+                        state["last_error"] = f"写回失败 id={row['id']}: {exc}"
+                else:
+                    state["fail_count"] += 1
+                    consecutive_failures += 1
+                    state["last_error"] = f"embedding计算返回空 id={row['id']}"
+
+                if consecutive_failures >= fail_limit:
+                    state["stopped_reason"] = f"连续失败{consecutive_failures}条，本轮停止"
+                    return state["done_count"], state["fail_count"], state["last_error"]
+                if sleep_seconds > 0:
+                    await _asyncio.sleep(sleep_seconds)
+
+        return state["done_count"], state["fail_count"], state["last_error"]
+    finally:
+        state["running"] = False
+        state["last_run_at"] = datetime.now(dt_timezone.utc).isoformat()
+
+
+async def _conversation_embedding_backfill_runner():
+    global _embed_backfill_rerun
+
+    try:
+        while True:
+            _embed_backfill_rerun = False
+            await backfill_conversation_embeddings_once()
+            if not _embed_backfill_rerun or _embed_backfill_state["stopped_reason"]:
+                break
+    except Exception as exc:
+        _embed_backfill_state["last_error"] = str(exc)
+        _embed_backfill_state["running"] = False
+
+
+def kick_embedding_backfill() -> bool:
+    """单实例唤醒补算器；运行中只登记再跑一轮。"""
+    global _embed_backfill_task, _embed_backfill_rerun
+    import asyncio as _asyncio
+
+    if not CONVERSATION_RECALL_ENABLED or not EMBEDDING_API_KEY:
+        return False
+    try:
+        loop = _asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    if _embed_backfill_task is not None and not _embed_backfill_task.done():
+        _embed_backfill_rerun = True
+        return False
+    _embed_backfill_task = loop.create_task(_conversation_embedding_backfill_runner())
+    return True
+
+
+async def get_embedding_backfill_status():
+    remaining = None
+    cumulative_embedded = None
+    content_tsv_remaining = None
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            remaining = await conn.fetchval(
+                f"SELECT COUNT(*) FROM conversations WHERE {_conversation_embedding_pending_condition()}"
+            )
+            embedding_column = "embedding" if HAS_PGVECTOR else "embedding_json"
+            cumulative_embedded = await conn.fetchval(
+                f"SELECT COUNT(*) FROM conversations WHERE {embedding_column} IS NOT NULL"
+            )
+            content_tsv_remaining = await conn.fetchval(
+                r"""SELECT COUNT(*) FROM conversations
+                    WHERE content_tsv IS NULL
+                      AND content IS NOT NULL AND content !~ '^\s*$'"""
+            )
+    except Exception as exc:
+        if not _embed_backfill_state["last_error"]:
+            _embed_backfill_state["last_error"] = f"查询补算状态失败: {exc}"
+
+    return {
+        "enabled": CONVERSATION_RECALL_ENABLED,
+        "running": _embed_backfill_state["running"],
+        "last_run_done_count": _embed_backfill_state["done_count"],
+        "fail_count": _embed_backfill_state["fail_count"],
+        "last_error": _embed_backfill_state["last_error"],
+        "stopped_reason": _embed_backfill_state["stopped_reason"],
+        "last_run_at": _embed_backfill_state["last_run_at"],
+        "remaining": remaining,
+        "cumulative_embedded": cumulative_embedded,
+        "content_tsv_remaining": content_tsv_remaining,
+    }
 
 
 async def get_recent_memories(limit: int = 20):
@@ -1260,11 +2122,43 @@ async def get_conversation_messages(session_id: str, limit: int = 100):
 # 分区缓存状态管理
 # ============================================================
 
-async def get_session_cache_state(session_id: str) -> dict:
+def _active_seen_fragment_ids(seen_fragment_times, ttl_hours: float, now=None) -> list:
+    """Return fragment IDs whose individual seen timestamps are still inside TTL."""
+    if ttl_hours <= 0:
+        return []
+    if isinstance(seen_fragment_times, str):
+        try:
+            seen_fragment_times = json.loads(seen_fragment_times)
+        except (json.JSONDecodeError, ValueError):
+            return []
+    if not isinstance(seen_fragment_times, dict):
+        return []
+
+    now = now or datetime.now(dt_timezone.utc)
+    cutoff = now - timedelta(hours=ttl_hours)
+    active = []
+    for fragment_id, raw_seen_at in seen_fragment_times.items():
+        try:
+            if isinstance(raw_seen_at, datetime):
+                seen_at = raw_seen_at
+            else:
+                seen_at = datetime.fromisoformat(str(raw_seen_at).replace("Z", "+00:00"))
+            if seen_at.tzinfo is None:
+                seen_at = seen_at.replace(tzinfo=dt_timezone.utc)
+            if seen_at >= cutoff:
+                active.append(str(fragment_id))
+        except (TypeError, ValueError):
+            continue
+    return sorted(set(active))
+
+
+async def get_session_cache_state(session_id: str, seen_ttl_hours: float = None) -> dict:
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT summary, a_start_round, updated_at FROM session_cache_state WHERE session_id = $1",
+            """SELECT summary, a_start_round, seen_fragment_ids,
+                      seen_fragment_times, updated_at
+               FROM session_cache_state WHERE session_id = $1""",
             session_id
         )
         if row:
@@ -1272,7 +2166,6 @@ async def get_session_cache_state(session_id: str) -> dict:
             summary_parts = []
             if raw_summary:
                 try:
-                    import json
                     parsed = json.loads(raw_summary)
                     if isinstance(parsed, list):
                         summary_parts = parsed
@@ -1280,12 +2173,35 @@ async def get_session_cache_state(session_id: str) -> dict:
                         summary_parts = [raw_summary]
                 except (json.JSONDecodeError, ValueError):
                     summary_parts = [raw_summary]
+            raw_seen_times = row.get('seen_fragment_times') or {}
+            if isinstance(raw_seen_times, str):
+                try:
+                    raw_seen_times = json.loads(raw_seen_times)
+                except (json.JSONDecodeError, ValueError):
+                    raw_seen_times = {}
+            if not raw_seen_times and row['seen_fragment_ids']:
+                legacy_seen_at = row['updated_at'] or datetime.now(dt_timezone.utc)
+                raw_seen_times = {
+                    str(fragment_id): legacy_seen_at.isoformat()
+                    for fragment_id in row['seen_fragment_ids']
+                }
+            seen_fragment_ids = (
+                _active_seen_fragment_ids(raw_seen_times, seen_ttl_hours)
+                if seen_ttl_hours is not None
+                else sorted(str(fragment_id) for fragment_id in raw_seen_times)
+            )
             return {
                 'summary_parts': summary_parts,
                 'a_start_round': row['a_start_round'] or 0,
+                'seen_fragment_ids': seen_fragment_ids,
                 'updated_at': row['updated_at'],
             }
-        return {'summary_parts': [], 'a_start_round': 0, 'updated_at': None}
+        return {
+            'summary_parts': [],
+            'a_start_round': 0,
+            'seen_fragment_ids': [],
+            'updated_at': None,
+        }
 
 
 async def save_session_cache_state(session_id: str, summary_parts: list, a_start_round: int):
@@ -1299,6 +2215,44 @@ async def save_session_cache_state(session_id: str, summary_parts: list, a_start
             ON CONFLICT (session_id) 
             DO UPDATE SET summary = $2, a_start_round = $3, updated_at = NOW()
         """, session_id, summary_json, a_start_round)
+
+
+async def mark_fragments_seen(session_id: str, fragment_ids: list, ttl_hours: float = 6):
+    """成功请求结束后原子合并已注入 fragment_id，不覆盖分区摘要状态。"""
+    ids = sorted({str(value) for value in fragment_ids if value})
+    ttl_hours = float(ttl_hours)
+    if not session_id or not ids or ttl_hours <= 0:
+        return 0
+    seen_at = datetime.now(dt_timezone.utc).isoformat()
+    fresh_seen = json.dumps(
+        {fragment_id: seen_at for fragment_id in ids},
+        ensure_ascii=False,
+    )
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO session_cache_state (
+                   session_id, seen_fragment_times, updated_at
+               ) VALUES ($1, $2::jsonb, NOW())
+               ON CONFLICT (session_id) DO UPDATE
+               SET seen_fragment_times = (
+                       SELECT COALESCE(
+                           jsonb_object_agg(active.key, active.value),
+                           '{}'::jsonb
+                       )
+                       FROM jsonb_each(
+                           COALESCE(
+                               session_cache_state.seen_fragment_times,
+                               '{}'::jsonb
+                           )
+                       ) AS active(key, value)
+                       WHERE (active.value #>> '{}')::timestamptz >=
+                             NOW() - ($3::double precision * INTERVAL '1 hour')
+                   ) || EXCLUDED.seen_fragment_times,
+                   updated_at = NOW()""",
+            session_id, fresh_seen, ttl_hours,
+        )
+    return len(ids)
 
 
 # ============================================================
@@ -1563,6 +2517,11 @@ async def import_conversations(records: list):
             
             model = r.get('model', '')
             created_at = r.get('created_at')
+            tsv_text = (
+                jieba_tokenize_for_tsv(content)
+                if CONVERSATION_RECALL_ENABLED
+                else None
+            )
             
             # 解析时间
             from datetime import datetime
@@ -1585,14 +2544,22 @@ async def import_conversations(records: list):
                     continue
                 
                 await conn.execute("""
-                    INSERT INTO conversations (session_id, role, content, model, created_at)
-                    VALUES ($1, $2, $3, $4, $5)
-                """, session_id, role, content, model, created_at)
+                    INSERT INTO conversations (
+                        session_id, role, content, model, created_at, content_tsv
+                    ) VALUES (
+                        $1, $2, $3, $4, $5,
+                        array_to_tsvector(string_to_array($6, ' '))
+                    )
+                """, session_id, role, content, model, created_at, tsv_text)
             else:
                 await conn.execute("""
-                    INSERT INTO conversations (session_id, role, content, model)
-                    VALUES ($1, $2, $3, $4)
-                """, session_id, role, content, model)
+                    INSERT INTO conversations (
+                        session_id, role, content, model, content_tsv
+                    ) VALUES (
+                        $1, $2, $3, $4,
+                        array_to_tsvector(string_to_array($5, ' '))
+                    )
+                """, session_id, role, content, model, tsv_text)
             
             imported += 1
         
@@ -1601,6 +2568,12 @@ async def import_conversations(records: list):
         else:
             print(f"📥 导入对话: {imported} 条新增")
         
+        if (
+            imported
+            and CONVERSATION_RECALL_ENABLED
+            and EMBEDDING_API_KEY
+        ):
+            kick_embedding_backfill()
         return imported, skipped
 
 
