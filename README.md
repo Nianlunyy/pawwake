@@ -1,6 +1,6 @@
 # 🐾 Pawwake · 爪迹
 
-**4.0 · Madeleine**
+**4.0.1 · Madeleine**
 
 *Follow the pawprints back.*
 
@@ -23,7 +23,7 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 - **对话线管理** — 固定 session ID 实现跨平台对话衔接，支持多对话线切换、摘要编辑
 - **对话记录** — 浏览、搜索、批量管理历史对话，支持 session 合并
 - **Token 统计** — 自动记录每次对话的 token 消耗，按 session 汇总显示
-- **全端点鉴权** — 设置 `GATEWAY_SECRET` 环境变量后，所有 API 端点需要携带密钥。Dashboard 通过 URL 参数传递密钥，自动注入后续请求
+- **双通道鉴权** — 程序 API 只接受请求头中的 `GATEWAY_SECRET`；Dashboard 使用独立密码登录和 HttpOnly 会话 Cookie，主密钥不会进入浏览器
 - **预置记忆** — 把你想让 AI "一开始就知道"的事情批量导入
 - **兼容性强** — 支持所有 OpenAI 格式的客户端和 API 服务商
 - **记忆向量搜索（可选）** — 关键词 + 语义向量四维混合搜索，说"过年"能搜到"春节"。支持 OpenAI 兼容的 Embedding API
@@ -76,9 +76,19 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 | `API_BASE_URL` | LLM API 地址 | `https://openrouter.ai/api/v1/chat/completions` |
 | `DEFAULT_MODEL` | 默认模型 | `anthropic/claude-sonnet-4.5` |
 | `PORT` | 端口 | `8000` |
-| `GATEWAY_SECRET`（可选） | 网关鉴权密钥，设置后所有 API 端点需要携带此密钥 | `your-secret-key` |
+| `GATEWAY_SECRET`（强烈建议） | 程序 API 鉴权密钥，客户端通过 `X-Gateway-Key` 请求头发送 | 独立随机值 |
+| `DASHBOARD_PASSWORD` | Dashboard 登录密码，不与网关密钥共用 | 独立强密码 |
+| `SESSION_SECRET` | Dashboard 会话签名密钥，至少 32 字符且每次部署保持不变 | 独立随机值 |
 
 5. 部署，访问你的网关地址看到 `{"status":"running"}` 就成功了
+
+可在本地分别运行三次下面的命令生成互不相同的随机值：
+
+```bash
+python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
+```
+
+从 4.0 升级时，先补齐 `DASHBOARD_PASSWORD` 和 `SESSION_SECRET` 再重新部署；缺少任一项时 Dashboard 会返回 503，程序 API 仍可继续用 `X-Gateway-Key` 访问。
 
 > ⚠️ Render 免费层的服务在无活动时会休眠，第一次访问需要等几十秒唤醒，之后就正常了。其他支持 Docker 部署的平台（Zeabur、Railway、Fly.io 等）也可以，流程类似。
 
@@ -109,7 +119,7 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 | `MEMORY_MAX_TOKENS（可选）` | 记忆提取、评分和整理单批次的输出上限。整理达到上限时会自动拆小批次；提取日志提示截断时可调高此项 | `4000` |
 | `MAX_MEMORIES_INJECT` | 每次注入的最大记忆条数 | `15` |
 | `MIN_SCORE_THRESHOLD` | 记忆搜索最低分数阈值，低于此分数的记忆不注入（0=不过滤） | `0.15` |
-| `MEMORY_EXTRACT_INTERVAL` | 记忆提取间隔（0=禁用/1=每轮/N=每N轮） | `1` |
+| `MEMORY_EXTRACT_INTERVAL` | 记忆提取间隔（0=禁用/1=每轮/N=每 N 轮；N 越大调用越少） | `1` |
 | `MEMORY_EXTRACT_ENABLED（可选）` | 记忆提取+注入总开关，false时只存消息不提取记忆 | `true` |
 | `TIMEZONE_HOURS` | 时区偏移（小时），用于记忆注入时的日期显示 | `8`（UTC+8） |
 | `FORCE_STREAM（可选）` | 强制所有请求走流式传输（解决部分客户端thinking不显示） | `false` |
@@ -117,7 +127,7 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 
 **3. 重新部署**
 
-部署后访问 `https://你的网关地址/dashboard`，能正常打开管理页面就说明数据库连接成功。
+部署后访问 `https://你的网关地址/dashboard`，输入 `DASHBOARD_PASSWORD` 登录；能正常打开管理页面就说明数据库连接成功。
 
 **4. 导入预置记忆（可选）**
 
@@ -132,7 +142,7 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 
 打开 `https://你的网关地址/dashboard` 可以查看所有记忆，支持搜索、编辑内容、调整权重、单条删除和批量删除，以及导入/导出备份。
 
-> 💡 如果设置了 `GATEWAY_SECRET`，访问地址变为 `https://你的网关地址/dashboard?gateway_key=你的密钥`。客户端请求头需加 `X-Gateway-Key: 你的密钥`。
+> 💡 Dashboard 登录与程序 API 分开。浏览器只使用 Dashboard 密码和 `HttpOnly + Secure + SameSite=Strict` 会话 Cookie；客户端请求通过 `X-Gateway-Key: 你的密钥` 鉴权。不要把任何密钥放进 URL。
 
 ### 第三阶段：分区缓存（省 token 费）
 
@@ -145,17 +155,19 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 [摘要区]    历史压缩摘要               ← 正常轮次命中
 [历史A区]   15轮原始消息               ← 正常轮次命中
 [历史B区]   当前周期消息               ← 通过lookback命中
-[当前输入]  时间+记忆+用户消息         ← 不缓存（每次不同）
+[当前输入]  时间+记忆+对话片段+用户消息  ← 不缓存（每次不同）
 ```
 
-首次轮转要等 A、B 两区各装满 15 轮，也就是累计 30 轮；此后每新增 15 轮轮转一次。轮转时 A 区压缩成摘要追加到摘要区（`CACHE_SUMMARY_MODEL` 留空则不生成摘要，A 区直接滑出），B 区升级为新的 A 区。正常轮次 90% 的 token 走缓存读取（0.1x 价格）。
+首次摘要生成要等 A、B 两区各装满 15 轮，也就是累计 30 轮；此后每新增 15 轮轮转一次。轮转时 A 区压缩成摘要追加到摘要区（`CACHE_SUMMARY_MODEL` 留空则不生成摘要，A 区直接滑出），B 区升级为新的 A 区。正常轮次 90% 的 token 走缓存读取（0.1x 价格）。
+
+记忆召回与原始对话召回都放在最后的当前输入中，位于所有缓存断点之后。每轮召回结果变化只影响本次不缓存的输入，不会改写人设、摘要或 A/B 历史区。
 
 **添加环境变量：**
 
 | 环境变量 | 说明 | 示例 |
 |---------|------|------|
 | `CACHE_PARTITION_ENABLED` | 分区缓存开关 | `true` |
-| `CACHE_PARTITION_X` | 轮转周期（轮数）。1轮 = 一次用户发言 + AI回复。B 区攒满 X 轮触发，首次需先装满 A、B 两区共 2X 轮 | `15` |
+| `CACHE_PARTITION_X` | 轮转周期（轮数）。1轮 = 一次用户发言 + AI回复。B 区攒满 X 轮触发，首次摘要生成需先装满 A、B 两区共 2X 轮 | `15` |
 | `CACHE_SUMMARY_MODEL` | 摘要模型。**留空 = 不生成摘要**，轮转时旧消息直接滑出上下文（纯轮转模式）。从旧版本升级的用户注意：旧版此项有默认模型，新版默认为空，需要摘要请显式配置。不建议使用推理模型（思考可能耗尽输出token导致摘要为空） | 空 |
 | `CACHE_SUMMARY_MAX_TOKENS`（可选） | 摘要的输出上限，日志出现"摘要生成失败: 模型返回空content"且 `finish_reason=length` 时调高此项 | `2000` |
 | `PARTITION_SESSION_ID` | 固定的 session ID | `my-thread` |
@@ -192,6 +204,7 @@ pawwake/
 ├── Dockerfile                 # 容器配置
 ├── templates/                 # 页面模板（Dashboard 界面）
 │   ├── dashboard.html         # 主控制台页面
+│   ├── login.html             # Dashboard 登录页
 │   └── ...
 ├── static/                    # 静态资源
 │   ├── css/                   # 样式文件
@@ -207,9 +220,12 @@ pawwake/
 | `/` | GET | 健康检查，查看网关状态 |
 | `/v1/chat/completions` | POST | 核心转发接口（OpenAI 兼容） |
 | `/v1/models` | GET | 模型列表 |
+| `/dashboard/login` | GET/POST | Dashboard 独立密码登录 |
+| `/dashboard/logout` | POST | 退出 Dashboard 登录 |
 | `/dashboard` | GET | 管理控制台（记忆、对话、对话线一体化界面） |
 | `/import/seed-memories` | GET | 执行预置记忆导入（开发者用） |
 | `/api/memories` | GET | 获取所有记忆（支持 `?layer=` `?active_only=` 筛选） |
+| `/api/memories/search` | GET/POST | 混合搜索记忆；私密查询推荐 POST JSON `{"q":"..."}` |
 | `/api/memories/consolidate` | POST | 手动触发记忆整理（异步，碎片 → 事件） |
 | `/api/memories/consolidate/status` | GET | 查询整理任务状态 |
 | `/api/memories/merge` | POST | 手动合并多条记忆 |
@@ -257,12 +273,12 @@ pawwake/
 ## 💡 记忆系统原理
 
 1. **你发消息** → 网关从数据库搜索相关记忆
-2. **记忆注入** → 相关记忆 + 记忆应用规则拼接到 system prompt 后面
+2. **记忆注入** → 分区缓存开启时，相关记忆随当前输入动态注入；关闭时拼接到 system prompt 后面
 3. **AI 回复** → 网关边转发边捕获完整回复
-4. **后台提取** → 用小模型（如 Haiku）从完整对话上下文中提取关键信息
+4. **后台提取** → 达到提取间隔时，用小模型（如 Haiku）从近期逻辑轮中提取关键信息
 5. **存入数据库** → 下次对话时可以检索到
 
-提取记忆时，网关会把客户端发来的完整对话上下文（不含 system prompt）传给提取模型，这样能捕捉到跨轮次的信息。通过 `MEMORY_EXTRACT_INTERVAL` 可以控制提取频率：设为 0 禁用自动提取，设为 1 每轮都提，设为 N 则每 N 轮提取一次（适合控制成本）。
+分区缓存开启时，网关按当前 session 的逻辑轮数触发提取，并从数据库托管的权威历史中截取最近 N 个逻辑轮；含多条 tool 消息的调用过程仍只算一轮。分区缓存关闭时，提取上下文来自本次客户端请求实际携带的非 system 消息。两种模式都会附上本轮最终 AI 回复，system prompt、网关注入的记忆与历史对话片段不会送给提取模型。`MEMORY_EXTRACT_INTERVAL` 设为 `0` 时禁用自动提取，设为 `1` 时每轮提取，设为 `N` 时每 N 轮提取一次。把 N 调大可以减少提取调用次数，但单次覆盖的近期消息也会相应增多。
 
 > **关于向量搜索：** 当前版本支持可选的记忆向量搜索功能。默认使用 jieba 中文分词 + 关键词匹配（ILIKE），适合大多数场景。如果需要语义搜索（说"过年"能搜到"春节"），可以设置 `MEMORY_VECTOR_ENABLED=true` + `EMBEDDING_API_KEY`，系统会同时走关键词和向量两路搜索，四维加权排序。支持任何 OpenAI 兼容的 Embedding API（OpenAI、Jina、Voyage、本地 Ollama 等）。如果数据库支持 pgvector 扩展会自动启用，否则回退到 Python 端计算余弦相似度。
 
@@ -320,7 +336,7 @@ A: 检查端口设置。Render 默认用 `PORT` 环境变量，确保设置为 `
 A: 如果数据库和网关不在同一个平台，连接字符串末尾可能需要加 `?sslmode=require`。分区缓存开启时，数据库不可用会让聊天端点返回明确的 `503 partition_database_unavailable`，避免用残缺历史继续对话。分区缓存关闭时，网关会用文件默认人设继续纯转发。
 
 **Q: 记忆会越来越多影响性能吗？**
-A: 每次最多注入 15 条记忆（可调），不会无限增长地消耗 token。提取记忆时会用客户端发来的完整上下文，token 用量比单轮提取大一些，可以通过 `MEMORY_EXTRACT_INTERVAL` 降低提取频率来控制成本。
+A: 每次最多注入 15 条记忆（可调），不会无限增长地消耗 token。分区模式按 session 的逻辑轮提取近期对话，非分区模式使用客户端本次携带的上下文；两者都不会发送整条会话。把 `MEMORY_EXTRACT_INTERVAL` 调大可以减少提取调用次数，设为 `0` 可完全禁用自动提取。
 
 **Q: 能用免费额度跑吗？**
 A: Render 免费层支持 Web Service + PostgreSQL，网关资源消耗很低，够用（注意免费 PostgreSQL 有 90 天期限）。也可以用 Neon 或 Supabase 的免费 PostgreSQL 作为长期方案。LLM API 费用另算（推荐 OpenRouter，按量付费）。
@@ -332,6 +348,15 @@ A: 打开 `https://你的网关地址/dashboard`，在「导出备份」页面�
 A: 能。这个项目的第一个部署者就是不会写代码的——代码是 AI 写的，部署是她自己看文档搞定的。
 
 ## 📋 更新日志
+
+### v4.0.1 · Madeleine（2026-08-10）
+
+- **Dashboard 独立登录** — 新增 `DASHBOARD_PASSWORD` 登录页，使用稳定 `SESSION_SECRET` 签发 12 小时 `HttpOnly + Secure + SameSite=Strict` 会话 Cookie
+- **主密钥退出浏览器** — 删除 `?gateway_key=` 鉴权和前端请求头注入，程序 API 只接受 `X-Gateway-Key` 请求头；Cookie 鉴权的写操作强制校验同源 `Origin`
+- **私密记忆检索** — `/api/memories/search` 新增 POST JSON 形状，查询不再需要把本轮消息放进 URL
+- **记忆提取间隔修复** — 分区模式改用当前 session 的权威历史按逻辑轮触发和截取，客户端只发送最新消息时也不会漏掉间隔内的对话；tool 调用过程只算一轮
+- **去重参照过滤** — 自动提取只把活跃记忆放进已有信息列表，软归档与合并后停用的碎片不再阻挡新信息提取
+- **仓库链接更新** — Dashboard 的 GitHub 入口同步到更名后的 `garan0613/pawwake`
 
 ### v4.0 · Madeleine（2026-08-10）
 
@@ -388,7 +413,7 @@ A: 能。这个项目的第一个部署者就是不会写代码的——代码�
 - **手动合并** — 在记忆列表勾选多条，打开合并弹窗编辑合并后内容。支持选择目标层级（事件/核心）
 - **撤回合并** — 事件记忆可一键撤回，恢复原始碎片
 - **软删除与恢复** — 删除记忆默认归档（`is_active=false`），可在「显示已归档」中恢复。永久删除需二次确认
-- **全端点鉴权** — 设置 `GATEWAY_SECRET` 环境变量后，所有非公开端点需要携带 `X-Gateway-Key` 请求头或 `?gateway_key=` URL 参数。未设置时跳过鉴权（兼容旧部署）
+- **全端点鉴权** — 设置 `GATEWAY_SECRET` 环境变量后保护所有非公开端点；当时支持的 URL 密钥方式已在 v4.0.1 移除
 - **Dashboard 全面升级** — 分层 Tab 标签页（全部/核心/事件/碎片 + 计数）、层级下拉选择器、标题编辑、底部浮动操作栏（选中后出现）、整理弹窗、合并弹窗、查看合并来源弹窗
 - **去重检查** — 新增三层去重策略（精确匹配 → 包含关系 → Jaccard 相似度），API 可调阈值
 - **搜索过滤** — 所有搜索路径（关键词 + 向量）自动跳过已归档记忆

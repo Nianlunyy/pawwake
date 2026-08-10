@@ -34,23 +34,6 @@ const ICONS = (() => {
 })();
 
 // ============================================
-// 网关鉴权：从URL参数读取gateway_key，自动注入所有请求
-// ============================================
-const _gatewayKey = new URLSearchParams(window.location.search).get('gateway_key') || '';
-if (_gatewayKey) {
-    const _origFetch = window.fetch;
-    window.fetch = function(url, opts = {}) {
-        opts.headers = opts.headers || {};
-        if (opts.headers instanceof Headers) {
-            opts.headers.set('X-Gateway-Key', _gatewayKey);
-        } else {
-            opts.headers['X-Gateway-Key'] = _gatewayKey;
-        }
-        return _origFetch.call(this, url, opts);
-    };
-}
-
-// ============================================
 // 全局状态
 // ============================================
 let allMemories = [];
@@ -833,7 +816,7 @@ async function doTextImport() {
             body: JSON.stringify({lines: lines, skip_scoring: skip})
         });
         if (!resp.ok) {
-            showImportResult('error', '❌ 导入失败：HTTP ' + resp.status + (resp.status === 401 ? '（鉴权失败，请用带 ?gateway_key=你的密钥 的地址打开本页）' : ''));
+            showImportResult('error', '❌ 导入失败：HTTP ' + resp.status + (resp.status === 401 ? '（登录已失效，请刷新页面重新登录）' : ''));
             return;
         }
         const data = await resp.json();
@@ -917,7 +900,7 @@ async function confirmJsonImport() {
             body: JSON.stringify(pendingJsonData)
         });
         if (!resp.ok) {
-            showImportResult('error', '❌ 导入失败：HTTP ' + resp.status + (resp.status === 401 ? '（鉴权失败，请用带 ?gateway_key=你的密钥 的地址打开本页）' : ''));
+            showImportResult('error', '❌ 导入失败：HTTP ' + resp.status + (resp.status === 401 ? '（登录已失效，请刷新页面重新登录）' : ''));
             return;
         }
         const data = await resp.json();
@@ -976,7 +959,7 @@ async function doExport() {
     try {
         const resp = await fetch('/export/memories');
         if (!resp.ok) {
-            alert('导出失败：HTTP ' + resp.status + (resp.status === 401 ? '（鉴权失败，请用带 ?gateway_key=你的密钥 的地址打开本页）' : ''));
+            alert('导出失败：HTTP ' + resp.status + (resp.status === 401 ? '（登录已失效，请刷新页面重新登录）' : ''));
             return;
         }
         const data = await resp.json();

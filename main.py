@@ -17,12 +17,17 @@ import os
 import json
 import uuid
 import asyncio
+import base64
+import hashlib
+import hmac
 import secrets
+import time
 import httpx
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
+from urllib.parse import parse_qs
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -52,11 +57,17 @@ DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "anthropic/claude-sonnet-4")
 PORT = int(os.getenv("PORT", "8080"))
 
 # 网关访问密钥（强烈建议设置！）
-# 设置后所有非公开端点都需要鉴权，二选一：
-#   - 请求头方式：X-Gateway-Key: 你的密钥（客户端/API 调用）
-#   - URL参数方式：?gateway_key=你的密钥（方便浏览器访问 dashboard）
-# 不设置则跳过鉴权（兼容旧部署，仅建议内网环境使用）
+# 设置后所有非公开 API 端点都需要 X-Gateway-Key 请求头。
+# Dashboard 使用独立密码登录，不读取或保存网关密钥。
+# 不设置则跳过 API 鉴权（兼容旧部署，仅建议内网环境使用）。
 GATEWAY_SECRET = os.getenv("GATEWAY_SECRET", "")
+
+# Dashboard 浏览器登录。SESSION_SECRET 需为稳定的 32 字符以上随机值，
+# 用于签发 HttpOnly 会话 Cookie；修改它会让已有登录全部失效。
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
+SESSION_SECRET = os.getenv("SESSION_SECRET", "")
+DASHBOARD_SESSION_SECONDS = 12 * 60 * 60
+DASHBOARD_SESSION_COOKIE = "__Host-pawwake_dashboard_session"
 
 # 记忆系统开关（只控制记忆能力；Dashboard 配置与分区缓存独立）
 MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "false").lower() == "true"
@@ -107,8 +118,8 @@ def conversation_persistence_enabled() -> bool:
 # 时区偏移（小时），用于记忆注入时的日期显示，默认 UTC+8
 TIMEZONE_HOURS = int(os.getenv("TIMEZONE_HOURS", "8"))
 
-# 轮次计数器
-_round_counter = 0
+# 非分区模式没有稳定 session 历史，保留进程内提取计数。
+_nonpartition_round_counter = 0
 
 # 强制流式传输（部分客户端不发stream=true导致thinking数据丢失，开启后强制所有请求走流式）
 FORCE_STREAM = os.getenv("FORCE_STREAM", "false").lower() == "true"
@@ -327,18 +338,50 @@ templates = Jinja2Templates(directory="templates")
 
 # 不需要鉴权的路径（根路径精确匹配，其余按前缀匹配）
 PUBLIC_PATHS = ("/", "/static/", "/health", "/favicon.ico")
+DASHBOARD_PATH_PREFIXES = ("/api/", "/import/", "/export/")
+DASHBOARD_WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def dashboard_auth_ready() -> bool:
+    return bool(DASHBOARD_PASSWORD and len(SESSION_SECRET) >= 32)
+
+
+def is_dashboard_path(path: str) -> bool:
+    return path == "/dashboard" or path.startswith("/dashboard/") or path.startswith(DASHBOARD_PATH_PREFIXES)
+
+
+def make_dashboard_session() -> str:
+    expires_at = int(time.time()) + DASHBOARD_SESSION_SECONDS
+    payload = str(expires_at).encode("ascii")
+    signature = hmac.new(SESSION_SECRET.encode("utf-8"), payload, hashlib.sha256).digest()
+    encoded_signature = base64.urlsafe_b64encode(signature).rstrip(b"=").decode("ascii")
+    return f"{expires_at}.{encoded_signature}"
+
+
+def valid_dashboard_session(token: str) -> bool:
+    if not dashboard_auth_ready():
+        return False
+    try:
+        expires_text, provided_signature = token.split(".", 1)
+        expires_at = int(expires_text)
+    except (TypeError, ValueError):
+        return False
+    if expires_at < int(time.time()):
+        return False
+    payload = expires_text.encode("ascii")
+    expected = hmac.new(SESSION_SECRET.encode("utf-8"), payload, hashlib.sha256).digest()
+    expected_signature = base64.urlsafe_b64encode(expected).rstrip(b"=").decode("ascii")
+    return secrets.compare_digest(provided_signature, expected_signature)
+
+
+def request_has_same_origin(request: Request) -> bool:
+    origin = request.headers.get("origin", "").rstrip("/")
+    expected = f"{request.url.scheme}://{request.url.netloc}".rstrip("/")
+    return bool(origin) and secrets.compare_digest(origin, expected)
 
 @app.middleware("http")
 async def gateway_auth_middleware(request: Request, call_next):
-    """检查 GATEWAY_SECRET，保护所有非公开端点"""
-    # 未设置密钥时跳过鉴权（兼容旧部署，但会打印警告）
-    if not GATEWAY_SECRET:
-        if not hasattr(gateway_auth_middleware, "_warned"):
-            print("⚠️  GATEWAY_SECRET 未设置！所有 API 端点不受保护！")
-            print("⚠️  请在环境变量中设置 GATEWAY_SECRET 以启用鉴权")
-            gateway_auth_middleware._warned = True
-        return await call_next(request)
-
+    """API 使用请求头鉴权，Dashboard 使用独立的签名 Cookie。"""
     path = request.url.path
 
     # 公开路径不需要鉴权（根路径精确匹配）
@@ -348,24 +391,50 @@ async def gateway_auth_middleware(request: Request, call_next):
         if path.startswith(prefix):
             return await call_next(request)
 
+    if path == "/dashboard/login":
+        return await call_next(request)
+
     # OPTIONS 预检请求放行（CORS 需要）
     if request.method == "OPTIONS":
         return await call_next(request)
 
-    # 从 header 或 query 参数获取密钥
-    provided_key = (
-        request.headers.get("X-Gateway-Key", "")
-        or request.query_params.get("gateway_key", "")
-    )
+    # 程序调用只接受请求头，不让主密钥进入 URL、浏览器历史或前端脚本。
+    provided_key = request.headers.get("X-Gateway-Key", "")
+    if GATEWAY_SECRET and secrets.compare_digest(provided_key, GATEWAY_SECRET):
+        return await call_next(request)
 
-    # compare_digest 防时序侧信道攻击
-    if not secrets.compare_digest(provided_key, GATEWAY_SECRET):
+    if is_dashboard_path(path) and (GATEWAY_SECRET or DASHBOARD_PASSWORD or SESSION_SECRET):
+        if not dashboard_auth_ready():
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "Dashboard login is not configured. Set DASHBOARD_PASSWORD and a stable SESSION_SECRET of at least 32 characters."
+                },
+            )
+        token = request.cookies.get(DASHBOARD_SESSION_COOKIE, "")
+        if valid_dashboard_session(token):
+            if request.method in DASHBOARD_WRITE_METHODS and not request_has_same_origin(request):
+                return JSONResponse(status_code=403, content={"error": "Invalid request origin."})
+            return await call_next(request)
+        if path == "/dashboard" and request.method == "GET":
+            return RedirectResponse(url="/dashboard/login", status_code=303)
         return JSONResponse(
             status_code=401,
-            content={"error": "Unauthorized. Provide X-Gateway-Key header or gateway_key parameter."},
+            content={"error": "Dashboard login required."},
         )
 
-    return await call_next(request)
+    # 未设置密钥时保留旧部署行为，但明确提示公网部署风险。
+    if not GATEWAY_SECRET:
+        if not hasattr(gateway_auth_middleware, "_warned"):
+            print("⚠️  GATEWAY_SECRET 未设置！API 端点不受保护！")
+            print("⚠️  请在环境变量中设置 GATEWAY_SECRET 以启用 API 鉴权")
+            gateway_auth_middleware._warned = True
+        return await call_next(request)
+
+    return JSONResponse(
+        status_code=401,
+        content={"error": "Unauthorized. Provide X-Gateway-Key header."},
+    )
 
 
 # ============================================================
@@ -684,6 +753,27 @@ def group_by_rounds(history: list) -> list:
     if current_round:
         rounds.append(current_round)
     return rounds
+
+
+def _build_memory_extraction_messages(
+    context_messages: list,
+    assistant_msg: str,
+    interval: int,
+) -> tuple[list, int]:
+    """按逻辑轮截取近期上下文，并附上本轮最终 assistant 回复。"""
+    non_system = [
+        msg for msg in (context_messages or [])
+        if msg.get("role") != "system"
+    ]
+    recent_rounds = group_by_rounds(non_system)[-max(1, interval):]
+    messages = [
+        {"role": msg.get("role"), "content": msg.get("content", "")}
+        for round_messages in recent_rounds
+        for msg in round_messages
+        if msg.get("role") in {"user", "assistant"}
+    ]
+    messages.append({"role": "assistant", "content": assistant_msg})
+    return messages, len(recent_rounds)
 
 
 def _should_rotate(b_rounds_count: int, X: int, a_msgs: list) -> bool:
@@ -1071,7 +1161,18 @@ async def build_conversation_recall_text(user_message: str, session_id: str):
 # 后台记忆处理
 # ============================================================
 
-async def process_memories_background(session_id: str, user_msg: str, assistant_msg: str, model: str, context_messages: list = None, skip_conversation_log: bool = False, tool_messages: list = None, assistant_tool_calls: list = None, assistant_reasoning: str = None):
+async def process_memories_background(
+    session_id: str,
+    user_msg: str,
+    assistant_msg: str,
+    model: str,
+    context_messages: list = None,
+    context_round_count: int = None,
+    skip_conversation_log: bool = False,
+    tool_messages: list = None,
+    assistant_tool_calls: list = None,
+    assistant_reasoning: str = None,
+):
     """
     后台异步：存储对话 + 提取记忆（不阻塞主流程）
     
@@ -1081,14 +1182,15 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
     - N: 每 N 轮提取一次
     对话记录始终保存，不受间隔影响（除非 skip_conversation_log=True）。
     
-    context_messages: 客户端发来的原始对话上下文（不含system prompt），
-                      用于让提取模型从完整上下文中提取记忆。
+    context_messages: 分区模式使用 DB 历史与本轮消息组成的权威上下文；
+                      非分区模式使用客户端发来的非 system 消息。
+    context_round_count: 分区模式当前 session 的逻辑轮数；非分区模式为 None。
     skip_conversation_log: 跳过对话存储（标题生成等辅助请求时使用）
     tool_messages: 客户端发来的工具结果消息列表
     assistant_tool_calls: response中assistant的工具调用列表（如果有）
     assistant_reasoning: response中assistant的reasoning_content（deepseek thinking mode）
     """
-    global _round_counter
+    global _nonpartition_round_counter
     
     try:
         # Debug: 打印存储分支判断依据
@@ -1160,31 +1262,54 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
         if MEMORY_EXTRACT_INTERVAL == 0:
             print(f"⏭️  记忆自动提取已禁用，跳过")
             return
-        
-        _round_counter += 1
-        
-        if MEMORY_EXTRACT_INTERVAL > 1 and (_round_counter % MEMORY_EXTRACT_INTERVAL != 0):
-            print(f"⏭️  轮次 {_round_counter}，跳过记忆提取（每 {MEMORY_EXTRACT_INTERVAL} 轮提取一次）")
+
+        # 工具调用尚未结束时只落库，等最终 assistant 回复再做一次完整提取。
+        if assistant_tool_calls:
+            print("⏭️  当前逻辑轮仍在等待工具结果，推迟记忆提取")
             return
-        
+
+        if context_round_count is None:
+            _nonpartition_round_counter += 1
+            current_round_count = _nonpartition_round_counter
+            round_scope = "非分区累计"
+        else:
+            current_round_count = max(0, int(context_round_count))
+            round_scope = f"session={session_id}"
+
+        if current_round_count <= 0:
+            print("⏭️  当前上下文没有可提取的逻辑轮")
+            return
+
+        if (
+            MEMORY_EXTRACT_INTERVAL > 1
+            and current_round_count % MEMORY_EXTRACT_INTERVAL != 0
+        ):
+            print(
+                f"⏭️  {round_scope} 第 {current_round_count} 轮，跳过记忆提取"
+                f"（每 {MEMORY_EXTRACT_INTERVAL} 轮提取一次）"
+            )
+            return
+
         if MEMORY_EXTRACT_INTERVAL > 1:
-            print(f"📝 轮次 {_round_counter}，执行记忆提取")
+            print(f"📝 {round_scope} 第 {current_round_count} 轮，执行记忆提取")
         
         # 3. 获取已有记忆，传给提取模型做对比去重
         existing = await get_recent_memories(limit=80)
         existing_contents = [r["content"] for r in existing]
         
-        # 4. 构建用于提取的消息列表
-        #    截取最近 MEMORY_EXTRACT_INTERVAL 轮对话（每轮=user+assistant共2条）
-        #    而非发送完整上下文，省token
+        # 4. 按逻辑轮截取近期上下文，而非发送完整会话。
         if context_messages:
-            # 截取最近N轮（interval×2条），加上最新的assistant回复
-            tail_count = MEMORY_EXTRACT_INTERVAL * 2
-            recent_msgs = list(context_messages)[-tail_count:] if len(context_messages) > tail_count else list(context_messages)
-            messages_for_extraction = recent_msgs + [
-                {"role": "assistant", "content": assistant_msg}
-            ]
-            print(f"📝 截取最近 {MEMORY_EXTRACT_INTERVAL} 轮对话提取记忆（{len(messages_for_extraction)} 条消息）")
+            messages_for_extraction, selected_round_count = (
+                _build_memory_extraction_messages(
+                    context_messages,
+                    assistant_msg,
+                    MEMORY_EXTRACT_INTERVAL,
+                )
+            )
+            print(
+                f"📝 截取最近 {selected_round_count} 个逻辑轮提取记忆"
+                f"（{len(messages_for_extraction)} 条 user/assistant 消息）"
+            )
         else:
             messages_for_extraction = [
                 {"role": "user", "content": user_msg},
@@ -1317,6 +1442,8 @@ async def _chat_completions_inner(request: Request):
     # ---------- 构建 system prompt ----------
     # 先保存原始对话消息（不含 system prompt），用于记忆提取
     original_messages = [msg for msg in messages if msg.get("role") != "system"]
+    extraction_context_messages = original_messages
+    extraction_round_count = None
     resolved_system_prompt = "" if skip_conversation_log else await get_system_prompt()
     
     # ---------- 检测工具调用消息 ----------
@@ -1421,6 +1548,8 @@ async def _chat_completions_inner(request: Request):
                                     print(f"⚠️ Race防护: 从客户端补充assistant(tool_calls)")
                                     break
         all_msgs = db_msgs + client_new_msgs
+        extraction_context_messages = all_msgs
+        extraction_round_count = len(group_by_rounds(all_msgs))
         
         # 同步更新tool_messages，避免process_memories_background存重复的旧tool
         tool_messages = [m for m in client_new_msgs if m.get("role") == "tool"]
@@ -1534,10 +1663,11 @@ async def _chat_completions_inner(request: Request):
                 session_id,
                 user_message,
                 model,
-                original_messages,
+                extraction_context_messages,
                 skip_conversation_log,
                 tool_messages,
                 pending_fragment_ids,
+                extraction_round_count,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
@@ -1576,7 +1706,9 @@ async def _chat_completions_inner(request: Request):
                 if conversation_persistence_enabled() and (user_message or tool_messages):
                     asyncio.create_task(
                         process_memories_background(session_id, user_message, assistant_msg, model, 
-                                                    context_messages=original_messages, skip_conversation_log=skip_conversation_log,
+                                                    context_messages=extraction_context_messages,
+                                                    context_round_count=extraction_round_count,
+                                                    skip_conversation_log=skip_conversation_log,
                                                     tool_messages=tool_messages, assistant_tool_calls=assistant_tool_calls,
                                                     assistant_reasoning=assistant_reasoning)
                     )
@@ -1590,7 +1722,18 @@ async def _chat_completions_inner(request: Request):
                 return JSONResponse(status_code=response.status_code, content=error_content)
 
 
-async def stream_and_capture(headers: dict, body: dict, session_id: str, user_message: str, model: str, original_messages: list = None, skip_conversation_log: bool = False, tool_messages: list = None, pending_fragment_ids: list = None):
+async def stream_and_capture(
+    headers: dict,
+    body: dict,
+    session_id: str,
+    user_message: str,
+    model: str,
+    extraction_context_messages: list = None,
+    skip_conversation_log: bool = False,
+    tool_messages: list = None,
+    pending_fragment_ids: list = None,
+    extraction_round_count: int = None,
+):
     """流式响应 + 捕获完整回复（原始字节透传，确保SSE格式和thinking数据完整）"""
     full_response = []
     full_reasoning = []
@@ -1703,7 +1846,9 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
     if conversation_persistence_enabled() and (user_message or tool_messages):
         asyncio.create_task(
             process_memories_background(session_id, user_message, assistant_msg, model, 
-                                        context_messages=original_messages, skip_conversation_log=skip_conversation_log,
+                                        context_messages=extraction_context_messages,
+                                        context_round_count=extraction_round_count,
+                                        skip_conversation_log=skip_conversation_log,
                                         tool_messages=tool_messages, assistant_tool_calls=assistant_tool_calls,
                                         assistant_reasoning=assistant_reasoning)
         )
@@ -1757,6 +1902,82 @@ async def export_memories():
         return {"error": str(e)}
 
 
+@app.get("/dashboard/login", response_class=HTMLResponse)
+async def dashboard_login_page(request: Request):
+    """Dashboard 独立登录页，网关主密钥不进入浏览器。"""
+    if valid_dashboard_session(request.cookies.get(DASHBOARD_SESSION_COOKIE, "")):
+        return RedirectResponse(url="/dashboard", status_code=303)
+    configured = dashboard_auth_ready()
+    return templates.TemplateResponse(
+        request,
+        "login.html",
+        {
+            "error": None,
+            "config_error": None if configured else "请先设置 DASHBOARD_PASSWORD 和至少 32 字符的 SESSION_SECRET。",
+        },
+        status_code=200 if configured else 503,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/dashboard/login", response_class=HTMLResponse)
+async def dashboard_login(request: Request):
+    """校验 Dashboard 密码并签发短期 HttpOnly Cookie。"""
+    if not dashboard_auth_ready():
+        return templates.TemplateResponse(
+            request,
+            "login.html",
+            {
+                "error": None,
+                "config_error": "请先设置 DASHBOARD_PASSWORD 和至少 32 字符的 SESSION_SECRET。",
+            },
+            status_code=503,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    body = await request.body()
+    fields = parse_qs(body[:4096].decode("utf-8", errors="replace"))
+    password = fields.get("password", [""])[0]
+    if len(body) > 4096 or not secrets.compare_digest(
+        password.encode("utf-8"),
+        DASHBOARD_PASSWORD.encode("utf-8"),
+    ):
+        return templates.TemplateResponse(
+            request,
+            "login.html",
+            {"error": "密码不正确。", "config_error": None},
+            status_code=401,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    response = RedirectResponse(url="/dashboard", status_code=303)
+    response.set_cookie(
+        DASHBOARD_SESSION_COOKIE,
+        make_dashboard_session(),
+        max_age=DASHBOARD_SESSION_SECONDS,
+        path="/",
+        secure=True,
+        httponly=True,
+        samesite="strict",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.post("/dashboard/logout")
+async def dashboard_logout():
+    response = RedirectResponse(url="/dashboard/login", status_code=303)
+    response.delete_cookie(
+        DASHBOARD_SESSION_COOKIE,
+        path="/",
+        secure=True,
+        httponly=True,
+        samesite="strict",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_page(request: Request):
     """Dashboard - 整合的记忆管理界面"""
@@ -1802,8 +2023,7 @@ async def api_get_memories(layer: int = None, active_only: bool = None):
     return result
 
 
-@app.get("/api/memories/search")
-async def api_search_memories(q: str = "", limit: int = 20):
+async def _run_memory_search(q: str, limit: int):
     """语义搜索记忆（Dashboard用，走后端 search_memories）"""
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用"}
@@ -1825,6 +2045,27 @@ async def api_search_memories(q: str = "", limit: int = 20):
         return {"results": out, "total": len(out)}
     except Exception as e:
         return {"error": str(e), "results": []}
+
+
+@app.get("/api/memories/search")
+async def api_search_memories(q: str = "", limit: int = 20):
+    return await _run_memory_search(q, limit)
+
+
+@app.post("/api/memories/search")
+async def api_search_memories_post(request: Request):
+    """POST 变体避免查询原文进入 URL 与访问日志。"""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "请求体必须是 JSON"})
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400, content={"error": "请求体必须是 JSON 对象"})
+    q = body.get("q", "")
+    limit = body.get("limit", 20)
+    if not isinstance(q, str) or not isinstance(limit, int) or isinstance(limit, bool):
+        return JSONResponse(status_code=400, content={"error": "q 必须是字符串，limit 必须是整数"})
+    return await _run_memory_search(q, limit)
 
 
 @app.put("/api/memories/{memory_id}")

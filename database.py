@@ -1823,7 +1823,11 @@ async def get_recent_memories(limit: int = 20):
     pool = await get_pool()
     async with pool.acquire() as conn:
         return await conn.fetch(
-            "SELECT id, content, importance, created_at FROM memories ORDER BY created_at DESC LIMIT $1",
+            """SELECT id, content, importance, created_at
+               FROM memories
+               WHERE is_active = TRUE
+               ORDER BY created_at DESC
+               LIMIT $1""",
             limit,
         )
 

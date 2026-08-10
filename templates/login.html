@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pawwake Dashboard 登录</title>
+    <link rel="stylesheet" href="/static/css/login.css?v=4.0.1">
+</head>
+<body>
+    <main class="login-shell">
+        <section class="login-card" aria-labelledby="login-title">
+            <div class="paw-mark" aria-hidden="true">🐾</div>
+            <p class="brand">Pawwake · 爪迹</p>
+            <h1 id="login-title">Dashboard 登录</h1>
+            <p class="subtitle">输入部署时设置的 Dashboard 密码。</p>
+
+            {% if config_error %}
+            <div class="message error" role="alert">{{ config_error }}</div>
+            {% else %}
+            <form method="post" action="/dashboard/login">
+                <label for="password">Dashboard 密码</label>
+                <input
+                    id="password"
+                    name="password"
+                    type="password"
+                    autocomplete="current-password"
+                    required
+                    autofocus
+                >
+                {% if error %}
+                <div class="message error" role="alert">{{ error }}</div>
+                {% endif %}
+                <button type="submit">登录</button>
+            </form>
+            {% endif %}
+        </section>
+    </main>
+</body>
+</html>
