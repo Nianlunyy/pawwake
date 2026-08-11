@@ -23,10 +23,14 @@ import hmac
 import secrets
 import time
 import httpx
+import google.auth
+from google.oauth2 import service_account
+from google.auth.transport.requests import Request as GoogleAuthRequest
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from urllib.parse import parse_qs
 from fastapi import FastAPI, Request
+from fastapi import HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -36,6 +40,35 @@ from database import init_tables, close_pool, save_message, search_memories, sav
 from database import search_chat_fragments, rebuild_content_tsv, kick_embedding_backfill, get_embedding_backfill_status, mark_fragments_seen
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories
+
+# ---- Vertex AI 动态令牌获取（带缓存，避免每次请求都重新刷新）----
+_cached_vertex_token = None
+_cached_vertex_token_expiry = 0
+
+def get_vertex_access_token():
+    global _cached_vertex_token, _cached_vertex_token_expiry
+
+    if _cached_vertex_token and time.time() < _cached_vertex_token_expiry - 60:
+        return _cached_vertex_token
+
+    sa_json_str = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
+    if sa_json_str:
+        info = json.loads(sa_json_str)
+        credentials = service_account.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+    else:
+        credentials, _ = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+
+    credentials.refresh(GoogleAuthRequest())
+
+    _cached_vertex_token = credentials.token
+    _cached_vertex_token_expiry = (
+        credentials.expiry.timestamp() if credentials.expiry else time.time() + 50 * 60
+    )
+    return _cached_vertex_token
 
 # ============================================================
 # 配置项 —— 全部从环境变量读取，部署时在云平台面板里设置
@@ -1759,7 +1792,13 @@ async def stream_and_capture(
     line_buffer = ""
     accumulated_tool_calls = {}  # index -> OpenAI-compatible tool call
     stream_succeeded = False
-    
+    if "aiplatform.googleapis.com" in API_BASE_URL:
+        try:
+            fresh_token = get_vertex_access_token()
+            headers["Authorization"] = f"Bearer {fresh_token}"
+        except Exception as e:
+            print(f"⚠️ 动态生成 Vertex Token 失败: {e}")
+            raise HTTPException(status_code=502, detail=f"Vertex AI 认证令牌获取失败: {str(e)}")
     async with httpx.AsyncClient(timeout=300) as client:
         async with client.stream("POST", API_BASE_URL, headers=headers, json=body) as response:
             # 打印上游响应头（排查thinking问题用）
