@@ -1099,6 +1099,24 @@ async def build_memory_text(user_message: str) -> str:
         return ""
 
 
+def _format_recall_timestamp(raw_ts) -> str:
+    """召回片段时间前缀：按 TIMEZONE_HOURS（环境变量，启动时生效）转本地时间到分钟。
+
+    naive 时间戳按 UTC 处理；任何解析失败退回截取日期的旧行为。
+    """
+    try:
+        if isinstance(raw_ts, datetime):
+            ts = raw_ts
+        else:
+            ts = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        local = ts.astimezone(timezone(timedelta(hours=TIMEZONE_HOURS)))
+        return local.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return str(raw_ts)[:10]
+
+
 async def build_conversation_recall_text(user_message: str, session_id: str):
     """为分区模式检索未注入过的对话片段，并返回待确认的 fragment_id。"""
     if (
@@ -1136,7 +1154,7 @@ async def build_conversation_recall_text(user_message: str, session_id: str):
                 for message in fragment:
                     date_prefix = ""
                     if message.get("created_at"):
-                        date_prefix = f"[{str(message['created_at'])[:10]}] "
+                        date_prefix = f"[{_format_recall_timestamp(message['created_at'])}] "
                     role = role_labels.get(message.get("role"), message.get("role", "消息"))
                     lines.append(f"{date_prefix}{role}: {message.get('content', '')}")
                 if lines and fragment_id:
