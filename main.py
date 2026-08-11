@@ -1739,7 +1739,7 @@ async def stream_and_capture(
     full_reasoning = []
     stream_usage = {}
     line_buffer = ""
-    accumulated_tool_calls = {}  # index -> {id, type, function: {name, arguments}}
+    accumulated_tool_calls = {}  # index -> OpenAI-compatible tool call
     stream_succeeded = False
     
     async with httpx.AsyncClient(timeout=300) as client:
@@ -1800,12 +1800,18 @@ async def stream_and_capture(
                                         }
                                     if tc.get("id"):
                                         accumulated_tool_calls[idx]["id"] = tc["id"]
+                                    for key, value in tc.items():
+                                        if key not in {"index", "id", "type", "function"}:
+                                            accumulated_tool_calls[idx][key] = value
                                     if "function" in tc:
                                         fn = tc["function"]
                                         if fn.get("name"):
                                             accumulated_tool_calls[idx]["function"]["name"] = fn["name"]
                                         if "arguments" in fn:
                                             accumulated_tool_calls[idx]["function"]["arguments"] += fn["arguments"]
+                                        for key, value in fn.items():
+                                            if key not in {"name", "arguments"}:
+                                                accumulated_tool_calls[idx]["function"][key] = value
                         except (json.JSONDecodeError, KeyError, IndexError):
                             pass
             stream_succeeded = response.status_code == 200
