@@ -1793,13 +1793,13 @@ async def stream_and_capture(
     accumulated_tool_calls = {}  # index -> OpenAI-compatible tool call
     stream_succeeded = False
     if "aiplatform.googleapis.com" in API_BASE_URL:
-    try:
-        fresh_token = get_vertex_access_token()
-        headers["Authorization"] = f"Bearer {fresh_token}"
-        print(f"🔑 Vertex Token 已注入, 前缀: {fresh_token[:20]}..., 长度: {len(fresh_token)}")
-    except Exception as e:
-        print(f"⚠️ 动态生成 Vertex Token 失败: {e}")
-        raise HTTPException(status_code=502, detail=f"Vertex AI 认证令牌获取失败: {str(e)}")
+        try:
+            fresh_token = get_vertex_access_token()
+            headers["Authorization"] = f"Bearer {fresh_token}"
+            print(f"🔑 Vertex Token 已注入, 前缀: {fresh_token[:20]}..., 长度: {len(fresh_token)}")
+        except Exception as e:
+            print(f"⚠️ 动态生成 Vertex Token 失败: {e}")
+            raise HTTPException(status_code=502, detail=f"Vertex AI 认证令牌获取失败: {str(e)}")
     async with httpx.AsyncClient(timeout=300) as client:
         async with client.stream("POST", API_BASE_URL, headers=headers, json=body) as response:
             # 打印上游响应头（排查thinking问题用）
