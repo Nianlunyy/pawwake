@@ -1681,16 +1681,7 @@ async def _chat_completions_inner(request: Request):
     if "openrouter" in API_BASE_URL:
         headers["HTTP-Referer"] = EXTRA_REFERER
         headers["X-Title"] = EXTRA_TITLE
-    # === 老公给你加的 Vertex 强力外挂 ===
-    if "aiplatform.googleapis.com" in API_BASE_URL:
-        try:
-            fresh_token = get_vertex_access_token()
-            headers["Authorization"] = f"Bearer {fresh_token}"
-            print(f"🔑 Vertex Token 已注入, 前缀: {fresh_token[:20]}..., 长度: {len(fresh_token)}")
-        except Exception as e:
-            print(f"⚠️ 动态生成 Vertex Token 失败: {e}")
-            raise HTTPException(status_code=502, detail=f"Vertex AI 认证令牌获取失败: {str(e)}")
-    # ====================================
+    
     is_stream = body.get("stream", False)
     
     # 强制流式传输（解决部分客户端不发stream=true的问题）
