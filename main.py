@@ -1861,12 +1861,12 @@ async def stream_and_capture(
                                 stream_usage = data["usage"]
                             
                             delta = data.get("choices", [{}])[0].get("delta", {})
-                            if delta:
-                                print(f"🔬 Delta keys: {list(delta.keys())}, 前20字: {delta.get('content','')[:20]!r}")
                             content = delta.get("content", "")
-                            if content:
+                            if "extra_content" in delta and content:
+                                full_reasoning.append(content)
+                            elif content:
                                 full_response.append(content)
-                            
+                
                             # 收集reasoning_content（deepseek thinking mode）
                             reasoning = delta.get("reasoning_content", "")
                             if reasoning:
