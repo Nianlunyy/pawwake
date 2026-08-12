@@ -1867,7 +1867,7 @@ async def stream_and_capture(
                             if is_thinking_chunk:
                                 full_reasoning.append(content)
                                 delta["reasoning_content"] = content
-                                delta["content"] = ""
+                                delta.pop("content", None)
                                 choices[0]["delta"] = delta
                                 data["choices"] = choices
                                 rewritten_line = "data: " + json.dumps(data, ensure_ascii=False)
