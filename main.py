@@ -1708,12 +1708,19 @@ async def _chat_completions_inner(request: Request):
     
     # 注入推理参数（解决客户端走网关时不带reasoning参数的问题）
     if REASONING_EFFORT and not skip_conversation_log:
-        # 统一用 reasoning_effort（Claude/OpenAI/Google Gemini OpenAI兼容端点都支持）
-        # 先删除客户端可能已带的值，确保用我们配置的
         body.pop("reasoning_effort", None)
         body.pop("google", None)
         body["reasoning_effort"] = REASONING_EFFORT
-        print(f"🧠 注入推理参数: reasoning_effort={REASONING_EFFORT}")
+        if "aiplatform.googleapis.com" in API_BASE_URL:
+            body["google"] = {
+                "thinking_config": {
+                    "thinking_level": REASONING_EFFORT,
+                    "include_thoughts": True
+                }
+            }
+            print(f"🧠 注入推理参数(Gemini): reasoning_effort={REASONING_EFFORT}, include_thoughts=True")
+        else:
+            print(f"🧠 注入推理参数: reasoning_effort={REASONING_EFFORT}")
     
     print(f"📡 请求: model={model}, stream={is_stream}, memory={'on' if MEMORY_ENABLED else 'off'}", flush=True)
     
