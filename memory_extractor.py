@@ -9,28 +9,68 @@ v2.3 改进：提取时注入已有记忆，让模型对比后只提取全新信
 
 import os
 import json
+import time
 import httpx
+import google.auth
+from google.oauth2 import service_account
+from google.auth.transport.requests import Request as GoogleAuthRequest
 from typing import List, Dict
 
 API_KEY = os.getenv("API_KEY", "")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://openrouter.ai/api/v1/chat/completions")
 
-# 记忆模型专用 API Key（不设则回退到主 API_KEY）
-# 适用于中转站按模型分组、不同模型需要不同 Key 的场景
 MEMORY_API_KEY = os.getenv("MEMORY_API_KEY", "")
 
-# 用来提取记忆的模型（便宜的就行）
-# 面板上这项写着"留空用默认"，清空会写进一个空串，os.getenv 的默认值这时不生效，
-# 所以默认值单独拎出来用 or 兜，热更新和重启后行为才一致
 DEFAULT_MEMORY_MODEL = "anthropic/claude-haiku-4.5"
 MEMORY_MODEL = os.getenv("MEMORY_MODEL") or DEFAULT_MEMORY_MODEL
 
-# 记忆提取的输出上限，原先硬编码 1000。部分上游会把 reasoning token
-# 也算进这条额度，JSON 可能在收尾前被截断，表面只报"未找到JSON数组"
 MEMORY_MAX_TOKENS = int(os.getenv("MEMORY_MAX_TOKENS", "4000"))
 
 def get_memory_api_key() -> str:
     return MEMORY_API_KEY or API_KEY
+
+
+# ---- Vertex AI 动态令牌获取（带缓存，避免每次请求都重新刷新）----
+_cached_vertex_token = None
+_cached_vertex_token_expiry = 0
+
+def get_vertex_access_token():
+    global _cached_vertex_token, _cached_vertex_token_expiry
+    if _cached_vertex_token and time.time() < _cached_vertex_token_expiry - 60:
+        return _cached_vertex_token
+
+    sa_json_str = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
+    if sa_json_str:
+        info = json.loads(sa_json_str)
+        credentials = service_account.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+    else:
+        credentials, _ = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+    credentials.refresh(GoogleAuthRequest())
+    _cached_vertex_token = credentials.token
+    _cached_vertex_token_expiry = (
+        credentials.expiry.timestamp() if credentials.expiry else time.time() + 50 * 60
+    )
+    return _cached_vertex_token
+
+
+def _build_vertex_headers_and_model(model: str):
+    """如果目标是 Vertex AI，注入动态令牌并补全 publisher 前缀；否则原样返回。"""
+    headers = {
+        "Authorization": f"Bearer {get_memory_api_key()}",
+        "Content-Type": "application/json",
+    }
+    if "aiplatform.googleapis.com" in API_BASE_URL:
+        try:
+            headers["Authorization"] = f"Bearer {get_vertex_access_token()}"
+        except Exception as e:
+            print(f"⚠️  记忆模块 Vertex Token 获取失败: {e}")
+        if "/" not in model:
+            model = f"google/{model}"
+    return headers, model
 
 
 def _diagnose_incomplete(finish_reason, completion_tokens, reasoning_tokens) -> str:
@@ -152,16 +192,14 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
     # 调用 LLM 提取记忆
     try:
         async with httpx.AsyncClient(timeout=60) as client:
+            headers, memory_model = _build_vertex_headers_and_model(MEMORY_MODEL)
+            headers["HTTP-Referer"] = "https://midsummer-gateway.local"
+            headers["X-Title"] = "Midsummer Memory Extraction"
             response = await client.post(
                 API_BASE_URL,
-                headers={
-                    "Authorization": f"Bearer {get_memory_api_key()}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://midsummer-gateway.local",
-                    "X-Title": "Midsummer Memory Extraction",
-                },
+                headers=headers,
                 json={
-                    "model": MEMORY_MODEL,
+                    "model": memory_model,
                     "max_tokens": MEMORY_MAX_TOKENS,
                     "messages": [
                         {"role": "system", "content": prompt},
@@ -292,17 +330,14 @@ async def score_memories(texts: List[str]) -> List[Dict]:
 
     try:
         async with httpx.AsyncClient(timeout=60) as client:
+            headers, memory_model = _build_vertex_headers_and_model(MEMORY_MODEL)
             response = await client.post(
                 API_BASE_URL,
-                headers={
-                    "Authorization": f"Bearer {get_memory_api_key()}",
-                    "Content-Type": "application/json",
-                },
+                headers=headers,
                 json={
-                    "model": MEMORY_MODEL,
+                    "model": memory_model,
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0,
-                    # 跟提取同一个模型同一类活，跟着同一个配置走；写死会让用户调了也不生效
                     "max_tokens": MEMORY_MAX_TOKENS,
                 },
             )
