@@ -1752,6 +1752,8 @@ async def _chat_completions_inner(request: Request):
             
             if response.status_code == 200:
                 resp_data = response.json()
+                resp_data = response.json()
+                print(f"🔬 原始响应完整结构: {json.dumps(resp_data.get('choices', [{}])[0].get('message', {}), ensure_ascii=False)[:2000]}")
                 assistant_msg = ""
                 assistant_tool_calls = None
                 assistant_reasoning = None
