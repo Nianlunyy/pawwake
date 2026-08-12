@@ -1912,23 +1912,6 @@ async def stream_and_capture(
         if line_buffer:
             yield line_buffer.encode("utf-8")
         stream_succeeded = response.status_code == 200
-                                    if tc.get("id"):
-                                        accumulated_tool_calls[idx]["id"] = tc["id"]
-                                    for key, value in tc.items():
-                                        if key not in {"index", "id", "type", "function"}:
-                                            accumulated_tool_calls[idx][key] = value
-                                    if "function" in tc:
-                                        fn = tc["function"]
-                                        if fn.get("name"):
-                                            accumulated_tool_calls[idx]["function"]["name"] = fn["name"]
-                                        if "arguments" in fn:
-                                            accumulated_tool_calls[idx]["function"]["arguments"] += fn["arguments"]
-                                        for key, value in fn.items():
-                                            if key not in {"name", "arguments"}:
-                                                accumulated_tool_calls[idx]["function"][key] = value
-                        except (json.JSONDecodeError, KeyError, IndexError):
-                            pass
-            stream_succeeded = response.status_code == 200
     
     assistant_msg = "".join(full_response)
     assistant_reasoning = "".join(full_reasoning) if full_reasoning else None
