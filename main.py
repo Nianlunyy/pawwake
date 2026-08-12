@@ -713,7 +713,6 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
 摘要："""
     
     try:
-        # 摘要请求发往主API_BASE_URL，直接用主API_KEY（MEMORY_API_KEY可能是其他提供商的key）
         headers = {
             "Authorization": f"Bearer {API_KEY}",
             "Content-Type": "application/json",
@@ -721,11 +720,18 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
         if "openrouter" in API_BASE_URL:
             headers["HTTP-Referer"] = EXTRA_REFERER
             headers["X-Title"] = EXTRA_TITLE
+        summary_model = CACHE_SUMMARY_MODEL
+        if "aiplatform.googleapis.com" in API_BASE_URL:
+            try:
+                headers["Authorization"] = f"Bearer {get_vertex_access_token()}"
+            except Exception as e:
+                print(f"⚠️ 摘要模型 Vertex Token 获取失败: {e}")
+            if "/" not in summary_model:
+                summary_model = f"google/{summary_model}"
 
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(API_BASE_URL, headers=headers, json={
-                "model": CACHE_SUMMARY_MODEL,
-                # 推理模型的思考也消耗max_tokens，给足空间避免content为空
+                "model": summary_model,
                 "max_tokens": CACHE_SUMMARY_MAX_TOKENS,
                 "messages": [{"role": "user", "content": prompt}],
             })
