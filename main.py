@@ -1710,7 +1710,6 @@ async def _chat_completions_inner(request: Request):
     if REASONING_EFFORT and not skip_conversation_log:
         body.pop("reasoning_effort", None)
         body.pop("google", None)
-        body["reasoning_effort"] = REASONING_EFFORT
         if "aiplatform.googleapis.com" in API_BASE_URL:
             body["google"] = {
                 "thinking_config": {
@@ -1718,8 +1717,9 @@ async def _chat_completions_inner(request: Request):
                     "include_thoughts": True
                 }
             }
-            print(f"🧠 注入推理参数(Gemini): reasoning_effort={REASONING_EFFORT}, include_thoughts=True")
+            print(f"🧠 注入推理参数(Gemini): thinking_level={REASONING_EFFORT}, include_thoughts=True")
         else:
+            body["reasoning_effort"] = REASONING_EFFORT
             print(f"🧠 注入推理参数: reasoning_effort={REASONING_EFFORT}")
     
     print(f"📡 请求: model={model}, stream={is_stream}, memory={'on' if MEMORY_ENABLED else 'off'}", flush=True)
