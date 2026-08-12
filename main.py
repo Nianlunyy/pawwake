@@ -1840,49 +1840,78 @@ async def stream_and_capture(
             is_error = response.status_code != 200
             
             async for chunk in response.aiter_bytes():
-                # 原始字节直接透传给客户端
+            if is_error:
                 yield chunk
-                
-                if is_error:
-                    error_body_parts.append(chunk)
-                    continue
-                
-                # 旁路解析：从字节流中提取assistant回复内容，用于后续记忆提取
-                text = chunk.decode("utf-8", errors="ignore")
-                line_buffer += text
-                while "\n" in line_buffer:
-                    line, line_buffer = line_buffer.split("\n", 1)
-                    line = line.strip()
-                    if line.startswith("data: ") and line != "data: [DONE]":
-                        try:
-                            data = json.loads(line[6:])
-                            
-                            if "usage" in data:
-                                stream_usage = data["usage"]
-                            
-                            delta = data.get("choices", [{}])[0].get("delta", {})
-                            content = delta.get("content", "")
-                            if "extra_content" in delta and content:
-                                full_reasoning.append(content)
-                            elif content:
+                error_body_parts.append(chunk)
+                continue
+
+            # 旁路解析：按行处理每条SSE事件；命中思考内容（带extra_content标记）时
+            # 改写为reasoning_content字段再转发，其余原样透传
+            text = chunk.decode("utf-8", errors="ignore")
+            line_buffer += text
+            while "\n" in line_buffer:
+                line, line_buffer = line_buffer.split("\n", 1)
+                stripped_line = line.strip()
+                if stripped_line.startswith("data: ") and stripped_line != "data: [DONE]":
+                    try:
+                        data = json.loads(stripped_line[6:])
+
+                        if "usage" in data:
+                            stream_usage = data["usage"]
+
+                        choices = data.get("choices") or [{}]
+                        delta = choices[0].get("delta", {}) if choices else {}
+                        content = delta.get("content", "")
+                        is_thinking_chunk = "extra_content" in delta and content
+
+                        if is_thinking_chunk:
+                            full_reasoning.append(content)
+                            delta["reasoning_content"] = content
+                            delta["content"] = ""
+                            choices[0]["delta"] = delta
+                            data["choices"] = choices
+                            rewritten_line = "data: " + json.dumps(data, ensure_ascii=False)
+                            yield (rewritten_line + "\n").encode("utf-8")
+                        else:
+                            if content:
                                 full_response.append(content)
-                
-                            # 收集reasoning_content（deepseek thinking mode）
-                            reasoning = delta.get("reasoning_content", "")
-                            if reasoning:
-                                full_reasoning.append(reasoning)
-                            
-                            # 累积tool_calls
-                            if "tool_calls" in delta:
-                                for tc in delta["tool_calls"]:
-                                    idx = tc.get("index", 0)
-                                    if idx not in accumulated_tool_calls:
-                                        accumulated_tool_calls[idx] = {
-                                            "index": idx,
-                                            "id": tc.get("id", ""),
-                                            "type": tc.get("type", "function"),
-                                            "function": {"name": "", "arguments": ""}
-                                        }
+                            yield (line + "\n").encode("utf-8")
+
+                        reasoning = delta.get("reasoning_content", "")
+                        if reasoning and not is_thinking_chunk:
+                            full_reasoning.append(reasoning)
+
+                        if "tool_calls" in delta:
+                            for tc in delta["tool_calls"]:
+                                idx = tc.get("index", 0)
+                                if idx not in accumulated_tool_calls:
+                                    accumulated_tool_calls[idx] = {
+                                        "index": idx,
+                                        "id": tc.get("id", ""),
+                                        "type": tc.get("type", "function"),
+                                        "function": {"name": "", "arguments": ""}
+                                    }
+                                if tc.get("id"):
+                                    accumulated_tool_calls[idx]["id"] = tc["id"]
+                                for key, value in tc.items():
+                                    if key not in {"index", "id", "type", "function"}:
+                                        accumulated_tool_calls[idx][key] = value
+                                if "function" in tc:
+                                    fn = tc["function"]
+                                    if fn.get("name"):
+                                        accumulated_tool_calls[idx]["function"]["name"] = fn["name"]
+                                    if "arguments" in fn:
+                                        accumulated_tool_calls[idx]["function"]["arguments"] += fn["arguments"]
+                                    for key, value in fn.items():
+                                        if key not in {"name", "arguments"}:
+                                            accumulated_tool_calls[idx]["function"][key] = value
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        yield (line + "\n").encode("utf-8")
+                else:
+                    yield (line + "\n").encode("utf-8")
+        if line_buffer:
+            yield line_buffer.encode("utf-8")
+        stream_succeeded = response.status_code == 200
                                     if tc.get("id"):
                                         accumulated_tool_calls[idx]["id"] = tc["id"]
                                     for key, value in tc.items():
