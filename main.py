@@ -376,7 +376,9 @@ def valid_dashboard_session(token: str) -> bool:
 
 def request_has_same_origin(request: Request) -> bool:
     origin = request.headers.get("origin", "").rstrip("/")
-    expected = f"{request.url.scheme}://{request.url.netloc}".rstrip("/")
+    forwarded_scheme = request.headers.get("x-forwarded-proto", "").strip().lower()
+    expected_scheme = forwarded_scheme if forwarded_scheme in {"http", "https"} else request.url.scheme
+    expected = f"{expected_scheme}://{request.url.netloc}".rstrip("/")
     return bool(origin) and secrets.compare_digest(origin, expected)
 
 @app.middleware("http")

@@ -332,6 +332,14 @@ raw API 不保存 seen 状态。调用方需要把上次返回的 `fragment_ids`
 **Q: 部署后访问显示 502 或服务无响应？**
 A: 检查端口设置。Render 默认用 `PORT` 环境变量，确保设置为 `8000`（和 Dockerfile 里一致）。如果用其他平台，注意端口是否匹配。
 
+**Q: Dashboard 能打开，但保存设置时提示 `Invalid request origin.`？**
+A: 更新到包含此修复的版本并重新部署，不需要新增环境变量。若自建反向代理后仍报错，请确认代理保留了原始 `Host`，并通过 `X-Forwarded-Proto` 告诉后端浏览器使用的协议。Nginx 可在对应的 `location` 中加入：
+
+```nginx
+proxy_set_header Host $host;
+proxy_set_header X-Forwarded-Proto $scheme;
+```
+
 **Q: 数据库连接失败？**
 A: 如果数据库和网关不在同一个平台，连接字符串末尾可能需要加 `?sslmode=require`。分区缓存开启时，数据库不可用会让聊天端点返回明确的 `503 partition_database_unavailable`，避免用残缺历史继续对话。分区缓存关闭时，网关会用文件默认人设继续纯转发。
 
