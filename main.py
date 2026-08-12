@@ -1861,6 +1861,8 @@ async def stream_and_capture(
                                 stream_usage = data["usage"]
                             
                             delta = data.get("choices", [{}])[0].get("delta", {})
+                            if delta:
+                                print(f"🔬 Delta原始结构: {json.dumps(delta, ensure_ascii=False)[:300]}")
                             content = delta.get("content", "")
                             if content:
                                 full_response.append(content)
