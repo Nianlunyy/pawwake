@@ -1689,6 +1689,9 @@ async def _chat_completions_inner(request: Request):
         except Exception as e:
             print(f"⚠️ 动态生成 Vertex Token 失败: {e}")
             raise HTTPException(status_code=502, detail=f"Vertex AI 认证令牌获取失败: {str(e)}")
+        if "/" not in body.get("model", ""):
+            body["model"] = f"google/{body['model']}"
+            print(f"🏷️ 已补全 Vertex publisher 前缀: model={body['model']}")
     is_stream = body.get("stream", False)
     
     # 强制流式传输（解决部分客户端不发stream=true的问题）
