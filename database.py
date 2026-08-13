@@ -595,7 +595,6 @@ async def save_memory_embedding(conn, memory_id: int, embedding: list):
             vec_str, memory_id
         )
     else:
-        import json
         await conn.execute(
             "UPDATE memories SET embedding_json = $1 WHERE id = $2",
             json.dumps(embedding), memory_id
@@ -614,8 +613,6 @@ async def save_conversation_embedding(conn, message_id: int, embedding: list):
             message_id,
         )
     else:
-        import json
-
         await conn.execute(
             "UPDATE conversations SET embedding_json = $1 WHERE id = $2",
             json.dumps(embedding),
@@ -728,16 +725,6 @@ async def update_last_assistant_message(session_id: str, new_content: str, model
                 kick_embedding_backfill()
             return True
         return False
-
-
-async def get_recent_messages(session_id: str, limit: int = 20):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT role, content, metadata, created_at FROM conversations WHERE session_id = $1 ORDER BY created_at DESC LIMIT $2",
-            session_id, limit,
-        )
-        return list(reversed(rows))
 
 
 async def search_conversations(query: str, limit: int = 20, offset: int = 0):
@@ -1016,8 +1003,6 @@ async def _semantic_session_scores(conn, query_embedding: list, pool_size: int,
             for row in rows
         }
 
-    import json
-
     params = []
     exclusion_sql, exclusion_params = _session_exclusion_sql(
         exclude_session_ids, 1
@@ -1174,7 +1159,6 @@ async def search_chat_fragments(
                     semantic_similarity = float(message["sem_sim"] or 0)
                 elif query_embedding and message["embedding_json"]:
                     try:
-                        import json
                         semantic_similarity = _cosine_sim(
                             query_embedding, json.loads(message["embedding_json"])
                         )
@@ -1429,7 +1413,6 @@ async def search_memories_hybrid(query: str, limit: int = 10):
                 """, vec_str, limit * 3)
             else:
                 # Python端计算cosine
-                import json
                 all_mem = await conn.fetch("""
                     SELECT id, content, importance, created_at, event_date, embedding_json
                     FROM memories WHERE embedding_json IS NOT NULL AND is_active = TRUE
@@ -2039,27 +2022,6 @@ async def get_all_memories_detail(limit: int = None, layer: int = None, active_o
         return [dict(r) for r in rows]
 
 
-async def update_memory(memory_id: int, content: str = None, importance: int = None):
-    """更新单条记忆"""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        if content is not None and importance is not None:
-            await conn.execute(
-                "UPDATE memories SET content = $1, importance = $2 WHERE id = $3",
-                content, importance, memory_id
-            )
-        elif content is not None:
-            await conn.execute(
-                "UPDATE memories SET content = $1 WHERE id = $2",
-                content, memory_id
-            )
-        elif importance is not None:
-            await conn.execute(
-                "UPDATE memories SET importance = $1 WHERE id = $2",
-                importance, memory_id
-            )
-
-
 async def delete_memory(memory_id: int):
     """删除单条记忆"""
     pool = await get_pool()
@@ -2209,7 +2171,6 @@ async def get_session_cache_state(session_id: str, seen_ttl_hours: float = None)
 
 
 async def save_session_cache_state(session_id: str, summary_parts: list, a_start_round: int):
-    import json
     summary_json = json.dumps(summary_parts, ensure_ascii=False)
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -2383,7 +2344,6 @@ async def list_all_session_cache_states() -> list:
         for r in rows:
             raw_summary = r['summary'] or ''
             try:
-                import json
                 parsed = json.loads(raw_summary)
                 if isinstance(parsed, list):
                     summary_parts = parsed
@@ -2528,7 +2488,6 @@ async def import_conversations(records: list):
             )
             
             # 解析时间
-            from datetime import datetime
             if created_at and isinstance(created_at, str):
                 try:
                     created_at = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
@@ -2602,51 +2561,6 @@ async def get_fragments_by_date(event_date):
             ORDER BY created_at
         """, start_utc, end_utc)
         return [dict(r) for r in rows]
-
-
-async def get_fragments_by_date_range(start_date, end_date):
-    """获取指定时间段的原始碎片（用于跨天整理）"""
-    # 把本地日期转成UTC时间范围，避免DATE()用UTC截断导致日期偏移
-    local_tz = dt_timezone(timedelta(hours=TIMEZONE_HOURS))
-    start_utc = datetime(start_date.year, start_date.month, start_date.day, tzinfo=local_tz).astimezone(dt_timezone.utc)
-    # end_date 当天结束 = end_date 下一天的 00:00
-    end_utc = datetime(end_date.year, end_date.month, end_date.day, tzinfo=local_tz).astimezone(dt_timezone.utc) + timedelta(days=1)
-    
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT id, content, importance, created_at
-            FROM memories
-            WHERE layer = 1 AND is_active = TRUE
-            AND created_at >= $1 AND created_at < $2
-            ORDER BY created_at
-        """, start_utc, end_utc)
-        return [dict(r) for r in rows]
-
-
-async def create_event_memory(title: str, content: str, importance: int, 
-                               event_date, merged_from: list):
-    """创建事件记忆（从碎片合并而来）"""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("""
-            INSERT INTO memories (content, importance, layer, title, is_active, merged_from, event_date)
-            VALUES ($1, $2, 2, $3, TRUE, $4, $5)
-            RETURNING id
-        """, content, importance, title, merged_from, event_date)
-        
-        new_id = row['id'] if row else None
-        
-        # 向量搜索：计算并保存 embedding
-        if MEMORY_VECTOR_ENABLED and new_id:
-            try:
-                embedding = await compute_embedding(content)
-                if embedding:
-                    await save_memory_embedding(conn, new_id, embedding)
-            except Exception as e:
-                print(f"⚠️ 事件记忆embedding计算失败（id={new_id}）: {e}")
-        
-        return new_id
 
 
 async def deactivate_memories(memory_ids: list):
@@ -2986,8 +2900,6 @@ async def cleanup_old_fragments(days: int = 30):
     Returns:
         删除的记忆数量
     """
-    from datetime import datetime, timedelta
-    
     pool = await get_pool()
     async with pool.acquire() as conn:
         cutoff_date = datetime.now() - timedelta(days=days)

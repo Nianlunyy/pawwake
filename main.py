@@ -32,7 +32,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from database import import_memories_v2, _parse_backup_datetime
-from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, update_memory, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, create_consolidated_events, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
+from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, create_consolidated_events, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
 from database import search_chat_fragments, rebuild_content_tsv, kick_embedding_backfill, get_embedding_backfill_status, mark_fragments_seen
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories
@@ -2200,11 +2200,6 @@ _consolidate_status = {
 }
 
 
-async def consolidate_memories_for_date(event_date):
-    """整理指定日期的碎片记忆"""
-    return await consolidate_memories_for_date_range(event_date, event_date)
-
-
 class ConsolidationError(Exception):
     """记忆整理失败，调用方可以安全地保留全部原始碎片。"""
 
@@ -2542,8 +2537,6 @@ async def api_manual_consolidate(request: Request):
         或
         date: 单个日期（兼容旧版）
     """
-    from datetime import date as date_type
-    
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用"}
     
@@ -2864,7 +2857,7 @@ async def api_delete_conversation(session_id: str):
 
 
 @app.post("/api/conversations/batch-delete")
-async def api_batch_delete(request: Request):
+async def api_batch_delete_conversations(request: Request):
     if not conversation_persistence_enabled():
         return {"error": "对话持久化未启用"}
     try:
