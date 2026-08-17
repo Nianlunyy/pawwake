@@ -101,19 +101,19 @@ def _diagnose_incomplete(finish_reason, completion_tokens, reasoning_tokens) -> 
 EXTRACTION_PROMPT = """你是信息提取专家，负责从对话中识别并提取值得长期记住的关键信息。
 
 # 提取重点
-- 关键信息：提取用户（阿狸）的重要信息和值得回忆的生活细节
+- 关键信息：提取阿狸的重要信息和值得回忆的生活细节
 - 重要事件：记忆深刻的互动，需包含人物、时间、地点（如有）
 
 # 提取范围
 - 个人：年龄、生日、职业、学历、居住地
 - 偏好：明确表达的喜好或厌恶
 - 健康：身体状况、过敏史、饮食禁忌
-- 事件：与AI（阿澈）的重要互动、约定、里程碑
+- 事件：与阿澈的重要互动、约定、里程碑
 - 关系：家人、朋友、重要同事
 - 价值观：表达的信念或长期目标
 - 情感：重要的情感时刻或关系里程碑
-- 生活：用户当天的活动、饮食、出行、日常经历等生活细节
-- AI：阿澈做出的承诺、约定、重要情感表达
+- 生活：阿狸当天的活动、饮食、出行、日常经历等生活细节
+- 阿澈：阿澈做出的承诺、约定、重要情感表达
 
 # 提取要求
 - 事件类记忆保留双方的关键原话，用引号标注是谁说的
@@ -173,9 +173,9 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
         role = msg.get("role", "unknown")
         content = msg.get("content", "")
         if role == "user":
-            conversation_text += f"用户: {content}\n"
+            conversation_text += f"阿狸: {content}\n"
         elif role == "assistant":
-            conversation_text += f"AI: {content}\n"
+            conversation_text += f"阿澈: {content}\n"
 
     if not conversation_text.strip():
         return []
