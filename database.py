@@ -10,10 +10,13 @@
 import os
 import re
 import json
+import logging
 from typing import Optional, List
 from datetime import datetime, date, timedelta, timezone as dt_timezone
 
 import asyncpg
+
+logger = logging.getLogger(__name__)
 
 # 时区偏移（和 main.py 保持一致）
 TIMEZONE_HOURS = int(os.getenv("TIMEZONE_HOURS", "8"))
@@ -65,6 +68,16 @@ MEMORY_SEMANTIC_THRESHOLD = float(os.getenv("MEMORY_SEMANTIC_THRESHOLD", "0.5"))
 # ============================================================
 
 _pool: Optional[asyncpg.Pool] = None
+
+
+class BrokenMergeReferencesError(ValueError):
+    """备份前发现 merged_from 引用了不存在的记忆。"""
+
+    def __init__(self, count: int):
+        self.count = count
+        super().__init__(
+            f"检测到 {count} 条记忆的合并来源已失效，可修复断裂引用后重新导出"
+        )
 
 
 async def get_pool() -> asyncpg.Pool:
@@ -1343,7 +1356,7 @@ def _effective_days_ago(event_date, created_at, now_utc):
     return max(0.0, (now_utc - created_at).total_seconds() / 86400.0)
 
 
-async def search_memories_hybrid(query: str, limit: int = 10):
+async def search_memories_hybrid(query: str, limit: int = 10, return_mode: bool = False):
     """
     记忆混合搜索：关键词 + 向量，归一化后四维加权
     
@@ -1353,9 +1366,10 @@ async def search_memories_hybrid(query: str, limit: int = 10):
     
     keywords = extract_search_keywords(query)
     query_embedding = await get_query_embedding(query) if EMBEDDING_API_KEY else []
+    search_mode = "hybrid" if query_embedding else "keyword"
     
     if not keywords and not query_embedding:
-        return []
+        return ([], search_mode) if return_mode else []
     
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -1458,7 +1472,7 @@ async def search_memories_hybrid(query: str, limit: int = 10):
         
         if not candidates:
             print(f"🔍 混合搜索 '{query}' → 两路均无结果")
-            return []
+            return ([], search_mode) if return_mode else []
         
         # ---- 归一化 + 加权 ----
         kw_norm = _min_max_normalize({mid: v['kw_score'] for mid, v in candidates.items()})
@@ -1516,7 +1530,15 @@ async def search_memories_hybrid(query: str, limit: int = 10):
         else:
             print(f"🔍 混合搜索 '{query}' → 无结果" + (f"（{filtered} 条被过滤）" if filtered else ""))
         
-        return [dict(r) for r in results]
+        output = [dict(r) for r in results]
+        return (output, search_mode) if return_mode else output
+
+
+async def search_memories_with_mode(query: str, limit: int = 10):
+    """搜索记忆，并报告本次实际使用了混合搜索还是关键词搜索。"""
+    if MEMORY_VECTOR_ENABLED:
+        return await search_memories_hybrid(query, limit, return_mode=True)
+    return await search_memories(query, limit), "keyword"
 
 
 async def get_pending_memory_embedding_count():
@@ -1834,7 +1856,51 @@ async def get_all_memories():
                    layer, title, is_active, merged_from, event_date
             FROM memories ORDER BY id
         """)
-        return [dict(r) for r in rows]
+        memories = [dict(r) for r in rows]
+
+    memory_ids = {memory["id"] for memory in memories}
+    broken_references = []
+    for memory in memories:
+        missing = sorted(set(memory.get("merged_from") or []) - memory_ids)
+        if missing:
+            broken_references.append((memory["id"], missing))
+    if broken_references:
+        logger.warning(
+            "Backup blocked by broken merged_from references: %s",
+            broken_references,
+        )
+        raise BrokenMergeReferencesError(len(broken_references))
+
+    return memories
+
+
+async def repair_broken_merge_references():
+    """清除已经无法完整撤回的 merged_from 关系，保留父记忆本身。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            rows = await conn.fetch("""
+                WITH broken AS (
+                    SELECT parent.id
+                    FROM memories AS parent
+                    WHERE parent.merged_from IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1
+                          FROM unnest(parent.merged_from) AS refs(source_id)
+                          WHERE NOT EXISTS (
+                              SELECT 1
+                              FROM memories AS source
+                              WHERE source.id = refs.source_id
+                          )
+                      )
+                )
+                UPDATE memories AS parent
+                SET merged_from = NULL
+                FROM broken
+                WHERE parent.id = broken.id
+                RETURNING parent.id
+            """)
+            return len(rows)
 
 
 def _parse_backup_datetime(value):
@@ -2022,20 +2088,68 @@ async def get_all_memories_detail(limit: int = None, layer: int = None, active_o
         return [dict(r) for r in rows]
 
 
-async def delete_memory(memory_id: int):
-    """删除单条记忆"""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM memories WHERE id = $1", memory_id)
+async def delete_archived_memory(memory_id: int):
+    """永久删除一条未被合并关系引用的已归档记忆。"""
+    return await delete_archived_memories_batch([memory_id])
 
 
-async def delete_memories_batch(memory_ids: list):
-    """批量删除记忆"""
+async def delete_archived_memories_batch(memory_ids: list):
+    """批量永久删除未被合并关系引用的已归档记忆。"""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute(
-            "DELETE FROM memories WHERE id = ANY($1::int[])", memory_ids
+        result = await conn.fetchrow(
+            """WITH targets AS (
+                   SELECT memory.id,
+                          EXISTS (
+                              SELECT 1
+                              FROM memories AS parent
+                              WHERE memory.id = ANY(
+                                  COALESCE(parent.merged_from, '{}'::int[])
+                              )
+                          ) AS protected
+                   FROM memories AS memory
+                   WHERE memory.id = ANY($1::int[])
+                     AND memory.is_active = FALSE
+               ), deleted AS (
+                   DELETE FROM memories AS memory
+                   USING targets
+                   WHERE memory.id = targets.id AND NOT targets.protected
+                   RETURNING memory.id
+               )
+               SELECT (SELECT COUNT(*) FROM deleted)::int AS deleted,
+                      (SELECT COUNT(*) FROM targets WHERE protected)::int AS protected""",
+            memory_ids,
         )
+        return {
+            "deleted": result["deleted"] if result else 0,
+            "protected": result["protected"] if result else 0,
+        }
+
+
+async def soft_delete_memories_batch(memory_ids: list):
+    """批量软删除记忆，返回实际转为不活跃的数量。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """UPDATE memories
+               SET is_active = FALSE
+               WHERE id = ANY($1::int[]) AND is_active = TRUE""",
+            memory_ids,
+        )
+        return int(result.split()[-1]) if result else 0
+
+
+async def restore_archived_memories_batch(memory_ids: list):
+    """批量恢复已归档记忆，返回实际恢复数量。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """UPDATE memories
+               SET is_active = TRUE
+               WHERE id = ANY($1::int[]) AND is_active = FALSE""",
+            memory_ids,
+        )
+        return int(result.split()[-1]) if result else 0
 
 
 # ============================================================
@@ -2898,22 +3012,41 @@ async def cleanup_old_fragments(days: int = 30):
     - created_at 在 days 天之前
     
     Returns:
-        删除的记忆数量
+        {"deleted": 删除数量, "revert_disabled": 结束撤回能力的父记忆数量}
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
         cutoff_date = datetime.now() - timedelta(days=days)
-        
-        result = await conn.execute("""
-            DELETE FROM memories
-            WHERE layer = 1
-            AND is_active = FALSE
-            AND created_at < $1
-        """, cutoff_date)
-        
-        # 解析删除数量，格式如 "DELETE 5"
-        deleted = int(result.split()[-1]) if result else 0
-        return deleted
+
+        async with conn.transaction():
+            rows = await conn.fetch("""
+                SELECT id
+                FROM memories
+                WHERE layer = 1
+                  AND is_active = FALSE
+                  AND created_at < $1
+                FOR UPDATE
+            """, cutoff_date)
+            fragment_ids = [int(row["id"]) for row in rows]
+            if not fragment_ids:
+                return {"deleted": 0, "revert_disabled": 0}
+
+            result = await conn.execute("""
+                UPDATE memories
+                SET merged_from = NULL
+                WHERE merged_from && $1::int[]
+            """, fragment_ids)
+            revert_disabled = int(result.split()[-1]) if result else 0
+
+            result = await conn.execute("""
+                DELETE FROM memories
+                WHERE id = ANY($1::int[])
+            """, fragment_ids)
+            deleted = int(result.split()[-1]) if result else 0
+            return {
+                "deleted": deleted,
+                "revert_disabled": revert_disabled,
+            }
 
 
 async def revert_merge(memory_id: int):
@@ -2930,31 +3063,50 @@ async def revert_merge(memory_id: int):
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # 获取事件记忆信息
-        row = await conn.fetchrow("""
-            SELECT id, layer, merged_from FROM memories WHERE id = $1
-        """, memory_id)
-        
-        if not row:
-            return {"error": "记忆不存在"}
-        
-        if row['layer'] != 2:
-            return {"error": "只能撤回事件记忆的合并"}
-        
-        merged_from = row['merged_from']
-        if not merged_from or len(merged_from) == 0:
-            return {"error": "没有合并来源，无法撤回"}
-        
-        # 恢复原始碎片
-        result = await conn.execute("""
-            UPDATE memories SET is_active = TRUE
-            WHERE id = ANY($1::int[])
-        """, merged_from)
-        restored = int(result.split()[-1]) if result else 0
-        
-        # 删除事件记忆
-        await conn.execute("""
-            DELETE FROM memories WHERE id = $1
-        """, memory_id)
-        
-        return {"status": "ok", "restored": restored}
+        async with conn.transaction():
+            row = await conn.fetchrow("""
+                SELECT id, layer, merged_from
+                FROM memories
+                WHERE id = $1
+                FOR UPDATE
+            """, memory_id)
+
+            if not row:
+                return {"error": "记忆不存在"}
+
+            if row['layer'] != 2:
+                return {"error": "只能撤回事件记忆的合并"}
+
+            merged_from = row['merged_from']
+            if not merged_from or len(merged_from) == 0:
+                return {"error": "没有完整的合并来源，无法撤回"}
+
+            source_rows = await conn.fetch("""
+                SELECT id
+                FROM memories
+                WHERE id = ANY($1::int[])
+                FOR UPDATE
+            """, merged_from)
+            source_ids = {int(source["id"]) for source in source_rows}
+            expected_ids = set(merged_from)
+            if source_ids != expected_ids:
+                missing = sorted(expected_ids - source_ids)
+                return {
+                    "error": f"合并来源不完整，缺少 {len(missing)} 条，未执行撤回"
+                }
+
+            result = await conn.execute("""
+                UPDATE memories SET is_active = TRUE
+                WHERE id = ANY($1::int[])
+            """, merged_from)
+            restored = int(result.split()[-1]) if result else 0
+            if restored != len(expected_ids):
+                raise RuntimeError(
+                    f"恢复来源数量不符: expected={len(expected_ids)}, restored={restored}"
+                )
+
+            await conn.execute("""
+                DELETE FROM memories WHERE id = $1
+            """, memory_id)
+
+            return {"status": "ok", "restored": restored}

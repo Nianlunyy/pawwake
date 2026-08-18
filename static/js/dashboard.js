@@ -22,7 +22,10 @@ const ICONS = (() => {
 let allMemories = [];
 let pendingJsonData = null;
 let currentLayer = 'all';
+let currentMemoryStatus = 'active';
+let memoryLayerStats = null;
 let memCurrentPage = 1;
+let manageMsgTimer = null;
 const MEM_PER_PAGE = 50;
 
 const LAYER_NAMES = {
@@ -113,22 +116,46 @@ function initTabs() {
 // ============================================
 // 分层 Tab 切换
 // ============================================
+function switchMemoryStatus(status) {
+    currentMemoryStatus = status;
+    memCurrentPage = 1;
+    clearSelection();
+    document.querySelectorAll('.status-tab').forEach(tab => {
+        tab.classList.toggle('active', tab.dataset.status === status);
+    });
+    document.getElementById('consolidateBtn').style.display = status === 'active' ? '' : 'none';
+    document.getElementById('semanticSearchBtn').style.display = status === 'active' ? '' : 'none';
+    document.getElementById('cleanupArchivedCard').style.display = status === 'archived' ? '' : 'none';
+    updateLayerCounts(memoryLayerStats);
+    filterAndSort();
+}
+
 function switchLayer(layer) {
     currentLayer = layer;
     memCurrentPage = 1;
-    document.querySelectorAll('.layer-tab').forEach(tab => {
+    clearSelection();
+    document.querySelectorAll('.layer-tab[data-layer]').forEach(tab => {
         tab.classList.toggle('active', tab.dataset.layer == layer);
     });
     filterAndSort();
 }
 
 function updateLayerCounts(stats) {
+    if (!stats) return;
+    memoryLayerStats = stats;
     const el1 = document.getElementById('count-layer-1');
     const el2 = document.getElementById('count-layer-2');
     const el3 = document.getElementById('count-layer-3');
-    if (el1) el1.textContent = stats.layer_1?.active || 0;
-    if (el2) el2.textContent = stats.layer_2?.active || 0;
-    if (el3) el3.textContent = stats.layer_3?.active || 0;
+    const countFor = layer => {
+        const layerStats = stats['layer_' + layer] || {};
+        if (currentMemoryStatus === 'archived') {
+            return (layerStats.total || 0) - (layerStats.active || 0);
+        }
+        return layerStats.active || 0;
+    };
+    if (el1) el1.textContent = countFor(1);
+    if (el2) el2.textContent = countFor(2);
+    if (el3) el3.textContent = countFor(3);
 }
 
 // ============================================
@@ -214,12 +241,11 @@ function filterAndSort() {
     const q = document.getElementById('searchBox').value.trim().toLowerCase();
     const sort = document.getElementById('sortSelect').value;
     const dateVal = document.getElementById('dateFilter').value;
-    const showInactiveEl = document.getElementById('showInactive');
-    const showInactive = showInactiveEl ? showInactiveEl.checked : false;
-    
-    let mems = allMemories;
+
+    let mems = allMemories.filter(m => currentMemoryStatus === 'archived'
+        ? m.is_active === false
+        : m.is_active !== false);
     if (currentLayer !== 'all') mems = mems.filter(m => (m.layer || 1) == currentLayer);
-    if (!showInactive) mems = mems.filter(m => m.is_active !== false);
     if (q) mems = mems.filter(m => m.content.toLowerCase().includes(q) || (m.title && m.title.toLowerCase().includes(q)));
     if (dateVal) mems = mems.filter(m => {
         const d = m.event_date || (m.created_at && fmtTime(m.created_at).slice(0, 10));
@@ -250,7 +276,8 @@ function filterAndSort() {
         if (currentLayer !== 'all') parts.push('层级: ' + LAYER_NAMES[currentLayer]);
         if (dateVal) parts.push('日期: ' + dateVal);
     } else {
-        parts.push('共 ' + allMemories.filter(m => m.is_active !== false).length + ' 条活跃记忆');
+        const statusLabel = currentMemoryStatus === 'archived' ? '已归档记忆' : '活跃记忆';
+        parts.push('共 ' + totalItems + ' 条' + statusLabel);
     }
     if (totalPages > 1) {
         parts.push(`第 ${memCurrentPage}/${totalPages} 页`);
@@ -311,6 +338,10 @@ function clearDateFilter() {
 }
 
 async function semanticSearch() {
+    if (currentMemoryStatus !== 'active') {
+        showManageMsg('warning', '语义搜索只查询活跃记忆');
+        return;
+    }
     const q = document.getElementById('searchBox').value.trim();
     if (!q) { alert('请先在搜索框输入关键词'); return; }
     
@@ -327,17 +358,21 @@ async function semanticSearch() {
         
         const results = data.results || [];
         renderTable(results);
+        if (data.warning) {
+            showManageMsg('warning', '⚠️ ' + data.warning);
+        }
         
         // 隐藏分页（语义搜索结果不分页）
         const paginationEl = document.getElementById('mem-pagination');
         if (paginationEl) paginationEl.innerHTML = '';
         
-        const scoreInfo = results.length > 0 
-            ? results.map(r => `#${r.id}(${(r.score || 0).toFixed(3)})`).join(', ')
+        const scoreInfo = results.length > 0
+            ? results.map((r, i) => `第${i + 1}条(${(r.score || 0).toFixed(3)})`).join(', ')
             : '';
         
+        const modeLabel = data.mode === 'hybrid' ? '语义搜索' : '关键词搜索';
         document.getElementById('stats').innerHTML = 
-            `🔍 语义搜索 "${q}" → ${results.length} 条结果` +
+            `🔍 ${modeLabel} "${q}" → ${results.length} 条结果` +
             (scoreInfo ? ` [${scoreInfo}]` : '') +
             `&nbsp;&nbsp;<a href="#" onclick="exitSemanticSearch(); return false;" style="color: var(--primary);">← 返回全部</a>`;
     } catch(e) {
@@ -366,7 +401,7 @@ async function changeLayer(id) {
             showManageMsg('error', '❌ ' + data.error);
             loadMemories();
         } else {
-            showManageMsg('success', '✅ #' + id + ' 层级已改为 ' + LAYER_NAMES[newLayer]);
+            showManageMsg('success', '✅ 层级已改为 ' + LAYER_NAMES[newLayer]);
             const mem = allMemories.find(m => m.id === id);
             if (mem) mem.layer = newLayer;
             loadMemories();
@@ -394,7 +429,7 @@ async function saveMem(id) {
         if (data.error) {
             showManageMsg('error', '❌ ' + data.error);
         } else {
-            showManageMsg('success', '✅ 已保存 #' + id);
+            showManageMsg('success', '✅ 已保存这条记忆');
             loadMemories();
         }
     } catch(e) {
@@ -403,9 +438,9 @@ async function saveMem(id) {
 }
 
 async function delMem(id, hard = false) {
-    const confirmMsg = hard 
-        ? '确定永久删除 #' + id + '？此操作不可撤销！'
-        : '确定删除 #' + id + '？（软删除，可恢复）';
+    const confirmMsg = hard
+        ? '确定永久删除这条已归档记忆？此操作不可恢复！'
+        : '确定删除这条活跃记忆？（删除后可恢复）';
     if (!confirm(confirmMsg)) return;
     try {
         const soft = !hard;
@@ -414,8 +449,9 @@ async function delMem(id, hard = false) {
         if (data.error) {
             showManageMsg('error', '❌ ' + data.error);
         } else {
-            const action = hard ? '永久删除' : '已归档';
-            showManageMsg('success', '✅ ' + action + ' #' + id);
+            const action = hard ? '已永久删除这条记忆' : '已删除这条记忆';
+            const recovery = hard ? '' : '（可恢复）';
+            showManageMsg('success', '✅ ' + action + recovery);
             loadMemories();
         }
     } catch(e) {
@@ -430,7 +466,7 @@ async function restoreMem(id) {
         if (data.error) {
             showManageMsg('error', '❌ ' + data.error);
         } else {
-            showManageMsg('success', '✅ 已恢复 #' + id);
+            showManageMsg('success', '✅ 已恢复这条记忆');
             loadMemories();
         }
     } catch(e) {
@@ -479,12 +515,51 @@ async function batchSave() {
     }
 }
 
-async function batchDelete() {
+async function batchDelete(hard = false) {
     const checked = [...document.querySelectorAll('.mem-check:checked')].map(c => parseInt(c.value));
     if (checked.length === 0) { showManageMsg('error', '请先勾选要删除的记忆'); return; }
-    if (!confirm('确定删除选中的 ' + checked.length + ' 条记忆？此操作不可撤销。')) return;
+    const confirmMsg = hard
+        ? '确定永久删除选中的 ' + checked.length + ' 条已归档记忆？合并来源会受到保护，此操作不可恢复！'
+        : '确定删除选中的 ' + checked.length + ' 条活跃记忆？删除后可恢复。';
+    if (!confirm(confirmMsg)) return;
     try {
         const resp = await fetch('/api/memories/batch-delete', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ids: checked, soft: !hard})
+        });
+        const data = await resp.json();
+        if (data.error) {
+            showManageMsg('error', '❌ ' + data.error);
+        } else {
+            const action = hard ? '永久删除' : '删除';
+            const protectedCount = data.protected || 0;
+            const skipped = checked.length - data.deleted - protectedCount;
+            const details = [];
+            if (protectedCount > 0) details.push('保护 ' + protectedCount + ' 条合并来源');
+            if (skipped > 0) details.push('跳过 ' + skipped + ' 条');
+            const detailText = details.length > 0 ? '，' + details.join('，') : '';
+            const messageType = data.deleted > 0 ? 'success' : 'warning';
+            const prefix = data.deleted > 0 ? '✅ 已' : '⚠️ 未';
+            showManageMsg(messageType, prefix + action + ' ' + data.deleted + ' 条' + detailText);
+            clearSelection();
+            loadMemories();
+        }
+    } catch(e) {
+        showManageMsg('error', '❌ ' + e.message);
+    }
+}
+
+async function batchRestore() {
+    const checked = [...document.querySelectorAll('.mem-check:checked')].map(c => parseInt(c.value));
+    if (checked.length === 0) { showManageMsg('error', '请先勾选要恢复的记忆'); return; }
+    if (currentMemoryStatus !== 'archived') {
+        showManageMsg('error', '只能在已归档页面批量恢复');
+        return;
+    }
+    if (!confirm('确定恢复选中的 ' + checked.length + ' 条已归档记忆？')) return;
+    try {
+        const resp = await fetch('/api/memories/batch-restore', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({ids: checked})
@@ -493,7 +568,11 @@ async function batchDelete() {
         if (data.error) {
             showManageMsg('error', '❌ ' + data.error);
         } else {
-            showManageMsg('success', '✅ 已删除 ' + data.deleted + ' 条');
+            const skipped = checked.length - data.restored;
+            const skippedText = skipped > 0 ? '，跳过 ' + skipped + ' 条' : '';
+            const messageType = data.restored > 0 ? 'success' : 'warning';
+            const prefix = data.restored > 0 ? '✅ 已恢复 ' : '⚠️ 未恢复 ';
+            showManageMsg(messageType, prefix + data.restored + ' 条' + skippedText);
             clearSelection();
             loadMemories();
         }
@@ -519,6 +598,8 @@ function updateFloatingBar() {
     if (checked > 0) {
         countEl.textContent = checked;
         floatingBar.style.display = 'flex';
+        document.getElementById('activeSelectionActions').style.display = currentMemoryStatus === 'active' ? 'flex' : 'none';
+        document.getElementById('archivedSelectionActions').style.display = currentMemoryStatus === 'archived' ? 'flex' : 'none';
     } else {
         floatingBar.style.display = 'none';
     }
@@ -533,9 +614,11 @@ function clearSelection() {
 
 function showManageMsg(type, text) {
     const container = document.getElementById('manage-msg');
+    if (manageMsgTimer) clearTimeout(manageMsgTimer);
     container.innerHTML = '<div class="msg msg-' + type + '">' + text + '</div>';
-    setTimeout(() => {
+    manageMsgTimer = setTimeout(() => {
         container.innerHTML = '';
+        manageMsgTimer = null;
     }, 4000);
 }
 
@@ -556,13 +639,13 @@ async function showMergeSource(id) {
         
         const sources = mem.merged_from.map(srcId => {
             const srcMem = allMems.find(m => m.id === srcId);
-            return srcMem ? { id: srcId, content: srcMem.content } : { id: srcId, content: '(已删除)' };
+            return { content: srcMem ? srcMem.content : '(已删除)' };
         });
         
-        let html = '<h3>合并来源 - 事件 #' + id + '</h3>';
+        let html = '<h3>合并来源</h3>';
         html += '<p style="color:var(--text-light);margin-bottom:16px;">以下 ' + sources.length + ' 条碎片被合并成了这条事件记忆：</p>';
         sources.forEach((src, i) => {
-            html += '<div class="source-item"><b>#' + src.id + '</b><br>' + escHtml(src.content) + '</div>';
+            html += '<div class="source-item"><b>第' + (i + 1) + '条</b><br>' + escHtml(src.content) + '</div>';
         });
         html += '<div class="modal-actions"><button class="btn btn-secondary" onclick="closeMergeSourceModal()">关闭</button></div>';
         
@@ -587,7 +670,7 @@ async function revertMerge(id) {
         return;
     }
     
-    if (!confirm('确定撤回合并？\n\n将恢复 ' + mem.merged_from.length + ' 条原始碎片，并删除当前事件记忆 #' + id)) {
+    if (!confirm('确定撤回合并？\n\n将恢复 ' + mem.merged_from.length + ' 条原始碎片，并删除当前事件记忆')) {
         return;
     }
     
@@ -654,7 +737,7 @@ async function doMerge() {
         if (data.error) {
             showManageMsg('error', '❌ ' + data.error);
         } else {
-            showManageMsg('success', '✅ 已合并 ' + data.merged + ' 条为新记忆 #' + data.new_id);
+            showManageMsg('success', '✅ 已合并 ' + data.merged + ' 条为新记忆');
             closeMergeModal();
             clearSelection();
             loadMemories();
@@ -743,7 +826,7 @@ async function doConsolidate() {
 // 清理归档碎片
 // ============================================
 async function cleanupOldFragments() {
-    if (!confirm('确定清理30天前的归档碎片？此操作不可撤销。')) return;
+    if (!confirm('确定清理30天前的归档碎片？受影响的整理记忆会同时结束撤回能力，此操作不可恢复。')) return;
     
     showManageMsg('info', '正在清理...');
     try {
@@ -756,7 +839,12 @@ async function cleanupOldFragments() {
         if (data.error) {
             showManageMsg('error', '❌ ' + data.error);
         } else {
-            showManageMsg('success', '✅ 已清理 ' + data.deleted + ' 条归档碎片');
+            const messageType = data.deleted > 0 ? 'success' : 'warning';
+            const prefix = data.deleted > 0 ? '✅ 已清理 ' : '⚠️ 未清理 ';
+            const revertText = data.revert_disabled > 0
+                ? '，' + data.revert_disabled + ' 条整理记忆不再支持撤回'
+                : '';
+            showManageMsg(messageType, prefix + data.deleted + ' 条归档碎片' + revertText);
             loadMemories();
         }
     } catch(e) {
@@ -892,12 +980,10 @@ async function confirmJsonImport() {
         } else {
             let msg = '✅ 导入完成！新增 ' + data.imported + ' 条，跳过 ' + data.skipped + ' 条（已存在），总计 ' + data.total + ' 条';
             if (data.conflicts && data.conflicts.length) {
-                msg += '<br>⚠️ ' + data.conflicts.length + ' 条内容与库中多条记忆重复，未导入也未挂关系：' +
-                    data.conflicts.map(c => '备份#' + c.backup_id + '→库内#' + c.matched_ids.join('/#')).join('，');
+                msg += '<br>⚠️ ' + data.conflicts.length + ' 条内容与库中多条记忆重复，未导入也未挂关系';
             }
             if (data.degraded && data.degraded.length) {
-                msg += '<br>⚠️ ' + data.degraded.length + ' 条合并关系因来源冲突未恢复（记忆本身已导入）：' +
-                    data.degraded.map(d => '备份#' + d.backup_id).join('，');
+                msg += '<br>⚠️ ' + data.degraded.length + ' 条合并关系因来源冲突未恢复（记忆本身已导入）';
             }
             if (data.pending_embeddings) {
                 msg += '<br>ℹ️ ' + data.pending_embeddings + ' 条记忆待重算向量，可在维护面板执行 embedding 回填';
@@ -937,6 +1023,36 @@ async function loadExportStats() {
     }
 }
 
+function showBrokenReferenceRepair(count) {
+    const el = document.getElementById('export-repair');
+    el.innerHTML = '<div class="msg msg-warning">⚠️ ' + count +
+        ' 条记忆的合并来源已失效，修复后才能导出完整备份。<br>' +
+        '<button class="btn btn-warning" onclick="repairBrokenReferences(' + count + ')">修复断裂引用</button></div>';
+}
+
+async function repairBrokenReferences(count) {
+    const confirmMsg = '确定修复 ' + count + ' 条断裂引用？\n\n' +
+        '将保留合并后的记忆，清除已经失效的来源关系；这些记忆将无法撤回合并。';
+    if (!confirm(confirmMsg)) return;
+
+    const el = document.getElementById('export-repair');
+    try {
+        const resp = await fetch('/api/memories/repair-broken-references', { method: 'POST' });
+        const data = await resp.json();
+        if (data.error) {
+            el.innerHTML = '<div class="msg msg-error">❌ ' + escHtml(data.error) + '</div>';
+            return;
+        }
+        const type = data.repaired > 0 ? 'success' : 'info';
+        const text = data.repaired > 0
+            ? '✅ 已修复 ' + data.repaired + ' 条断裂引用，请重新下载备份。'
+            : '没有需要修复的断裂引用。';
+        el.innerHTML = '<div class="msg msg-' + type + '">' + text + '</div>';
+    } catch(e) {
+        el.innerHTML = '<div class="msg msg-error">❌ 修复失败：' + escHtml(e.message) + '</div>';
+    }
+}
+
 async function doExport() {
     // 用 fetch 走鉴权补丁（location.href 跳转不带 X-Gateway-Key，开启鉴权时会 401）
     try {
@@ -946,7 +1062,12 @@ async function doExport() {
             return;
         }
         const data = await resp.json();
+        if (data.code === 'broken_merge_references') {
+            showBrokenReferenceRepair(data.count || 0);
+            return;
+        }
         if (data.error) { alert('导出失败: ' + data.error); return; }
+        document.getElementById('export-repair').innerHTML = '';
         const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');

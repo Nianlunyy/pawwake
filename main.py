@@ -31,8 +31,14 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, Red
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from database import import_memories_v2, _parse_backup_datetime
-from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, delete_memory, delete_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, create_consolidated_events, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
+from database import (
+    BrokenMergeReferencesError,
+    _parse_backup_datetime,
+    import_memories_v2,
+    repair_broken_merge_references,
+    search_memories_with_mode,
+)
+from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, delete_archived_memory, delete_archived_memories_batch, soft_delete_memories_batch, restore_archived_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, create_consolidated_events, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
 from database import search_chat_fragments, rebuild_content_tsv, kick_embedding_backfill, get_embedding_backfill_status, mark_fragments_seen
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories
@@ -1924,8 +1930,23 @@ async def export_memories():
             "exported_at": str(__import__("datetime").datetime.now()),
             "memories": memories,
         }
+    except BrokenMergeReferencesError as e:
+        return {
+            "error": str(e),
+            "code": "broken_merge_references",
+            "count": e.count,
+        }
     except Exception as e:
         return {"error": str(e)}
+
+
+@app.post("/api/memories/repair-broken-references")
+async def api_repair_broken_merge_references():
+    """显式清除失效的合并来源关系，使完整备份可以重新导出。"""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    repaired = await repair_broken_merge_references()
+    return {"status": "ok", "repaired": repaired}
 
 
 @app.get("/dashboard/login", response_class=HTMLResponse)
@@ -2056,7 +2077,7 @@ async def _run_memory_search(q: str, limit: int):
     if not q.strip():
         return {"error": "搜索关键词不能为空", "results": []}
     try:
-        results = await search_memories(q.strip(), limit)
+        results, mode = await search_memories_with_mode(q.strip(), limit)
         tz_offset = timezone(timedelta(hours=TIMEZONE_HOURS))
         out = []
         for r in results:
@@ -2068,7 +2089,13 @@ async def _run_memory_search(q: str, limit: int):
                         dt = dt.replace(tzinfo=timezone.utc)
                     item["created_at"] = dt.astimezone(tz_offset).strftime("%Y-%m-%d %H:%M:%S")
             out.append(item)
-        return {"results": out, "total": len(out)}
+        response = {"results": out, "total": len(out), "mode": mode}
+        if mode == "keyword":
+            response["warning"] = (
+                "向量模型本次未生效，已按关键词搜索；"
+                "请检查向量搜索开关和 Embedding 配置"
+            )
+        return response
     except Exception as e:
         return {"error": str(e), "results": []}
 
@@ -2111,18 +2138,28 @@ async def api_update_memory(memory_id: int, request: Request):
 
 
 @app.delete("/api/memories/{memory_id}")
-async def api_delete_memory(memory_id: int, soft: bool = False):
+async def api_delete_memory(memory_id: int, soft: bool = True):
     """删除单条记忆
     
     Query params:
-        soft: true=归档（is_active=false），false=永久删除
+        soft: true=可恢复软删除，false=永久删除已归档记忆
     """
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用"}
     if soft:
         await update_memory_with_layer(memory_id, is_active=False)
     else:
-        await delete_memory(memory_id)
+        result = await delete_archived_memory(memory_id)
+        if result["protected"]:
+            return JSONResponse(
+                status_code=409,
+                content={"error": "该记忆仍是合并来源，不能永久删除"},
+            )
+        if not result["deleted"]:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "只能永久删除已归档记忆"},
+            )
     return {"status": "ok", "id": memory_id}
 
 
@@ -2148,15 +2185,40 @@ async def api_batch_update(request: Request):
 
 @app.post("/api/memories/batch-delete")
 async def api_batch_delete(request: Request):
-    """批量删除记忆"""
+    """批量软删除活跃记忆，或永久删除已归档记忆。"""
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用"}
     data = await request.json()
     ids = data.get("ids", [])
     if not ids:
         return {"error": "未选择记忆"}
-    await delete_memories_batch(ids)
-    return {"status": "ok", "deleted": len(ids)}
+    soft = data.get("soft", True)
+    if not isinstance(soft, bool):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "soft 必须是布尔值"},
+        )
+    if soft:
+        deleted = await soft_delete_memories_batch(ids)
+        protected = 0
+    else:
+        result = await delete_archived_memories_batch(ids)
+        deleted = result["deleted"]
+        protected = result["protected"]
+    return {"status": "ok", "deleted": deleted, "protected": protected}
+
+
+@app.post("/api/memories/batch-restore")
+async def api_batch_restore(request: Request):
+    """批量恢复已归档记忆。"""
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+    data = await request.json()
+    ids = data.get("ids", [])
+    if not ids:
+        return {"error": "未选择记忆"}
+    restored = await restore_archived_memories_batch(ids)
+    return {"status": "ok", "restored": restored}
 
 
 # ============================================================
@@ -2648,8 +2710,13 @@ async def api_cleanup_fragments(request: Request):
     days = data.get("days", 30)
     
     try:
-        deleted = await cleanup_old_fragments(days)
-        return {"status": "ok", "deleted": deleted, "days": days}
+        result = await cleanup_old_fragments(days)
+        return {
+            "status": "ok",
+            "deleted": result["deleted"],
+            "revert_disabled": result["revert_disabled"],
+            "days": days,
+        }
     except Exception as e:
         return {"error": str(e)}
 

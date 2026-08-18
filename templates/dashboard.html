@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Memory Gateway</title>
-    <link rel="stylesheet" href="/static/css/dashboard.css?v=4.0.1">
+    <link rel="stylesheet" href="/static/css/dashboard.css?v=4.0.3">
 </head>
 <body>
     <div class="dashboard">
@@ -20,11 +20,11 @@
                     <span class="nav-label">记忆管理</span>
                 </a>
                 <a href="#" class="nav-item" data-section="import">
-                    <span class="nav-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg></span>
+                    <span class="nav-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/></svg></span>
                     <span class="nav-label">导入记忆</span>
                 </a>
                 <a href="#" class="nav-item" data-section="export">
-                    <span class="nav-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/></svg></span>
+                    <span class="nav-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg></span>
                     <span class="nav-label">导出备份</span>
                 </a>
                 <a href="#" class="nav-item" data-section="conversations">
@@ -72,21 +72,20 @@
                 <!-- 分层 Tab -->
                 <div class="card layer-tabs-card">
                     <div class="layer-tabs">
+                        <button class="layer-tab status-tab active" data-status="active" onclick="switchMemoryStatus('active')">活跃记忆</button>
+                        <button class="layer-tab status-tab" data-status="archived" onclick="switchMemoryStatus('archived')">已归档</button>
+                        <span class="tab-separator"></span>
                         <button class="layer-tab active" data-layer="all" onclick="switchLayer('all')">全部</button>
                         <button class="layer-tab" data-layer="3" onclick="switchLayer(3)">核心记忆 <span id="count-layer-3">0</span></button>
                         <button class="layer-tab" data-layer="2" onclick="switchLayer(2)">事件记忆 <span id="count-layer-2">0</span></button>
                         <button class="layer-tab" data-layer="1" onclick="switchLayer(1)">原始碎片 <span id="count-layer-1">0</span></button>
-                        <label class="checkbox-label" style="margin-left:auto;">
-                            <input type="checkbox" id="showInactive" onchange="memCurrentPage=1;filterAndSort()">
-                            <span>显示已归档</span>
-                        </label>
                     </div>
                 </div>
 
                 <div class="card toolbar-card">
                     <div class="toolbar">
                         <input type="text" id="searchBox" class="search-input" placeholder="搜索记忆..." oninput="memCurrentPage=1;filterAndSort()">
-                        <button class="btn btn-sm" onclick="semanticSearch()" title="使用后端混合搜索（关键词+向量）" style="white-space: nowrap;">语义搜索</button>
+                        <button class="btn btn-sm" id="semanticSearchBtn" onclick="semanticSearch()" title="使用后端混合搜索（关键词+向量）" style="white-space: nowrap;">语义搜索</button>
                         <div class="toolbar-group">
                             <input type="date" id="dateFilter" class="date-input" onchange="memCurrentPage=1;filterAndSort()" title="按日期筛选">
                             <button class="btn btn-icon" onclick="clearDateFilter()" title="清除日期">✕</button>
@@ -94,11 +93,11 @@
                         <select id="sortSelect" class="select-input" onchange="memCurrentPage=1;filterAndSort()">
                             <option value="id-desc">时间从新到旧</option>
                             <option value="id-asc">时间从旧到新</option>
-                            <option value="imp-desc">权重 从高到低</option>
-                            <option value="imp-asc">权重 从低到高</option>
+                            <option value="imp-desc">权重从高到低</option>
+                            <option value="imp-asc">权重从低到高</option>
                         </select>
                         <div class="toolbar-actions">
-                            <button class="btn btn-warning" onclick="openConsolidateModal()">整理记忆</button>
+                            <button class="btn btn-warning" id="consolidateBtn" onclick="openConsolidateModal()">整理记忆</button>
                             <label class="checkbox-label">
                                 <input type="checkbox" id="selectAll" onchange="toggleAll()">
                                 <span>全选</span>
@@ -118,7 +117,7 @@
                         <thead>
                             <tr>
                                 <th class="col-check"><input type="checkbox" id="selectAllHead" onchange="toggleAll()"></th>
-                                <th class="col-id">ID</th>
+                                <th class="col-id">序号</th>
                                 <th class="col-layer">层级</th>
                                 <th class="col-title">标题</th>
                                 <th class="col-content">内容</th>
@@ -132,7 +131,7 @@
                 </div>
 
                 <!-- 清理归档碎片 -->
-                <div class="card" style="margin-top: 16px; padding: 16px;">
+                <div class="card" id="cleanupArchivedCard" style="display:none; margin-top: 16px; padding: 16px;">
                     <div style="display: flex; align-items: center; gap: 16px;">
                         <span style="color: var(--text-light); font-size: 14px;">清理30天前的归档碎片：</span>
                         <button class="btn btn-danger" onclick="cleanupOldFragments()">清理</button>
@@ -221,12 +220,16 @@
             <!-- 底部浮动操作栏 -->
             <div id="floatingBar" class="floating-bar" style="display:none;">
                 <span class="floating-count">已选 <b id="selectedCount">0</b> 条</span>
-                <div class="floating-actions">
+                <div class="floating-actions" id="activeSelectionActions">
                     <button class="btn btn-primary" onclick="batchSave()">保存选中</button>
                     <button class="btn btn-secondary" onclick="openMergeModal()">合并选中</button>
                     <button class="btn btn-danger" onclick="batchDelete()">删除选中</button>
-                    <button class="btn btn-icon" onclick="clearSelection()" title="取消选择">✕</button>
                 </div>
+                <div class="floating-actions" id="archivedSelectionActions" style="display:none;">
+                    <button class="btn btn-success" onclick="batchRestore()">恢复选中</button>
+                    <button class="btn btn-danger" onclick="batchDelete(true)">永久删除选中</button>
+                </div>
+                <button class="btn btn-icon" onclick="clearSelection()" title="取消选择">✕</button>
             </div>
 
             <!-- 导入记忆 Section -->
@@ -298,6 +301,7 @@
                         正在统计...
                     </div>
                     <button class="btn btn-primary btn-lg" onclick="doExport()">下载 JSON 备份</button>
+                    <div id="export-repair" style="margin-top: 12px;"></div>
                 </div>
 
                 <div class="card tips-card">
@@ -667,6 +671,6 @@
         </main>
     </div>
 
-    <script src="/static/js/dashboard.js?v=4.0.1"></script>
+    <script src="/static/js/dashboard.js?v=4.0.3.1"></script>
 </body>
 </html>
