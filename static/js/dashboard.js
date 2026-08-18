@@ -1,5 +1,5 @@
 /**
- * AI Memory Gateway - Dashboard JavaScript
+ * Pawwake - Dashboard JavaScript
  * 整合记忆管理、导入、导出功能
  * 支持三层记忆架构 v2
  */

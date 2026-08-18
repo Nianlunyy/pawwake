@@ -1,5 +1,5 @@
 """
-AI Memory Gateway — 带记忆系统的 LLM 转发网关
+Pawwake · 爪迹 — 带记忆系统的 LLM 转发网关
 =============================================
 让你的 AI 拥有长期记忆。
 
@@ -163,8 +163,8 @@ def sync_memory_extractor_config():
     _me_mod.MEMORY_MODEL = os.environ.get("MEMORY_MODEL") or _me_mod.DEFAULT_MEMORY_MODEL
 
 # 额外的请求头（有些 API 需要，比如 OpenRouter 需要 Referer）
-EXTRA_REFERER = os.getenv("EXTRA_REFERER", "https://ai-memory-gateway.local")
-EXTRA_TITLE = os.getenv("EXTRA_TITLE", "AI Memory Gateway")
+EXTRA_REFERER = os.getenv("EXTRA_REFERER", "https://github.com/garan0613/pawwake")
+EXTRA_TITLE = os.getenv("EXTRA_TITLE", "Pawwake")
 
 
 # ============================================================
@@ -340,7 +340,7 @@ async def lifespan(app: FastAPI):
     await close_pool()
 
 
-app = FastAPI(title="AI Memory Gateway", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="Pawwake", version="4.0.3", lifespan=lifespan)
 
 # 静态文件和模板配置
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -1402,7 +1402,7 @@ async def health_check():
     
     return {
         "status": "running",
-        "gateway": "AI Memory Gateway v2.0",
+        "gateway": "Pawwake v4.0.3",
         "system_prompt_loaded": len(resolved_system_prompt) > 0,
         "system_prompt_length": len(resolved_system_prompt),
         "memory_enabled": MEMORY_ENABLED,
@@ -1421,7 +1421,7 @@ async def list_models():
                 "id": DEFAULT_MODEL,
                 "object": "model",
                 "created": 1700000000,
-                "owned_by": "ai-memory-gateway",
+                "owned_by": "pawwake",
             }
         ],
     }
@@ -3698,7 +3698,7 @@ async def save_settings(request: Request):
 
 if __name__ == "__main__":
     import uvicorn
-    print(f"🚀 AI Memory Gateway 启动中... 端口 {PORT}")
+    print(f"🚀 Pawwake 启动中... 端口 {PORT}")
     print(f"📝 人设长度：{len(SYSTEM_PROMPT)} 字符")
     print(f"🤖 默认模型：{DEFAULT_MODEL}")
     print(f"🔗 API 地址：{API_BASE_URL}")

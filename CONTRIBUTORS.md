@@ -1,6 +1,6 @@
 # Contributors
 
-AI Memory Gateway is created and maintained through the shared work of Garan, Midsummer, and Solstice.
+Pawwake is created and maintained through the shared work of Garan, Midsummer, and Solstice.
 
 ## Garan / 七堂伽藍_
 
