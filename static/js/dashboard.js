@@ -371,10 +371,18 @@ async function semanticSearch() {
             : '';
         
         const modeLabel = data.mode === 'hybrid' ? '语义搜索' : '关键词搜索';
-        document.getElementById('stats').innerHTML = 
-            `🔍 ${modeLabel} "${q}" → ${results.length} 条结果` +
-            (scoreInfo ? ` [${scoreInfo}]` : '') +
-            `&nbsp;&nbsp;<a href="#" onclick="exitSemanticSearch(); return false;" style="color: var(--primary);">← 返回全部</a>`;
+        const stats = document.getElementById('stats');
+        stats.textContent = `🔍 ${modeLabel} "${q}" → ${results.length} 条结果` +
+            (scoreInfo ? ` [${scoreInfo}]` : '') + '\u00a0\u00a0';
+        const backLink = document.createElement('a');
+        backLink.href = '#';
+        backLink.textContent = '← 返回全部';
+        backLink.style.color = 'var(--primary)';
+        backLink.addEventListener('click', (event) => {
+            event.preventDefault();
+            exitSemanticSearch();
+        });
+        stats.appendChild(backLink);
     } catch(e) {
         document.getElementById('stats').textContent = '❌ 搜索失败: ' + e.message;
     }
@@ -615,9 +623,12 @@ function clearSelection() {
 function showManageMsg(type, text) {
     const container = document.getElementById('manage-msg');
     if (manageMsgTimer) clearTimeout(manageMsgTimer);
-    container.innerHTML = '<div class="msg msg-' + type + '">' + text + '</div>';
+    const message = document.createElement('div');
+    message.className = 'msg msg-' + type;
+    message.textContent = text;
+    container.replaceChildren(message);
     manageMsgTimer = setTimeout(() => {
-        container.innerHTML = '';
+        container.replaceChildren();
         manageMsgTimer = null;
     }, 4000);
 }
@@ -926,13 +937,13 @@ async function previewJson() {
         const parsed = JSON.parse(jsonStr);
         if (parsed.error) {
             showImportResult('error', '❌ 这份文件不是备份，是一条错误响应（' + parsed.error + '）。请回导出页面重新导出一份');
-            preview.innerHTML = '';
+            preview.replaceChildren();
             return;
         }
         const mems = parsed.memories || [];
         if (mems.length === 0) {
             showImportResult('error', '❌ 没有找到 memories 字段，请确认这是从导出功能导出的文件');
-            preview.innerHTML = '';
+            preview.replaceChildren();
             return;
         }
         
@@ -940,19 +951,36 @@ async function previewJson() {
         const verTag = parsed.schema_version === 2
             ? '（v2 完整备份，含层级/日期/合并关系）'
             : '（旧版备份，将按碎片导入）';
-        let html = '<p><b>预览：共 ' + mems.length + ' 条记忆</b>' + verTag + '</p>';
+        const summary = document.createElement('p');
+        const summaryTitle = document.createElement('b');
+        summaryTitle.textContent = '预览：共 ' + mems.length + ' 条记忆';
+        summary.appendChild(summaryTitle);
+        summary.appendChild(document.createTextNode(verTag));
+        preview.appendChild(summary);
+
         const show = mems.slice(0, 10);
         show.forEach(m => {
-            html += '<div class="preview-item">权重 ' + (m.importance || '?') + ' | ' + (m.content || '').substring(0, 80) + '</div>';
+            const item = document.createElement('div');
+            item.className = 'preview-item';
+            item.textContent = '权重 ' + (m.importance || '?') + ' | ' + String(m.content || '').substring(0, 80);
+            preview.appendChild(item);
         });
         if (mems.length > 10) {
-            html += '<div class="preview-item" style="color:#999;">...还有 ' + (mems.length - 10) + ' 条</div>';
+            const remaining = document.createElement('div');
+            remaining.className = 'preview-item';
+            remaining.style.color = '#999';
+            remaining.textContent = '...还有 ' + (mems.length - 10) + ' 条';
+            preview.appendChild(remaining);
         }
-        html += '<br><button class="btn btn-primary" onclick="confirmJsonImport()">确认导入</button>';
-        preview.innerHTML = html;
+        preview.appendChild(document.createElement('br'));
+        const confirmButton = document.createElement('button');
+        confirmButton.className = 'btn btn-primary';
+        confirmButton.textContent = '确认导入';
+        confirmButton.addEventListener('click', confirmJsonImport);
+        preview.appendChild(confirmButton);
     } catch(e) {
         showImportResult('error', '❌ JSON 格式错误：' + e.message);
-        preview.innerHTML = '';
+        preview.replaceChildren();
     }
 }
 
@@ -980,18 +1008,18 @@ async function confirmJsonImport() {
         } else {
             let msg = '✅ 导入完成！新增 ' + data.imported + ' 条，跳过 ' + data.skipped + ' 条（已存在），总计 ' + data.total + ' 条';
             if (data.conflicts && data.conflicts.length) {
-                msg += '<br>⚠️ ' + data.conflicts.length + ' 条内容与库中多条记忆重复，未导入也未挂关系';
+                msg += '\n⚠️ ' + data.conflicts.length + ' 条内容与库中多条记忆重复，未导入也未挂关系';
             }
             if (data.degraded && data.degraded.length) {
-                msg += '<br>⚠️ ' + data.degraded.length + ' 条合并关系因来源冲突未恢复（记忆本身已导入）';
+                msg += '\n⚠️ ' + data.degraded.length + ' 条合并关系因来源冲突未恢复（记忆本身已导入）';
             }
             if (data.pending_embeddings) {
-                msg += '<br>ℹ️ ' + data.pending_embeddings + ' 条记忆待重算向量，可在维护面板执行 embedding 回填';
+                msg += '\nℹ️ ' + data.pending_embeddings + ' 条记忆待重算向量，可在维护面板执行 embedding 回填';
             }
             showImportResult(data.conflicts && data.conflicts.length || data.degraded && data.degraded.length ? 'info' : 'success', msg);
             loadMemories();
         }
-        document.getElementById('jsonPreview').innerHTML = '';
+        document.getElementById('jsonPreview').replaceChildren();
         pendingJsonData = null;
     } catch(e) {
         showImportResult('error', '❌ 请求失败：' + e.message);
@@ -1000,12 +1028,18 @@ async function confirmJsonImport() {
 
 function showImportResult(type, text) {
     const container = document.getElementById('import-result');
-    container.innerHTML = '<div class="msg msg-' + type + '">' + text + '</div>';
+    const message = document.createElement('div');
+    message.className = 'msg msg-' + type;
+    text.split('\n').forEach((line, index) => {
+        if (index > 0) message.appendChild(document.createElement('br'));
+        message.appendChild(document.createTextNode(line));
+    });
+    container.replaceChildren(message);
 }
 
 function clearImportResult() {
-    document.getElementById('import-result').innerHTML = '';
-    document.getElementById('jsonPreview').innerHTML = '';
+    document.getElementById('import-result').replaceChildren();
+    document.getElementById('jsonPreview').replaceChildren();
 }
 
 // ============================================

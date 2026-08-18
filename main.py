@@ -20,6 +20,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import logging
 import secrets
 import time
 import httpx
@@ -42,6 +43,8 @@ from database import init_tables, close_pool, save_message, search_memories, sav
 from database import search_chat_fragments, rebuild_content_tsv, kick_embedding_backfill, get_embedding_backfill_status, mark_fragments_seen
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories
+
+logger = logging.getLogger(__name__)
 
 # ============================================================
 # 配置项 —— 全部从环境变量读取，部署时在云平台面板里设置
@@ -120,6 +123,12 @@ def get_active_session_id() -> str:
 def conversation_persistence_enabled() -> bool:
     """记忆、分区或对话召回任一开启时都需要保留历史。"""
     return MEMORY_ENABLED or CACHE_PARTITION_ENABLED or _db_module.CONVERSATION_RECALL_ENABLED
+
+
+def _api_failure(message: str, **extra) -> dict:
+    """记录当前意外异常，对外只返回固定文案。"""
+    logger.exception("API operation failed: %s", message)
+    return {"error": message, **extra}
 
 # 时区偏移（小时），用于记忆注入时的日期显示，默认 UTC+8
 TIMEZONE_HOURS = int(os.getenv("TIMEZONE_HOURS", "8"))
@@ -1429,12 +1438,11 @@ async def chat_completions(request: Request):
     
     try:
         return await _chat_completions_inner(request)
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
+    except Exception:
+        logger.exception("Chat completion gateway failed")
         return JSONResponse(
             status_code=500,
-            content={"error": {"message": f"Gateway internal error: {type(e).__name__}: {e}", "type": "gateway_error"}},
+            content={"error": {"message": "Gateway internal error", "type": "gateway_error"}},
         )
 
 
@@ -1900,8 +1908,8 @@ async def import_seed_memories():
         return result
     except ImportError:
         return {"error": "未找到 seed_memories.py，请参考 seed_memories_example.py 创建"}
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        return _api_failure("导入预置记忆失败")
 
 
 @app.get("/export/memories")
@@ -1932,12 +1940,12 @@ async def export_memories():
         }
     except BrokenMergeReferencesError as e:
         return {
-            "error": str(e),
+            "error": f"检测到 {e.count} 条记忆的合并来源已失效，可修复断裂引用后重新导出",
             "code": "broken_merge_references",
             "count": e.count,
         }
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        return _api_failure("导出记忆失败")
 
 
 @app.post("/api/memories/repair-broken-references")
@@ -2096,8 +2104,8 @@ async def _run_memory_search(q: str, limit: int):
                 "请检查向量搜索开关和 Embedding 配置"
             )
         return response
-    except Exception as e:
-        return {"error": str(e), "results": []}
+    except Exception:
+        return _api_failure("搜索失败", results=[])
 
 
 @app.get("/api/memories/search")
@@ -2580,13 +2588,9 @@ async def consolidate_memories_for_date_range(start_date, end_date):
             "fragments_processed": len(all_fragments),
             "events_created": len(created_ids),
         }
-    except ConsolidationError as exc:
-        return {"status": "error", "error": str(exc)}
-    except Exception as exc:
-        return {
-            "status": "error",
-            "error": f"整理失败，原始碎片未归档: {exc}",
-        }
+    except Exception:
+        logger.exception("Memory consolidation failed")
+        return {"status": "error", "error": "整理失败，原始碎片未归档"}
 
 
 @app.post("/api/memories/consolidate")
@@ -2630,9 +2634,9 @@ async def api_manual_consolidate(request: Request):
             result = await consolidate_memories_for_date_range(start_date, end_date)
             _consolidate_status["result"] = result
             print(f"[manual/consolidate] 整理 {start_date}~{end_date}: {result}")
-        except Exception as e:
-            _consolidate_status["error"] = str(e)
-            print(f"[manual/consolidate] 整理 {start_date}~{end_date} 失败: {e}")
+        except Exception:
+            logger.exception("Manual memory consolidation failed for %s~%s", start_date, end_date)
+            _consolidate_status["error"] = "整理失败，原始碎片未归档"
         finally:
             _consolidate_status["running"] = False
     
@@ -2717,8 +2721,8 @@ async def api_cleanup_fragments(request: Request):
             "revert_disabled": result["revert_disabled"],
             "days": days,
         }
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        return _api_failure("清理归档碎片失败")
 
 
 @app.post("/api/memories/{memory_id}/revert-merge")
@@ -2730,8 +2734,8 @@ async def api_revert_merge(memory_id: int):
     try:
         result = await revert_merge(memory_id)
         return result
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        return _api_failure("撤回合并失败")
 
 
 @app.post("/api/memories/{memory_id}/restore")
@@ -2743,8 +2747,8 @@ async def api_restore_memory(memory_id: int):
     try:
         await update_memory_with_layer(memory_id, is_active=True)
         return {"status": "ok", "id": memory_id}
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        return _api_failure("恢复记忆失败")
 
 
 @app.get("/api/memories/layer-stats")
@@ -2756,8 +2760,8 @@ async def api_layer_statistics():
     try:
         stats = await get_layer_statistics()
         return stats
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        return _api_failure("加载记忆统计失败")
 
 
 @app.post("/import/text")
@@ -2811,8 +2815,8 @@ async def import_text_memories(request: Request):
             "skipped": skipped,
             "total": total,
         }
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        return _api_failure("导入记忆失败")
 
 
 @app.post("/import/memories")
@@ -2869,8 +2873,8 @@ async def import_memories(request: Request):
             "skipped": skipped,
             "total": total,
         }
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        return _api_failure("导入记忆失败")
 
 
 # ============================================================
@@ -2885,8 +2889,8 @@ async def api_conversations(page: int = 1, per_page: int = 20):
         results, total = await get_conversations_paginated(page, per_page)
         total_pages = max(1, -(-total // per_page))  # 向上取整
         return {"conversations": results, "total": total, "page": page, "per_page": per_page, "total_pages": total_pages}
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        return _api_failure("加载对话失败")
 
 
 @app.get("/api/conversations/{session_id}/messages")
@@ -2908,8 +2912,8 @@ async def api_conversation_messages(session_id: str, limit: int = 50, offset: in
         msgs = [{"id": r["id"], "role": r["role"], "content": r["content"], 
                  "created_at": r["created_at"].isoformat() if r.get("created_at") else None} for r in rows]
         return {"messages": msgs, "total": total}
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        return _api_failure("加载消息失败")
 
 
 @app.delete("/api/conversations/{session_id}")
@@ -2919,8 +2923,8 @@ async def api_delete_conversation(session_id: str):
     try:
         await delete_conversation(session_id)
         return {"status": "ok"}
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        return _api_failure("删除对话失败")
 
 
 @app.post("/api/conversations/batch-delete")
@@ -2933,8 +2937,8 @@ async def api_batch_delete_conversations(request: Request):
         if ids:
             await batch_delete_conversations(ids)
         return {"status": "ok", "deleted": len(ids)}
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        return _api_failure("批量删除对话失败")
 
 
 @app.post("/api/admin/merge-sessions")
@@ -2949,8 +2953,8 @@ async def api_merge_sessions(request: Request):
             return {"error": "source_ids 和 target_id 不能为空"}
         result = await merge_sessions_to_target(source_ids, target_id)
         return {"status": "ok", **result}
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        return _api_failure("合并对话失败")
 
 
 @app.get("/api/chat/search")
@@ -2963,8 +2967,8 @@ async def api_search_conversations(q: str = "", limit: int = 20, offset: int = 0
     try:
         results, total = await search_conversations(q.strip(), limit, offset)
         return {"results": results, "total": total}
-    except Exception as e:
-        return {"error": str(e), "results": [], "total": 0}
+    except Exception:
+        return _api_failure("搜索对话失败", results=[], total=0)
 
 
 def _bounded_int(value, default: int, lower: int, upper: int) -> int:
@@ -3015,10 +3019,10 @@ async def _run_fragment_search(
             "query": query,
             "mode": mode,
         }
-    except Exception as e:
+    except Exception:
         return JSONResponse(
             status_code=500,
-            content={"error": str(e), "results": [], "total_sessions": 0},
+            content=_api_failure("搜索对话片段失败", results=[], total_sessions=0),
         )
 
 
@@ -3084,8 +3088,8 @@ async def api_rebuild_conversation_search():
             "content_tsv_updated": updated_tsv,
             "backfill": await get_embedding_backfill_status(),
         }
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+    except Exception:
+        return JSONResponse(status_code=500, content=_api_failure("重建对话搜索失败"))
 
 
 @app.get("/api/admin/conversation-embedding-status")
@@ -3107,8 +3111,8 @@ async def api_update_message(message_id: int, request: Request):
         if updated == 0:
             return {"error": "消息不存在"}
         return {"status": "ok"}
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        return _api_failure("保存消息失败")
 
 
 @app.delete("/api/chat/messages/{message_id}")
@@ -3121,8 +3125,8 @@ async def api_delete_message(message_id: int):
         if deleted == 0:
             return {"error": "消息不存在"}
         return {"status": "ok"}
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        return _api_failure("删除消息失败")
 
 
 @app.get("/api/conversations/export")
@@ -3133,8 +3137,8 @@ async def api_export_conversations():
     try:
         data = await export_all_conversations()
         return JSONResponse(content=data)
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        return _api_failure("导出对话失败")
 
 
 @app.post("/api/conversations/import")
@@ -3148,8 +3152,8 @@ async def api_import_conversations(request: Request):
             return {"error": "格式错误：需要 JSON 数组"}
         imported, skipped = await import_conversations(records)
         return {"status": "ok", "imported": imported, "skipped": skipped, "total": imported + skipped}
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        return _api_failure("导入对话失败")
 
 
 # ============================================================
@@ -3200,8 +3204,8 @@ async def api_update_summary(request: Request):
         await save_session_cache_state(sid, summary_parts, a_start)
         total_len = sum(len(p) for p in summary_parts)
         return {"status": "ok", "summary_parts": len(summary_parts), "summary_length": total_len}
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        return _api_failure("保存摘要失败")
 
 
 @app.delete("/api/partition/summary")
@@ -3214,8 +3218,8 @@ async def api_clear_summary(request: Request):
         # 摘要和 a_start_round 一起归零
         await save_session_cache_state(sid, [], 0)
         return {"status": "ok"}
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        return _api_failure("清空摘要失败")
 
 
 @app.post("/api/partition/thread")
@@ -3236,8 +3240,8 @@ async def api_create_thread(request: Request):
         await save_session_cache_state(new_id, summary_parts, 0)
         total_len = sum(len(p) for p in summary_parts)
         return {"status": "ok", "session_id": new_id, "summary_length": total_len}
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        return _api_failure("创建对话线失败")
 
 
 @app.post("/api/partition/switch")
@@ -3252,8 +3256,8 @@ async def api_switch_thread(request: Request):
         PARTITION_SESSION_ID = new_id
         await set_gateway_config("partition_session_id", new_id)
         return {"status": "ok", "old_session_id": old_id, "new_session_id": new_id}
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        return _api_failure("切换对话线失败")
 
 
 @app.put("/api/partition/thread/rename")
@@ -3275,8 +3279,8 @@ async def api_rename_thread(request: Request):
             PARTITION_SESSION_ID = new_id
             await set_gateway_config("partition_session_id", new_id)
         return {"status": "ok", "old_id": old_id, "new_id": new_id}
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        return _api_failure("重命名对话线失败")
 
 
 @app.delete("/api/partition/thread/{session_id:path}")
@@ -3289,8 +3293,8 @@ async def api_delete_thread(session_id: str):
         await delete_session_cache_state(session_id)
         print(f"🗑️ 删除对话线: {session_id}")
         return {"status": "ok", "session_id": session_id}
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        return _api_failure("删除对话线失败")
 
 
 # ============================================================
@@ -3316,8 +3320,8 @@ async def api_backfill_memory_embeddings():
     
     try:
         total = await get_pending_memory_embedding_count()
-    except Exception as e:
-        return {"error": f"查询待处理数量失败: {e}"}
+    except Exception:
+        return _api_failure("查询待处理数量失败")
     
     if total == 0:
         return {"status": "done", "message": "所有记忆已有embedding，无需补算", "total": 0, "done": 0}
@@ -3341,9 +3345,9 @@ async def api_backfill_memory_embeddings():
             
             _backfill_mem_status["finished_at"] = datetime.now(timezone.utc).isoformat()
             print(f"✅ 记忆embedding补算完成：{_backfill_mem_status['done']}/{_backfill_mem_status['total']}")
-        except Exception as e:
-            _backfill_mem_status["error"] = str(e)
-            print(f"❌ 记忆embedding补算异常: {e}")
+        except Exception:
+            logger.exception("Memory embedding backfill failed")
+            _backfill_mem_status["error"] = "记忆向量补算失败"
         finally:
             _backfill_mem_status["running"] = False
     
@@ -3439,9 +3443,8 @@ async def get_models():
         else:
             return {"models": [], "total": 0, "provider": "unknown", "note": "未识别的 API，请手动输入模型名"}
 
-    except Exception as e:
-        print(f"[get_models] 错误: {e}")
-        return {"error": str(e), "models": []}
+    except Exception:
+        return _api_failure("加载模型列表失败", models=[])
 
 
 # ============================================================
@@ -3556,9 +3559,8 @@ async def get_settings():
         }
 
         return {"status": "ok", "settings": settings}
-    except Exception as e:
-        print(f"[get_settings] 错误: {e}")
-        return {"error": str(e)}
+    except Exception:
+        return _api_failure("加载设置失败")
 
 
 @app.put("/api/settings")
@@ -3688,9 +3690,8 @@ async def save_settings(request: Request):
             "skipped": skipped,
             "message": f"已更新 {len(updated)} 项配置，立即生效"
         }
-    except Exception as e:
-        print(f"[save_settings] 错误: {e}")
-        return {"error": str(e)}
+    except Exception:
+        return _api_failure("保存设置失败")
 
 
 # ============================================================
