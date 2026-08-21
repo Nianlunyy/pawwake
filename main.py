@@ -1752,8 +1752,8 @@ async def _chat_completions_inner(request: Request):
             
             if response.status_code == 200:
                 resp_data = response.json()
-                resp_data = response.json()
                 print(f"🔬 原始响应完整结构: {json.dumps(resp_data.get('choices', [{}])[0].get('message', {}), ensure_ascii=False)[:2000]}")
+                print(f"🔍 完整usage原始数据(排查缓存字段用): {json.dumps(resp_data.get('usage', {}), ensure_ascii=False)}")
                 assistant_msg = ""
                 assistant_tool_calls = None
                 assistant_reasoning = None
@@ -1942,6 +1942,7 @@ async def stream_and_capture(
         pt = stream_usage.get("prompt_tokens", 0)
         ct = stream_usage.get("completion_tokens", 0)
         tt = stream_usage.get("total_tokens", 0)
+        print(f"🔍 完整usage原始数据(排查缓存字段用): {json.dumps(stream_usage, ensure_ascii=False)}")
         if tt > 0 and not skip_conversation_log:
             asyncio.create_task(save_token_usage(session_id, model, pt, ct, tt))
             print(f"📊 Stream Token: {pt} + {ct} = {tt}")
