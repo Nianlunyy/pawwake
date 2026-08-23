@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pawwake 数据库已停用</title>
+    <link rel="stylesheet" href="/static/css/login.css?v=4.0.1">
+</head>
+<body>
+    <main class="login-shell">
+        <section class="login-card" aria-labelledby="disabled-title">
+            <div class="paw-mark" aria-hidden="true">🐾</div>
+            <p class="brand">Pawwake · 爪迹</p>
+            <h1 id="disabled-title">数据库已停用</h1>
+            <p class="subtitle">当前处于不保存对话、Token 和记忆的纯转发模式。</p>
+            <div class="message error" role="alert">
+                要恢复 Dashboard 与数据库能力，请把部署环境变量
+                <strong>DATABASE_ENABLED</strong> 改为 <strong>true</strong>，然后重启 Pawwake。
+            </div>
+            <form method="post" action="/dashboard/logout">
+                <button type="submit">退出登录</button>
+            </form>
+        </section>
+    </main>
+</body>
+</html>

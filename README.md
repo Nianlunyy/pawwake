@@ -1,6 +1,6 @@
 # 🐾 Pawwake · 爪迹
 
-**4.0.3 · Madeleine**
+**4.0.5 · Madeleine**
 
 *Follow the pawprints back.*
 
@@ -53,11 +53,7 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 
 **1. 准备文件**
 
-你只需要这几个文件：
-- `main.py` — 网关主程序
-- `system_prompt.txt` — 你的 AI 人设（可选）
-- `requirements.txt` — Python 依赖
-- `Dockerfile` — 容器配置
+上传整个项目目录即可。`main.py` 是启动入口，运行时还会加载同目录下的路由、数据库和共享状态模块；`system_prompt.txt` 是可选的 AI 人设文件。
 
 **2. 修改人设**
 
@@ -113,6 +109,7 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 
 | 环境变量 | 说明 | 示例 |
 |---------|------|------|
+| `DATABASE_ENABLED` | 数据库总开关；设为 `false` 时强制关闭记忆、分区缓存和对话召回，进入纯转发模式。恢复需改回 `true` 并重启 | `true` |
 | `DATABASE_URL` | PostgreSQL 连接字符串 | `postgresql://user:pass@host:port/db` |
 | `MEMORY_ENABLED` | 开启记忆 | `true` |
 | `MEMORY_MODEL` | 记忆提取、评分、整理共用的模型（推荐便宜的小模型），留空回退到内置默认 | `anthropic/claude-haiku-4.5` |
@@ -189,15 +186,30 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 
 ### 第四阶段：关闭记忆（应急）
 
-如果记忆系统出问题，把 `MEMORY_ENABLED` 改为 `false` 即可停止记忆检索、注入和提取；Dashboard 设置与活跃对话线仍会从数据库恢复。若要进入不保存对话的纯转发模式，请同时关闭 `CACHE_PARTITION_ENABLED`。
+如果记忆系统出问题，把环境变量 `DATABASE_ENABLED` 改回 `false` 即可退回纯转发模式，不需要改代码。
 
 ## 📁 文件说明
 
 ```
 pawwake/
-├── main.py                    # 网关主程序
-├── database.py                # 数据库操作（PostgreSQL）
-├── memory_extractor.py        # AI 记忆提取
+├── main.py                    # 应用组装、生命周期与启动入口
+├── shared.py                  # 可热更新配置、共享运行态与人设缓存
+├── auth.py                    # 网关请求头与 Dashboard Cookie 鉴权
+├── partition_engine.py        # 分区上下文、轮转与摘要
+├── memory_pipeline.py         # 记忆注入、对话召回与后台提取
+├── memory_extractor.py        # AI 记忆提取器
+├── routes/                    # 按领域拆分的 HTTP 路由
+│   ├── chat.py                # 健康检查与 OpenAI 兼容聊天
+│   ├── dashboard.py           # Dashboard、模型列表与设置
+│   ├── memories.py            # 记忆管理、导入、整理与补算
+│   ├── conversations.py       # 对话管理与片段检索
+│   └── partition.py           # 分区状态与对话线管理
+├── db/                        # PostgreSQL 数据层
+│   ├── core.py                # 连接池、表结构与网关配置
+│   ├── search.py              # 分词、向量、召回与补算
+│   ├── conversations.py       # 对话、分区状态与 Token 统计
+│   └── memories.py            # 记忆存取、备份与生命周期
+├── database.py                # 4.x 旧导入兼容入口，5.0 删除
 ├── system_prompt.txt          # 你的 AI 人设（自行编辑）
 ├── seed_memories_example.py   # 预置记忆示例
 ├── requirements.txt           # Python 依赖
@@ -219,12 +231,13 @@ pawwake/
 |------|------|------|
 | `/` | GET | 健康检查，查看网关状态 |
 | `/v1/chat/completions` | POST | 核心转发接口（OpenAI 兼容） |
+| `/api/memories` | POST | 显式写入单条记忆；需 `X-Gateway-Key`，支持 `external_id` 幂等重试 |
 | `/v1/models` | GET | 模型列表 |
 | `/dashboard/login` | GET/POST | Dashboard 独立密码登录 |
 | `/dashboard/logout` | POST | 退出 Dashboard 登录 |
 | `/dashboard` | GET | 管理控制台（记忆、对话、对话线一体化界面） |
 | `/import/seed-memories` | GET | 执行预置记忆导入（开发者用） |
-| `/api/memories` | GET | 获取所有记忆（支持 `?layer=` `?active_only=` 筛选） |
+| `/api/memories` | GET/POST | 获取记忆，或显式创建一条记忆 |
 | `/api/memories/search` | GET/POST | 混合搜索记忆；私密查询推荐 POST JSON `{"q":"..."}` |
 | `/api/memories/consolidate` | POST | 手动触发记忆整理（异步，碎片 → 事件） |
 | `/api/memories/consolidate/status` | GET | 查询整理任务状态 |
@@ -356,6 +369,13 @@ A: 打开 `https://你的网关地址/dashboard`，在「导出备份」页面�
 A: 能。这个项目的第一个部署者就是不会写代码的——代码是 AI 写的，部署是她自己看文档搞定的。
 
 ## 📋 更新日志
+
+### v4.0.5 · Madeleine（2026-08-23）
+
+- **数据库总闸** — 新增默认开启的 `DATABASE_ENABLED`；关闭后统一压制三个数据库子能力、跳过连接与初始化，并保留纯转发聊天和模型列表
+- **单条记忆写入 API** — 新增 `POST /api/memories`，供 MCP、脚本、日记摘要和迁移工具显式写入记忆；严格校验字段并只接受 `X-Gateway-Key`
+- **幂等外部 ID** — 可选 `external_id` 使用部分唯一索引防止重复写入，重试会返回原记录并标记 `inserted=false`
+- **模块化内部结构** — 路由、共享运行态、分区缓存、记忆流水线和数据库操作按领域拆分；除 4.0.5 版本标识外，启动命令、57 条产品路由、数据库结构与既有响应保持不变。老用户升级请用 `Pawwake-4.0.5/` 整目录覆盖旧文件，不要只替换 `main.py`；启动时自动补建索引，无需手动迁移。
 
 ### v4.0.3 · Madeleine（2026-08-18）
 

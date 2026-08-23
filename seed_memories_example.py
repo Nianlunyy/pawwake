@@ -16,7 +16,8 @@ importance 评分规则（1-10）：
 - 3-4:  临时性信息
 """
 
-from database import get_pool, save_memory, get_all_memories_count
+from db.core import get_pool
+from db.memories import get_all_memories_count, save_memory
 
 SEED_MEMORIES = [
     # ======== 基础信息（改成你自己的） ========

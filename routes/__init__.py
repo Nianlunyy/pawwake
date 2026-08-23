@@ -1,0 +1,1 @@
+"""Pawwake HTTP route domains."""
