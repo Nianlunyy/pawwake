@@ -177,6 +177,9 @@ async function loadMemories() {
 function renderTable(mems, startIndex) {
     startIndex = startIndex || 0;
     const tbody = document.getElementById('tbody');
+    const successorIds = new Set(allMemories
+        .filter(m => m.superseded_by != null)
+        .map(m => m.superseded_by));
     tbody.innerHTML = mems.map((m, i) => {
         const layer = m.layer || 1;
         const isInactive = m.is_active === false;
@@ -197,6 +200,15 @@ function renderTable(mems, startIndex) {
             mergeInfo = '<div class="merge-info" onclick="showMergeSource(' + m.id + ')">' +
                 ICONS.paperclip(12) + ' 由 ' + mergedFrom.length + ' 条合并</div>';
         }
+
+        let versionInfo = '';
+        if (m.superseded_by != null) {
+            versionInfo = '<div class="merge-info" onclick="showVersionChain(' + m.id + ')">' +
+                ICONS.paperclip(12) + ' 已被新版本取代</div>';
+        } else if (successorIds.has(m.id)) {
+            versionInfo = '<div class="merge-info" onclick="showVersionChain(' + m.id + ')">' +
+                ICONS.paperclip(12) + ' 查看旧版本</div>';
+        }
         
         // 撤回按钮（只有事件记忆且有合并来源时显示）
         let revertBtn = '';
@@ -208,13 +220,18 @@ function renderTable(mems, startIndex) {
         let restoreBtn = '';
         let deleteBtn = '<button class="btn btn-danger btn-sm" onclick="delMem(' + m.id + ')">删除</button>';
         if (isInactive) {
-            restoreBtn = '<button class="btn btn-success btn-sm" onclick="restoreMem(' + m.id + ')">恢复</button>';
-            deleteBtn = '<button class="btn btn-danger btn-sm" onclick="delMem(' + m.id + ', true)">永久删除</button>';
+            if (m.superseded_by != null) {
+                restoreBtn = '<button class="btn btn-warning btn-sm" onclick="undoSupersede(' + m.id + ')">撤销取代</button>';
+                deleteBtn = '';
+            } else {
+                restoreBtn = '<button class="btn btn-success btn-sm" onclick="restoreMem(' + m.id + ')">恢复</button>';
+                deleteBtn = '<button class="btn btn-danger btn-sm" onclick="delMem(' + m.id + ', true)">永久删除</button>';
+            }
         }
         
         return '<tr data-id="' + m.id + '" class="' + rowClass + '">' +
             '<td class="col-check"><input type="checkbox" class="mem-check" value="' + m.id + '" onchange="updateFloatingBar()"></td>' +
-            '<td class="col-id">' + (startIndex + i + 1) + mergeInfo + '</td>' +
+            '<td class="col-id">' + (startIndex + i + 1) + mergeInfo + versionInfo + '</td>' +
             '<td class="col-layer">' + layerSelect + '</td>' +
             '<td class="col-title"><input type="text" class="title-input" id="t_' + m.id + '" value="' + escHtml(titleDisplay) + '" placeholder="无标题"></td>' +
             '<td class="col-content"><textarea class="content-textarea" id="c_' + m.id + '">' + escHtml(m.content) + '</textarea></td>' +
@@ -671,6 +688,68 @@ function closeMergeSourceModal() {
     document.getElementById('mergeSourceModal').style.display = 'none';
 }
 
+async function showVersionChain(id) {
+    try {
+        const resp = await fetch('/api/memories?active_only=false');
+        const data = await resp.json();
+        const memories = data.memories || [];
+        const byId = new Map(memories.map(m => [m.id, m]));
+        let current = byId.get(id);
+        if (!current) {
+            showManageMsg('error', '没有版本链信息');
+            return;
+        }
+
+        const visited = new Set();
+        let predecessor = memories.find(m => m.superseded_by === current.id);
+        while (predecessor && !visited.has(predecessor.id)) {
+            visited.add(current.id);
+            current = predecessor;
+            predecessor = memories.find(m => m.superseded_by === current.id);
+        }
+
+        const chain = [];
+        visited.clear();
+        while (current && !visited.has(current.id)) {
+            chain.push(current);
+            visited.add(current.id);
+            current = current.superseded_by == null ? null : byId.get(current.superseded_by);
+        }
+
+        let html = '<h3>记忆版本链</h3>';
+        html += '<p style="color:var(--text-light);margin-bottom:16px;">旧版本保留原文，默认召回只使用活跃版本。</p>';
+        chain.forEach((memory, index) => {
+            const status = memory.is_active === false ? '已取代' : '活跃';
+            html += '<div class="source-item"><b>版本 ' + (index + 1) + ' · ' + status + '</b><br>' +
+                escHtml(memory.content) + '</div>';
+        });
+        html += '<div class="modal-actions"><button class="btn btn-secondary" onclick="closeMergeSourceModal()">关闭</button></div>';
+        document.getElementById('mergeSourceContent').innerHTML = html;
+        document.getElementById('mergeSourceModal').style.display = 'flex';
+    } catch(e) {
+        showManageMsg('error', '❌ ' + e.message);
+    }
+}
+
+async function undoSupersede(id) {
+    if (!confirm('确定撤销取代？\n\n旧记忆会恢复为活跃状态，新记忆会保留。')) {
+        return;
+    }
+    try {
+        const resp = await fetch('/api/memories/' + id + '/undo-supersede', { method: 'POST' });
+        const data = await resp.json();
+        if (data.error) {
+            showManageMsg('error', '❌ ' + data.error);
+        } else {
+            closeMergeSourceModal();
+            showManageMsg('success', '✅ 已撤销取代，旧记忆恢复为活跃状态');
+            loadMemories();
+        }
+    } catch(e) {
+        showManageMsg('error', '❌ ' + e.message);
+    }
+}
+
 // ============================================
 // 撤回合并
 // ============================================
@@ -948,7 +1027,9 @@ async function previewJson() {
         }
         
         pendingJsonData = parsed;
-        const verTag = parsed.schema_version === 2
+        const verTag = parsed.schema_version === 3
+            ? '（v3 完整备份，含层级/日期/合并与版本关系）'
+            : parsed.schema_version === 2
             ? '（v2 完整备份，含层级/日期/合并关系）'
             : '（旧版备份，将按碎片导入）';
         const summary = document.createElement('p');

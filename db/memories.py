@@ -7,9 +7,12 @@ from datetime import date, datetime, timedelta, timezone as dt_timezone
 import shared
 from db import core as db_core
 from db import search as db_search
-from db.core import BrokenMergeReferencesError
+from db.core import BrokenMergeReferencesError, BrokenSupersessionReferencesError
 
 logger = logging.getLogger(__name__)
+
+_EXTRACTION_RELEVANT_LIMIT = 10
+_EXTRACTION_RECENT_LIMIT = 10
 
 # ============================================================
 # 记忆操作
@@ -41,6 +44,85 @@ async def save_memory(content: str, importance: int = 5, source_session: str = "
             except Exception as e:
                 print(f"⚠️ 记忆 {row['id']} embedding自动计算失败: {e}")
         return row["id"] if row else None
+
+
+async def save_extracted_memory(
+    content: str,
+    importance: int,
+    source_session: str,
+    supersede_id=None,
+    candidate_ids=None,
+):
+    """Save one extracted fact and atomically retire an allowed active predecessor."""
+    allowed_ids = {
+        memory_id for memory_id in (candidate_ids or [])
+        if isinstance(memory_id, int) and not isinstance(memory_id, bool)
+    }
+    requested_id = (
+        supersede_id
+        if isinstance(supersede_id, int) and not isinstance(supersede_id, bool)
+        else None
+    )
+
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                INSERT INTO memories
+                    (content, importance, source_session, layer, is_active)
+                VALUES ($1, $2, $3, 1, TRUE)
+                RETURNING id
+                """,
+                content,
+                importance,
+                source_session,
+            )
+            new_id = int(row["id"])
+            retired_id = None
+            if requested_id in allowed_ids:
+                predecessor = await conn.fetchrow(
+                    """
+                    SELECT id, is_active, superseded_by
+                    FROM memories
+                    WHERE id = $1
+                    FOR UPDATE
+                    """,
+                    requested_id,
+                )
+                if (
+                    predecessor
+                    and predecessor["is_active"] is True
+                    and predecessor["superseded_by"] is None
+                ):
+                    result = await conn.execute(
+                        """
+                        UPDATE memories
+                        SET is_active = FALSE, superseded_by = $2
+                        WHERE id = $1
+                          AND is_active = TRUE
+                          AND superseded_by IS NULL
+                        """,
+                        requested_id,
+                        new_id,
+                    )
+                    if result == "UPDATE 1":
+                        retired_id = requested_id
+
+    if shared.MEMORY_VECTOR_ENABLED:
+        try:
+            embedding = await db_search.compute_embedding(content)
+            if embedding:
+                async with pool.acquire() as conn:
+                    await db_search.save_memory_embedding(conn, new_id, embedding)
+        except Exception as exc:
+            print(f"⚠️ 记忆 {new_id} embedding自动计算失败: {exc}")
+
+    return {
+        "id": new_id,
+        "action": "supersede" if retired_id is not None else "new",
+        "superseded_id": retired_id,
+    }
 
 
 async def get_memory_by_external_id(external_id: str):
@@ -336,6 +418,150 @@ async def search_memories_with_mode(query: str, limit: int = 10):
     return await search_memories(query, limit), "keyword"
 
 
+async def get_extraction_candidates(
+    query: str,
+    relevant_limit: int = _EXTRACTION_RELEVANT_LIMIT,
+    recent_limit: int = _EXTRACTION_RECENT_LIMIT,
+):
+    """Return read-only dedup candidates: relevant top K union latest M active."""
+    def candidate_row(row):
+        return {
+            key: row[key]
+            for key in ("id", "content", "importance", "created_at", "event_date")
+        }
+
+    keywords = db_search.extract_search_keywords(query)
+    query_embedding = (
+        await db_search.get_query_embedding(query)
+        if relevant_limit > 0 and shared.MEMORY_VECTOR_ENABLED and shared.EMBEDDING_API_KEY
+        else []
+    )
+
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        relevant = {}
+        candidate_pool_size = relevant_limit * 3
+
+        if keywords and relevant_limit > 0:
+            hit_parts = [
+                f"CASE WHEN content ILIKE '%' || ${index + 1} || '%' THEN 1 ELSE 0 END"
+                for index in range(len(keywords))
+            ]
+            hit_count = " + ".join(hit_parts)
+            where_parts = [
+                f"content ILIKE '%' || ${index + 1} || '%'"
+                for index in range(len(keywords))
+            ]
+            keyword_rows = await conn.fetch(
+                f"""
+                SELECT id, content, importance, created_at, event_date,
+                       ({hit_count})::float / {len(keywords)}.0 AS keyword_score
+                FROM memories
+                WHERE is_active = TRUE AND ({' OR '.join(where_parts)})
+                ORDER BY keyword_score DESC, id ASC
+                LIMIT ${len(keywords) + 1}
+                """,
+                *keywords,
+                candidate_pool_size,
+            )
+            for row in keyword_rows:
+                relevant[row["id"]] = {
+                    "row": candidate_row(row),
+                    "keyword_score": float(row["keyword_score"]),
+                    "similarity": None,
+                }
+
+        if query_embedding and relevant_limit > 0:
+            semantic_rows = []
+            try:
+                if db_core.HAS_PGVECTOR:
+                    vector_text = "[" + ",".join(str(value) for value in query_embedding) + "]"
+                    semantic_rows = await conn.fetch(
+                        """
+                        SELECT id, content, importance, created_at, event_date,
+                               1 - (embedding <=> $1::vector) AS similarity
+                        FROM memories
+                        WHERE embedding IS NOT NULL AND is_active = TRUE
+                        ORDER BY embedding <=> $1::vector, id ASC
+                        LIMIT $2
+                        """,
+                        vector_text,
+                        candidate_pool_size,
+                    )
+                else:
+                    embedded_rows = await conn.fetch(
+                        """
+                        SELECT id, content, importance, created_at, event_date,
+                               embedding_json
+                        FROM memories
+                        WHERE embedding_json IS NOT NULL AND is_active = TRUE
+                        """
+                    )
+                    for row in embedded_rows:
+                        try:
+                            semantic_rows.append({
+                                **dict(row),
+                                "similarity": db_search._cosine_sim(
+                                    query_embedding,
+                                    json.loads(row["embedding_json"]),
+                                ),
+                            })
+                        except Exception:
+                            continue
+                    semantic_rows.sort(key=lambda row: (-row["similarity"], row["id"]))
+                    semantic_rows = semantic_rows[:candidate_pool_size]
+            except Exception as exc:
+                print(f"⚠️ 提取候选向量检索失败，退回关键词和最新记忆: {exc}")
+
+            for row in semantic_rows:
+                item = relevant.setdefault(row["id"], {
+                    "row": candidate_row(row),
+                    "keyword_score": None,
+                    "similarity": None,
+                })
+                item["similarity"] = float(row["similarity"])
+
+        def relevance_key(item):
+            keyword_score = item["keyword_score"]
+            similarity = item["similarity"]
+            best_score = max(
+                score for score in (keyword_score, similarity) if score is not None
+            )
+            return (
+                -best_score,
+                -(keyword_score if keyword_score is not None else float("-inf")),
+                -(similarity if similarity is not None else float("-inf")),
+                item["row"]["id"],
+            )
+
+        relevant_rows = [
+            item["row"]
+            for item in sorted(relevant.values(), key=relevance_key)[:relevant_limit]
+        ]
+        recent_rows = []
+        if recent_limit > 0:
+            recent_rows = await conn.fetch(
+                """
+                SELECT id, content, importance, created_at, event_date
+                FROM memories
+                WHERE is_active = TRUE
+                ORDER BY created_at DESC, id DESC
+                LIMIT $1
+                """,
+                recent_limit,
+            )
+
+    candidates = []
+    seen_ids = set()
+    for row in [*relevant_rows, *recent_rows]:
+        memory = candidate_row(row)
+        if memory["id"] in seen_ids:
+            continue
+        seen_ids.add(memory["id"])
+        candidates.append(memory)
+    return candidates
+
+
 async def get_pending_memory_embedding_count():
     """查询还没有embedding的记忆数量"""
     pool = await db_core.get_pool()
@@ -431,7 +657,7 @@ async def get_all_memories():
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT id, content, importance, source_session, created_at,
-                   layer, title, is_active, merged_from, event_date
+                   layer, title, is_active, merged_from, event_date, superseded_by
             FROM memories ORDER BY id
         """)
         memories = [dict(r) for r in rows]
@@ -448,6 +674,21 @@ async def get_all_memories():
             broken_references,
         )
         raise BrokenMergeReferencesError(len(broken_references))
+
+    broken_supersession_references = [
+        memory["id"]
+        for memory in memories
+        if memory.get("superseded_by") is not None
+        and memory["superseded_by"] not in memory_ids
+    ]
+    if broken_supersession_references:
+        logger.warning(
+            "Backup blocked by broken superseded_by references: %s",
+            broken_supersession_references,
+        )
+        raise BrokenSupersessionReferencesError(
+            len(broken_supersession_references)
+        )
 
     return memories
 
@@ -509,8 +750,8 @@ def _parse_backup_date(value):
         return None
 
 
-async def import_memories_v2(memories: list):
-    """恢复 v2 版本化备份：单事务两遍，先插入建映射，再回填合并关系。
+async def import_memories_v2(memories: list, schema_version: int = 2):
+    """恢复版本化备份：单事务建映射，再回填合并与版本关系。
 
     - 同内容且库中唯一 → 跳过并映射到已有行（同一份备份重复导入幂等）
     - 同内容但库中多行 → 不猜挂哪条，计入 conflicts 回执，引用它的合并链降级
@@ -539,6 +780,16 @@ async def import_memories_v2(memories: list):
             if ref not in backup_ids:
                 raise ValueError(
                     f"记忆 {mem['backup_id']} 的 merged_from 引用了备份中不存在的 {ref}，备份不完整"
+                )
+        successor = mem.get("superseded_by") if schema_version >= 3 else None
+        if successor is not None:
+            if isinstance(successor, bool) or not isinstance(successor, int):
+                raise ValueError(
+                    f"记忆 {mem['backup_id']} 的 superseded_by 引用非法: {successor!r}"
+                )
+            if successor not in backup_ids:
+                raise ValueError(
+                    f"记忆 {mem['backup_id']} 的 superseded_by 引用了备份中不存在的 {successor}，备份不完整"
                 )
 
     pool = await db_core.get_pool()
@@ -605,10 +856,45 @@ async def import_memories_v2(memories: list):
                     [id_map[ref] for ref in refs], new_id,
                 )
 
+            if schema_version >= 3:
+                for mem in memories:
+                    successor = mem.get("superseded_by")
+                    if successor is None:
+                        continue
+                    old_id = id_map.get(mem["backup_id"])
+                    successor_id = id_map.get(successor)
+                    if old_id is None or successor_id is None:
+                        raise ValueError(
+                            f"记忆 {mem['backup_id']} 的版本链因内容冲突无法完整恢复"
+                        )
+                    await conn.execute(
+                        """UPDATE memories
+                           SET superseded_by = $1, is_active = FALSE
+                           WHERE id = $2""",
+                        successor_id,
+                        old_id,
+                    )
+
+                restored_ids = list(id_map.values())
+                broken_count = await conn.fetchval(
+                    """
+                    SELECT COUNT(*)
+                    FROM memories AS old
+                    LEFT JOIN memories AS successor
+                      ON successor.id = old.superseded_by
+                    WHERE old.id = ANY($1::int[])
+                      AND old.superseded_by IS NOT NULL
+                      AND successor.id IS NULL
+                    """,
+                    restored_ids,
+                )
+                if broken_count:
+                    raise ValueError("版本链恢复后校验失败")
+
     total = await get_all_memories_count()
     result = {
         "status": "done",
-        "schema_version": 2,
+        "schema_version": schema_version,
         "imported": imported,
         "skipped": skipped,
         "conflicts": conflicts,
@@ -657,7 +943,7 @@ async def get_all_memories_detail(limit: int = None, layer: int = None, active_o
 
         rows = await conn.fetch(f"""
             SELECT id, content, importance, source_session, created_at,
-                   layer, title, is_active, merged_from, event_date
+                   layer, title, is_active, merged_from, event_date, superseded_by
             FROM memories
             {where_clause}
             ORDER BY id
@@ -677,13 +963,19 @@ async def delete_archived_memories_batch(memory_ids: list):
     async with pool.acquire() as conn:
         result = await conn.fetchrow(
             """WITH targets AS (
-                   SELECT memory.id,
-                          EXISTS (
+               SELECT memory.id,
+                          memory.superseded_by IS NOT NULL
+                          OR EXISTS (
                               SELECT 1
                               FROM memories AS parent
                               WHERE memory.id = ANY(
                                   COALESCE(parent.merged_from, '{}'::int[])
                               )
+                          )
+                          OR EXISTS (
+                              SELECT 1
+                              FROM memories AS predecessor
+                              WHERE predecessor.superseded_by = memory.id
                           ) AS protected
                    FROM memories AS memory
                    WHERE memory.id = ANY($1::int[])
@@ -718,16 +1010,73 @@ async def soft_delete_memories_batch(memory_ids: list):
 
 
 async def restore_archived_memories_batch(memory_ids: list):
-    """批量恢复已归档记忆，返回实际恢复数量。"""
+    """批量恢复普通归档记忆；版本前驱必须走显式撤销。"""
     pool = await db_core.get_pool()
     async with pool.acquire() as conn:
         result = await conn.execute(
             """UPDATE memories
                SET is_active = TRUE
-               WHERE id = ANY($1::int[]) AND is_active = FALSE""",
+               WHERE id = ANY($1::int[])
+                 AND is_active = FALSE
+                 AND superseded_by IS NULL""",
             memory_ids,
         )
         return int(result.split()[-1]) if result else 0
+
+
+async def restore_archived_memory(memory_id: int):
+    """恢复一条普通归档记忆；版本前驱必须走显式撤销。"""
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                SELECT id, is_active, superseded_by
+                FROM memories
+                WHERE id = $1
+                FOR UPDATE
+                """,
+                memory_id,
+            )
+            if not row:
+                return {"status": "not_found"}
+            if row["superseded_by"] is not None:
+                return {"status": "superseded"}
+            if row["is_active"] is False:
+                await conn.execute(
+                    "UPDATE memories SET is_active = TRUE WHERE id = $1",
+                    memory_id,
+                )
+            return {"status": "ok"}
+
+
+async def undo_memory_supersession(memory_id: int):
+    """Restore one superseded predecessor and keep its successor untouched."""
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                SELECT id, superseded_by
+                FROM memories
+                WHERE id = $1
+                FOR UPDATE
+                """,
+                memory_id,
+            )
+            if not row:
+                return {"status": "not_found"}
+            if row["superseded_by"] is None:
+                return {"status": "not_superseded"}
+            await conn.execute(
+                """
+                UPDATE memories
+                SET is_active = TRUE, superseded_by = NULL
+                WHERE id = $1
+                """,
+                memory_id,
+            )
+            return {"status": "ok"}
 
 
 # ============================================================
@@ -1086,6 +1435,7 @@ async def cleanup_old_fragments(days: int = 30):
     - layer = 1（原始碎片）
     - is_active = FALSE（已归档）
     - created_at 在 days 天之前
+    - 不属于自动取代版本链
 
     Returns:
         {"deleted": 删除数量, "revert_disabled": 结束撤回能力的父记忆数量}
@@ -1096,11 +1446,17 @@ async def cleanup_old_fragments(days: int = 30):
 
         async with conn.transaction():
             rows = await conn.fetch("""
-                SELECT id
-                FROM memories
-                WHERE layer = 1
-                  AND is_active = FALSE
-                  AND created_at < $1
+                SELECT memory.id
+                FROM memories AS memory
+                WHERE memory.layer = 1
+                  AND memory.is_active = FALSE
+                  AND memory.created_at < $1
+                  AND memory.superseded_by IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM memories AS predecessor
+                      WHERE predecessor.superseded_by = memory.id
+                  )
                 FOR UPDATE
             """, cutoff_date)
             fragment_ids = [int(row["id"]) for row in rows]
@@ -1141,10 +1497,15 @@ async def revert_merge(memory_id: int):
     async with pool.acquire() as conn:
         async with conn.transaction():
             row = await conn.fetchrow("""
-                SELECT id, layer, merged_from
-                FROM memories
-                WHERE id = $1
-                FOR UPDATE
+                SELECT memory.id, memory.layer, memory.merged_from,
+                       memory.superseded_by IS NOT NULL OR EXISTS (
+                           SELECT 1
+                           FROM memories AS predecessor
+                           WHERE predecessor.superseded_by = memory.id
+                       ) AS protected_by_supersession
+                FROM memories AS memory
+                WHERE memory.id = $1
+                FOR UPDATE OF memory
             """, memory_id)
 
             if not row:
@@ -1152,6 +1513,9 @@ async def revert_merge(memory_id: int):
 
             if row['layer'] != 2:
                 return {"error": "只能撤回事件记忆的合并"}
+
+            if row.get('protected_by_supersession', False):
+                return {"error": "版本链中的记忆不能撤回合并"}
 
             merged_from = row['merged_from']
             if not merged_from or len(merged_from) == 0:

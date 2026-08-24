@@ -42,6 +42,14 @@ class BrokenMergeReferencesError(ValueError):
         )
 
 
+class BrokenSupersessionReferencesError(ValueError):
+    """备份前发现 superseded_by 指向不存在的后继记忆。"""
+
+    def __init__(self, count: int):
+        self.count = count
+        super().__init__(f"检测到 {count} 条记忆的版本后继已失效，无法导出完整备份")
+
+
 class DatabaseDisabled(RuntimeError):
     """数据库总闸关闭时拒绝创建或返回连接池。"""
 
@@ -244,6 +252,30 @@ async def init_tables():
             CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_external_id
             ON memories (external_id)
             WHERE external_id IS NOT NULL;
+        """)
+
+        # superseded_by: 自动冲突接管后的后继记忆
+        await conn.execute("""
+            ALTER TABLE memories
+            ADD COLUMN IF NOT EXISTS superseded_by INTEGER;
+        """)
+        await conn.execute("""
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'fk_memories_superseded_by'
+                      AND conrelid = 'memories'::regclass
+                ) THEN
+                    ALTER TABLE memories
+                    ADD CONSTRAINT fk_memories_superseded_by
+                    FOREIGN KEY (superseded_by) REFERENCES memories(id);
+                END IF;
+            END $$;
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memories_superseded_by
+            ON memories (superseded_by)
+            WHERE superseded_by IS NOT NULL;
         """)
 
         # 三层记忆索引

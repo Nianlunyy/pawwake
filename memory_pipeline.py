@@ -196,6 +196,27 @@ async def build_conversation_recall_text(user_message: str, session_id: str):
 # 后台记忆处理
 # ============================================================
 
+def _extraction_query_text(messages: list) -> str:
+    """Flatten the exact user/assistant extraction window into search text."""
+    parts = []
+    for message in messages:
+        if message.get("role") not in {"user", "assistant"}:
+            continue
+        content = message.get("content", "")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = " ".join(
+                block.get("text", "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") in {"text", "input_text"}
+            )
+        else:
+            text = ""
+        if text.strip():
+            parts.append(text.strip())
+    return "\n".join(parts)
+
 async def process_memories_background(
     session_id: str,
     user_msg: str,
@@ -225,7 +246,6 @@ async def process_memories_background(
     assistant_tool_calls: response中assistant的工具调用列表（如果有）
     assistant_reasoning: response中assistant的reasoning_content（deepseek thinking mode）
     """
-    global _nonpartition_round_counter
 
     try:
         # Debug: 打印存储分支判断依据
@@ -304,8 +324,8 @@ async def process_memories_background(
             return
 
         if context_round_count is None:
-            _nonpartition_round_counter += 1
-            current_round_count = _nonpartition_round_counter
+            shared._nonpartition_round_counter += 1
+            current_round_count = shared._nonpartition_round_counter
             round_scope = "非分区累计"
         else:
             current_round_count = max(0, int(context_round_count))
@@ -328,11 +348,7 @@ async def process_memories_background(
         if shared.MEMORY_EXTRACT_INTERVAL > 1:
             print(f"📝 {round_scope} 第 {current_round_count} 轮，执行记忆提取")
 
-        # 3. 获取已有记忆，传给提取模型做对比去重
-        existing = await db_memories.get_recent_memories(limit=80)
-        existing_contents = [r["content"] for r in existing]
-
-        # 4. 按逻辑轮截取近期上下文，而非发送完整会话。
+        # 3. 按逻辑轮截取近期上下文，而非发送完整会话。
         if context_messages:
             messages_for_extraction, selected_round_count = (
                 partition_engine._build_memory_extraction_messages(
@@ -351,7 +367,15 @@ async def process_memories_background(
                 {"role": "assistant", "content": assistant_msg},
             ]
 
-        new_memories = await extract_memories(messages_for_extraction, existing_memories=existing_contents)
+        # 4. 用同一提取窗口只读检索相关候选与最新活跃记忆。
+        candidate_query = _extraction_query_text(messages_for_extraction)
+        existing = await db_memories.get_extraction_candidates(candidate_query)
+        candidate_ids = {row["id"] for row in existing}
+
+        new_memories = await extract_memories(
+            messages_for_extraction,
+            existing_memories=existing,
+        )
 
         # 过滤垃圾记忆（不靠模型自觉，硬过滤）
         META_BLACKLIST = [
@@ -364,22 +388,43 @@ async def process_memories_background(
 
         filtered_memories = []
         for mem in new_memories:
+            if mem.get("action") == "duplicate":
+                print(f"⏭️ 跳过重复记忆: {mem['content'][:60]}...")
+                continue
             content = mem["content"]
             if any(kw in content for kw in META_BLACKLIST):
                 print(f"🚫 过滤掉meta记忆: {content[:60]}...")
                 continue
+            if (
+                mem.get("action") == "supersede"
+                and mem.get("candidate_id") not in candidate_ids
+            ):
+                mem = {**mem, "action": "new", "candidate_id": None}
             filtered_memories.append(mem)
 
+        superseded_count = 0
         for mem in filtered_memories:
-            await db_memories.save_memory(
+            result = await db_memories.save_extracted_memory(
                 content=mem["content"],
                 importance=mem["importance"],
                 source_session=session_id,
+                supersede_id=(
+                    mem.get("candidate_id")
+                    if mem.get("action") == "supersede"
+                    else None
+                ),
+                candidate_ids=candidate_ids,
             )
+            if result["action"] == "supersede":
+                superseded_count += 1
 
         if filtered_memories:
             total = await db_memories.get_all_memories_count()
-            print(f"💾 已保存 {len(filtered_memories)} 条新记忆（过滤了 {len(new_memories) - len(filtered_memories)} 条），总计 {total} 条")
+            print(
+                f"💾 已保存 {len(filtered_memories)} 条记忆"
+                f"（取代 {superseded_count} 条，跳过/过滤 {len(new_memories) - len(filtered_memories)} 条），"
+                f"总计 {total} 条"
+            )
 
     except Exception as e:
         print(f"⚠️  后台记忆处理失败: {e}")

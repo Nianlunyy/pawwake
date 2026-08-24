@@ -62,7 +62,7 @@ async def export_memories():
                 mem["event_date"] = str(mem["event_date"])
 
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "total": len(memories),
             "exported_at": str(__import__("datetime").datetime.now()),
             "memories": memories,
@@ -71,6 +71,12 @@ async def export_memories():
         return {
             "error": f"检测到 {e.count} 条记忆的合并来源已失效，可修复断裂引用后重新导出",
             "code": "broken_merge_references",
+            "count": e.count,
+        }
+    except db_memories.BrokenSupersessionReferencesError as e:
+        return {
+            "error": str(e),
+            "code": "broken_supersession_references",
             "count": e.count,
         }
     except Exception:
@@ -304,7 +310,7 @@ async def api_delete_memory(memory_id: int, soft: bool = True):
         if result["protected"]:
             return JSONResponse(
                 status_code=409,
-                content={"error": "该记忆仍是合并来源，不能永久删除"},
+                content={"error": "该记忆仍属于合并或版本链，不能永久删除"},
             )
         if not result["deleted"]:
             return JSONResponse(
@@ -888,10 +894,37 @@ async def api_restore_memory(memory_id: int):
         return {"error": "记忆系统未启用"}
 
     try:
-        await db_memories.update_memory_with_layer(memory_id, is_active=True)
+        result = await db_memories.restore_archived_memory(memory_id)
+        if result["status"] == "not_found":
+            return JSONResponse(status_code=404, content={"error": "记忆不存在"})
+        if result["status"] == "superseded":
+            return JSONResponse(
+                status_code=409,
+                content={"error": "该记忆属于版本链，请使用撤销取代"},
+            )
         return {"status": "ok", "id": memory_id}
     except Exception:
         return shared._api_failure("恢复记忆失败")
+
+
+@router.post("/api/memories/{memory_id}/undo-supersede")
+async def api_undo_memory_supersession(memory_id: int):
+    """撤销自动取代：恢复旧记忆，保留后继记忆。"""
+    if not shared.MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+
+    try:
+        result = await db_memories.undo_memory_supersession(memory_id)
+        if result["status"] == "not_found":
+            return JSONResponse(status_code=404, content={"error": "记忆不存在"})
+        if result["status"] == "not_superseded":
+            return JSONResponse(
+                status_code=409,
+                content={"error": "该记忆没有可撤销的取代关系"},
+            )
+        return result
+    except Exception:
+        return shared._api_failure("撤销取代失败")
 
 
 @router.get("/api/memories/layer-stats")
@@ -975,10 +1008,14 @@ async def import_memories(request: Request):
         if not memories:
             return {"error": "没有找到记忆数据，请确认 JSON 格式正确"}
 
-        # v2 版本化备份：完整恢复三层结构、日期和合并关系
-        if data.get("schema_version") == 2:
+        # v2/v3 版本化备份：v3 额外恢复自动取代版本链
+        schema_version = data.get("schema_version")
+        if schema_version in (2, 3):
             try:
-                return await db_memories.import_memories_v2(memories)
+                return await db_memories.import_memories_v2(
+                    memories,
+                    schema_version=schema_version,
+                )
             except ValueError as e:
                 return {"error": f"备份校验失败：{e}"}
 
