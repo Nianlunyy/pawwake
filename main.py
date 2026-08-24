@@ -40,6 +40,12 @@ from routes.partition import router as partition_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """初始化持久化配置；记忆关闭时仍保留 Dashboard 与对话线状态。"""
+    if "MEMORY_EXTRACT_ENABLED" in os.environ:
+        print(
+            "⚠️  MEMORY_EXTRACT_ENABLED 已移除并被忽略；"
+            "请改用 MEMORY_EXTRACT_INTERVAL=0 停止自动提取，"
+            "MAX_MEMORIES_INJECT=0 停止自动注入"
+        )
     if not shared.DATABASE_ENABLED:
         print("ℹ️  数据库总闸已关闭；跳过数据库初始化并进入纯转发模式")
         yield
@@ -58,6 +64,7 @@ async def lifespan(app: FastAPI):
                     "API_BASE_URL": str, "API_KEY": str, "DEFAULT_MODEL": str,
                     "MEMORY_ENABLED": lambda v: shared._parse_bool(v),
                     "MAX_MEMORIES_INJECT": int, "MAX_CONVERSATIONS_INJECT": int,
+                    "MEMORY_SEEN_TTL_HOURS": lambda v: max(0.0, float(v)),
                     "CONVERSATION_SEEN_TTL_HOURS": lambda v: max(0.0, float(v)),
                     "MEMORY_EXTRACT_INTERVAL": int,
                     "CACHE_PARTITION_ENABLED": lambda v: shared._parse_bool(v),
@@ -114,8 +121,6 @@ async def lifespan(app: FastAPI):
         if shared.MEMORY_ENABLED:
             count = await db_memories.get_all_memories_count()
             print(f"✅ 记忆系统已启动，当前记忆数量：{count}")
-            if not shared.MEMORY_EXTRACT_ENABLED:
-                print(f"ℹ️  记忆提取+注入已关闭（MEMORY_EXTRACT_ENABLED=false）")
         else:
             print("ℹ️  记忆系统已关闭；Dashboard 配置与对话线状态仍可用")
 
@@ -151,7 +156,7 @@ async def lifespan(app: FastAPI):
 
 
 
-app = FastAPI(title="Pawwake", version="4.1.0", lifespan=lifespan)
+app = FastAPI(title="Pawwake", version="4.1.1", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 app.middleware("http")(auth.gateway_auth_middleware)
 
@@ -178,7 +183,7 @@ if __name__ == "__main__":
     print(f"💬 对话持久化：{'开启' if shared.conversation_persistence_enabled() else '关闭'}")
     print(f"🧠 记忆系统：{'开启' if shared.MEMORY_ENABLED else '关闭'}")
     if shared.MEMORY_ENABLED:
-        print(f"📝 记忆提取+注入：{'开启' if shared.MEMORY_EXTRACT_ENABLED else '关闭'}")
+        print(f"📚 记忆自动注入：{'禁用' if shared.MAX_MEMORIES_INJECT <= 0 else f'每轮最多 {shared.MAX_MEMORIES_INJECT} 条'}")
     print(f"🔄 记忆提取间隔：{'禁用' if shared.MEMORY_EXTRACT_INTERVAL == 0 else '每轮提取' if shared.MEMORY_EXTRACT_INTERVAL == 1 else f'每 {shared.MEMORY_EXTRACT_INTERVAL} 轮提取一次'}")
     if shared.CACHE_PARTITION_ENABLED:
         print(f"🔒 分区缓存：开启 (X={shared.CACHE_PARTITION_X}, session={shared.PARTITION_SESSION_ID or '未设置'})")

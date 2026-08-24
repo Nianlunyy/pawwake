@@ -253,6 +253,32 @@ def _active_seen_fragment_ids(seen_fragment_times, ttl_hours: float, now=None) -
     return sorted(set(active))
 
 
+def _active_seen_memory_ids(seen_memory_times, ttl_hours: float, now=None) -> list:
+    """Return integer memory IDs whose individual seen timestamps are inside TTL."""
+    active = []
+    for memory_id in _active_seen_fragment_ids(seen_memory_times, ttl_hours, now):
+        try:
+            active.append(int(memory_id))
+        except (TypeError, ValueError):
+            continue
+    return sorted(set(active))
+
+
+async def get_active_seen_memory_ids(session_id: str, ttl_hours: float = 6) -> list:
+    """Read only the memory seen ledger for one partition session."""
+    ttl_hours = float(ttl_hours)
+    if not session_id or ttl_hours <= 0:
+        return []
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        seen_memory_times = await conn.fetchval(
+            """SELECT seen_memory_times
+               FROM session_cache_state WHERE session_id = $1""",
+            session_id,
+        )
+    return _active_seen_memory_ids(seen_memory_times or {}, ttl_hours)
+
+
 async def get_session_cache_state(session_id: str, seen_ttl_hours: float = None) -> dict:
     pool = await db_core.get_pool()
     async with pool.acquire() as conn:
@@ -349,6 +375,48 @@ async def mark_fragments_seen(session_id: str, fragment_ids: list, ttl_hours: fl
                        WHERE (active.value #>> '{}')::timestamptz >=
                              NOW() - ($3::double precision * INTERVAL '1 hour')
                    ) || EXCLUDED.seen_fragment_times,
+                   updated_at = NOW()""",
+            session_id, fresh_seen, ttl_hours,
+        )
+    return len(ids)
+
+
+async def mark_memories_seen(session_id: str, memory_ids: list, ttl_hours: float = 6):
+    """成功请求结束后原子合并已注入 memory id，不覆盖分区与对话召回状态。"""
+    ids = sorted({
+        int(value)
+        for value in memory_ids
+        if isinstance(value, int) and not isinstance(value, bool)
+    })
+    ttl_hours = float(ttl_hours)
+    if not session_id or not ids or ttl_hours <= 0:
+        return 0
+    seen_at = datetime.now(dt_timezone.utc).isoformat()
+    fresh_seen = json.dumps(
+        {str(memory_id): seen_at for memory_id in ids},
+        ensure_ascii=False,
+    )
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO session_cache_state (
+                   session_id, seen_memory_times, updated_at
+               ) VALUES ($1, $2::jsonb, NOW())
+               ON CONFLICT (session_id) DO UPDATE
+               SET seen_memory_times = (
+                       SELECT COALESCE(
+                           jsonb_object_agg(active.key, active.value),
+                           '{}'::jsonb
+                       )
+                       FROM jsonb_each(
+                           COALESCE(
+                               session_cache_state.seen_memory_times,
+                               '{}'::jsonb
+                           )
+                       ) AS active(key, value)
+                       WHERE (active.value #>> '{}')::timestamptz >=
+                             NOW() - ($3::double precision * INTERVAL '1 hour')
+                   ) || EXCLUDED.seen_memory_times,
                    updated_at = NOW()""",
             session_id, fresh_seen, ttl_hours,
         )

@@ -140,15 +140,24 @@ async def get_memory_by_external_id(external_id: str):
     return dict(row) if row else None
 
 
-async def search_memories(query: str, limit: int = 10):
+def _normalize_excluded_ids(exclude_ids) -> list:
+    return sorted({
+        int(value)
+        for value in (exclude_ids or [])
+        if isinstance(value, int) and not isinstance(value, bool)
+    })
+
+
+async def search_memories(query: str, limit: int = 10, exclude_ids=None):
     """
     搜索相关记忆
 
     MEMORY_VECTOR_ENABLED=true 时走混合搜索（关键词 + 向量）
     否则走纯关键词搜索
     """
+    excluded_ids = _normalize_excluded_ids(exclude_ids)
     if shared.MEMORY_VECTOR_ENABLED:
-        return await search_memories_hybrid(query, limit)
+        return await search_memories_hybrid(query, limit, exclude_ids=excluded_ids)
 
     # ---- 纯关键词搜索 ----
     keywords = db_search.extract_search_keywords(query)
@@ -172,7 +181,12 @@ async def search_memories(query: str, limit: int = 10):
         where_parts = [f"content ILIKE '%' || ${i+1} || '%'" for i in range(len(keywords))]
         where_clause = f"is_active = TRUE AND ({' OR '.join(where_parts)})"
 
-        limit_idx = len(keywords) + 1
+        if excluded_ids:
+            exclude_idx = len(params) + 1
+            params.append(excluded_ids)
+            where_clause += f" AND NOT (id = ANY(${exclude_idx}::int[]))"
+
+        limit_idx = len(params) + 1
         params.append(limit)
 
         # 时效天数：事件记忆按本地日历日差（AT TIME ZONE 'UTC' 拿到无时区的 UTC 挂钟，
@@ -233,7 +247,12 @@ def _effective_days_ago(event_date, created_at, now_utc):
     return max(0.0, (now_utc - created_at).total_seconds() / 86400.0)
 
 
-async def search_memories_hybrid(query: str, limit: int = 10, return_mode: bool = False):
+async def search_memories_hybrid(
+    query: str,
+    limit: int = 10,
+    return_mode: bool = False,
+    exclude_ids=None,
+):
     """
     记忆混合搜索：关键词 + 向量，归一化后四维加权
 
@@ -241,6 +260,7 @@ async def search_memories_hybrid(query: str, limit: int = 10, return_mode: bool 
     """
     from datetime import datetime, timezone
 
+    excluded_ids = _normalize_excluded_ids(exclude_ids)
     keywords = db_search.extract_search_keywords(query)
     query_embedding = await db_search.get_query_embedding(query) if shared.EMBEDDING_API_KEY else []
     search_mode = "hybrid" if query_embedding else "keyword"
@@ -265,7 +285,12 @@ async def search_memories_hybrid(query: str, limit: int = 10, return_mode: bool 
             where_parts = [f"content ILIKE '%' || ${i+1} || '%'" for i in range(len(keywords))]
             where_clause = f"is_active = TRUE AND ({' OR '.join(where_parts)})"
 
-            limit_idx = len(keywords) + 1
+            if excluded_ids:
+                exclude_idx = len(params) + 1
+                params.append(excluded_ids)
+                where_clause += f" AND NOT (id = ANY(${exclude_idx}::int[]))"
+
+            limit_idx = len(params) + 1
             params.append(limit * 3)
 
             kw_sql = f"""
@@ -294,20 +319,39 @@ async def search_memories_hybrid(query: str, limit: int = 10, return_mode: bool 
         if query_embedding:
             if db_core.HAS_PGVECTOR:
                 vec_str = '[' + ','.join(str(f) for f in query_embedding) + ']'
-                sem_rows = await conn.fetch("""
-                    SELECT id, content, importance, created_at, event_date,
-                           1 - (embedding <=> $1::vector) as similarity
-                    FROM memories
-                    WHERE embedding IS NOT NULL AND is_active = TRUE
-                    ORDER BY embedding <=> $1::vector
-                    LIMIT $2
-                """, vec_str, limit * 3)
+                if excluded_ids:
+                    sem_rows = await conn.fetch("""
+                        SELECT id, content, importance, created_at, event_date,
+                               1 - (embedding <=> $1::vector) as similarity
+                        FROM memories
+                        WHERE embedding IS NOT NULL AND is_active = TRUE
+                          AND NOT (id = ANY($2::int[]))
+                        ORDER BY embedding <=> $1::vector
+                        LIMIT $3
+                    """, vec_str, excluded_ids, limit * 3)
+                else:
+                    sem_rows = await conn.fetch("""
+                        SELECT id, content, importance, created_at, event_date,
+                               1 - (embedding <=> $1::vector) as similarity
+                        FROM memories
+                        WHERE embedding IS NOT NULL AND is_active = TRUE
+                        ORDER BY embedding <=> $1::vector
+                        LIMIT $2
+                    """, vec_str, limit * 3)
             else:
                 # Python端计算cosine
-                all_mem = await conn.fetch("""
-                    SELECT id, content, importance, created_at, event_date, embedding_json
-                    FROM memories WHERE embedding_json IS NOT NULL AND is_active = TRUE
-                """)
+                if excluded_ids:
+                    all_mem = await conn.fetch("""
+                        SELECT id, content, importance, created_at, event_date, embedding_json
+                        FROM memories
+                        WHERE embedding_json IS NOT NULL AND is_active = TRUE
+                          AND NOT (id = ANY($1::int[]))
+                    """, excluded_ids)
+                else:
+                    all_mem = await conn.fetch("""
+                        SELECT id, content, importance, created_at, event_date, embedding_json
+                        FROM memories WHERE embedding_json IS NOT NULL AND is_active = TRUE
+                    """)
 
                 scored = []
                 for row in all_mem:

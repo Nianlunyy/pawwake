@@ -158,6 +158,7 @@ async def init_tables():
                 a_start_round   INTEGER DEFAULT 0,
                 seen_fragment_ids TEXT[] DEFAULT '{}',
                 seen_fragment_times JSONB DEFAULT '{}'::jsonb,
+                seen_memory_times JSONB DEFAULT '{}'::jsonb,
                 updated_at      TIMESTAMPTZ DEFAULT NOW()
             );
         """)
@@ -168,6 +169,10 @@ async def init_tables():
         await conn.execute("""
             ALTER TABLE session_cache_state
             ADD COLUMN IF NOT EXISTS seen_fragment_times JSONB DEFAULT '{}'::jsonb;
+        """)
+        await conn.execute("""
+            ALTER TABLE session_cache_state
+            ADD COLUMN IF NOT EXISTS seen_memory_times JSONB DEFAULT '{}'::jsonb;
         """)
         await conn.execute("""
             UPDATE session_cache_state AS scs

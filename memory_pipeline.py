@@ -21,7 +21,7 @@ async def build_system_prompt_with_memories(user_message: str, base_prompt: str)
     1. 用用户消息搜索相关记忆
     2. 格式化成文本拼接到人设后面
     """
-    if not shared.MEMORY_ENABLED or not shared.MEMORY_EXTRACT_ENABLED:
+    if not shared.MEMORY_ENABLED:
         return base_prompt
 
     if shared.MAX_MEMORIES_INJECT <= 0:
@@ -79,12 +79,36 @@ async def build_system_prompt_with_memories(user_message: str, base_prompt: str)
         return base_prompt
 
 
-async def build_memory_text(user_message: str) -> str:
-    """搜索记忆并格式化为注入文本（分区缓存模式用）"""
-    if shared.MAX_MEMORIES_INJECT <= 0:
+async def build_memory_text(
+    user_message: str,
+    session_id: str = None,
+    injected_ids: list = None,
+) -> str:
+    """搜索记忆并格式化为注入文本（分区缓存模式用）。"""
+    if (
+        not shared.DATABASE_ENABLED
+        or not shared.MEMORY_ENABLED
+        or shared.MAX_MEMORIES_INJECT <= 0
+    ):
         return ""
     try:
-        memories = await db_memories.search_memories(user_message, limit=shared.MAX_MEMORIES_INJECT)
+        excluded_ids = []
+        if session_id and shared.MEMORY_SEEN_TTL_HOURS > 0:
+            excluded_ids = await db_conversations.get_active_seen_memory_ids(
+                session_id,
+                shared.MEMORY_SEEN_TTL_HOURS,
+            )
+        if excluded_ids:
+            memories = await db_memories.search_memories(
+                user_message,
+                limit=shared.MAX_MEMORIES_INJECT,
+                exclude_ids=excluded_ids,
+            )
+        else:
+            memories = await db_memories.search_memories(
+                user_message,
+                limit=shared.MAX_MEMORIES_INJECT,
+            )
         if not memories:
             return ""
 
@@ -103,6 +127,13 @@ async def build_memory_text(user_message: str) -> str:
                 except:
                     date_str = f"[{str(mem['created_at'])[:10]}] "
             memory_lines.append(f"- {date_str}{mem['content']}")
+
+        if injected_ids is not None:
+            injected_ids.extend(
+                mem["id"]
+                for mem in memories
+                if isinstance(mem.get("id"), int) and not isinstance(mem.get("id"), bool)
+            )
 
         print(f"📚 注入了 {len(memories)} 条相关记忆")
         return (
@@ -308,10 +339,6 @@ async def process_memories_background(
         # 2. 检查是否需要提取记忆
         if not shared.MEMORY_ENABLED:
             print(f"⏭️  记忆系统已关闭；仅保留分区缓存或对话召回所需的对话记录")
-            return
-
-        if not shared.MEMORY_EXTRACT_ENABLED:
-            print(f"⏭️  记忆提取已关闭（MEMORY_EXTRACT_ENABLED=false）")
             return
 
         if shared.MEMORY_EXTRACT_INTERVAL == 0:

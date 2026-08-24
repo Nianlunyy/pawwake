@@ -236,6 +236,10 @@ async def get_settings():
             "MEMORY_API_KEY":          _mask_key(memory_key_raw),
             "MEMORY_MODEL":            db.get("MEMORY_MODEL") or os.environ.get("MEMORY_MODEL", ""),
             "MAX_MEMORIES_INJECT":     int(db.get("MAX_MEMORIES_INJECT") or shared.MAX_MEMORIES_INJECT),
+            "MEMORY_SEEN_TTL_HOURS": float(
+                db.get("MEMORY_SEEN_TTL_HOURS")
+                or shared.MEMORY_SEEN_TTL_HOURS
+            ),
             "MAX_CONVERSATIONS_INJECT": int(
                 db.get("MAX_CONVERSATIONS_INJECT") or shared.MAX_CONVERSATIONS_INJECT
             ),
@@ -320,6 +324,7 @@ async def save_settings(request: Request):
             "MEMORY_API_KEY":        str,
             "MEMORY_ENABLED":        lambda v: shared._parse_bool(v),
             "MAX_MEMORIES_INJECT":   int,
+            "MEMORY_SEEN_TTL_HOURS": lambda v: max(0.0, float(v)),
             "MAX_CONVERSATIONS_INJECT": int,
             "CONVERSATION_SEEN_TTL_HOURS": lambda v: max(0.0, float(v)),
             "MEMORY_EXTRACT_INTERVAL": int,

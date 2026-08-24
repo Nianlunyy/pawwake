@@ -49,6 +49,12 @@ MEMORY_ENABLED = DATABASE_ENABLED and os.getenv("MEMORY_ENABLED", "false").lower
 # 每次注入的最大记忆条数
 MAX_MEMORIES_INJECT = int(os.getenv("MAX_MEMORIES_INJECT", "15"))
 
+# 同一记忆在分区 session 中的自动去重窗口。0 = 不保留 seen 去重状态。
+MEMORY_SEEN_TTL_HOURS = max(
+    0.0,
+    float(os.getenv("MEMORY_SEEN_TTL_HOURS", "6")),
+)
+
 # 分区模式自动注入的最大历史对话片段数。raw API 可逐请求覆盖。
 MAX_CONVERSATIONS_INJECT = int(os.getenv("MAX_CONVERSATIONS_INJECT", "3"))
 
@@ -60,9 +66,6 @@ CONVERSATION_SEEN_TTL_HOURS = max(
 
 # 记忆提取间隔（0 = 禁用自动提取，1 = 每轮提取，N = 每 N 轮提取一次）
 MEMORY_EXTRACT_INTERVAL = int(os.getenv("MEMORY_EXTRACT_INTERVAL", "1"))
-
-# 记忆提取+注入总开关（false时数据库仍连接、消息仍存储，但不提取也不注入记忆）
-MEMORY_EXTRACT_ENABLED = os.getenv("MEMORY_EXTRACT_ENABLED", "true").lower() == "true"
 
 # 分区缓存
 CACHE_PARTITION_ENABLED = DATABASE_ENABLED and os.getenv("CACHE_PARTITION_ENABLED", "false").lower() == "true"

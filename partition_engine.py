@@ -496,7 +496,6 @@ async def build_partitioned_messages(
 
         if (
             shared.MEMORY_ENABLED
-            and shared.MEMORY_EXTRACT_ENABLED
             and user_message
             and memory_text_builder
         ):
@@ -562,7 +561,6 @@ async def _build_basic_cached(
 
         if (
             shared.MEMORY_ENABLED
-            and shared.MEMORY_EXTRACT_ENABLED
             and user_message
             and memory_text_builder
         ):

@@ -37,7 +37,7 @@ async def health_check():
 
     return {
         "status": "running",
-        "gateway": "Pawwake v4.1.0",
+        "gateway": "Pawwake v4.1.1",
         "system_prompt_loaded": len(resolved_system_prompt) > 0,
         "system_prompt_length": len(resolved_system_prompt),
         "database_enabled": shared.DATABASE_ENABLED,
@@ -89,6 +89,7 @@ async def _chat_completions_inner(request: Request):
     body = await request.json()
     messages = body.get("messages", [])
     pending_fragment_ids = []
+    pending_memory_ids = []
 
     # ---------- 检测是否应跳过对话存储 ----------
     # 优先尊重客户端显式声明；无法加 header 的客户端则识别其标题生成模板。
@@ -230,7 +231,7 @@ async def _chat_completions_inner(request: Request):
         print(f"📦 分区模式: DB历史{len(db_msgs)}条 + 客户端消息{len(client_new_msgs)}条")
 
         partition_prompt = resolved_system_prompt
-        if shared.MEMORY_ENABLED and shared.MEMORY_EXTRACT_ENABLED and shared.MAX_MEMORIES_INJECT > 0:
+        if shared.MEMORY_ENABLED and shared.MAX_MEMORIES_INJECT > 0:
             partition_prompt = (resolved_system_prompt or "") + partition_engine.MEMORY_USAGE_GUIDE
         # 保留客户端自带的 system（工具说明等），拼接到网关 prompt 之后，
         # 与非分区路径的行为对齐（前端 system 稳定时不影响 BP1 缓存命中）
@@ -241,13 +242,21 @@ async def _chat_completions_inner(request: Request):
             conversation_recall_text, pending_fragment_ids = (
                 await memory_pipeline.build_conversation_recall_text(user_message, session_id)
             )
+
+            async def build_session_memory_text(message: str):
+                return await memory_pipeline.build_memory_text(
+                    message,
+                    session_id,
+                    pending_memory_ids,
+                )
+
             messages = await partition_engine.build_partitioned_messages(
                 session_id,
                 all_msgs,
                 partition_prompt,
                 user_message,
                 conversation_recall_text,
-                memory_pipeline.build_memory_text,
+                build_session_memory_text,
             )
         except Exception as e:
             print(f"❌ 分区缓存不可用：读取轮转状态失败: {e}")
@@ -264,8 +273,8 @@ async def _chat_completions_inner(request: Request):
 
     else:
         # ---------- 原有逻辑：system prompt + 记忆注入 ----------
-        if not skip_conversation_log and (resolved_system_prompt or (shared.MEMORY_ENABLED and shared.MEMORY_EXTRACT_ENABLED and user_message)):
-            if shared.MEMORY_ENABLED and shared.MEMORY_EXTRACT_ENABLED and user_message:
+        if not skip_conversation_log and (resolved_system_prompt or (shared.MEMORY_ENABLED and user_message)):
+            if shared.MEMORY_ENABLED and user_message:
                 enhanced_prompt = await memory_pipeline.build_system_prompt_with_memories(
                     user_message,
                     resolved_system_prompt,
@@ -342,6 +351,7 @@ async def _chat_completions_inner(request: Request):
                 tool_messages,
                 pending_fragment_ids,
                 extraction_round_count,
+                pending_memory_ids,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
@@ -377,6 +387,16 @@ async def _chat_completions_inner(request: Request):
                     except Exception as e:
                         print(f"⚠️ 对话召回 seen 写入失败，保留待下次重试: {e}")
 
+                if pending_memory_ids:
+                    try:
+                        await db_conversations.mark_memories_seen(
+                            session_id,
+                            pending_memory_ids,
+                            shared.MEMORY_SEEN_TTL_HOURS,
+                        )
+                    except Exception as e:
+                        print(f"⚠️ 记忆注入 seen 写入失败，保留待下次重试: {e}")
+
                 if shared.conversation_persistence_enabled() and (user_message or tool_messages):
                     asyncio.create_task(
                         memory_pipeline.process_memories_background(session_id, user_message, assistant_msg, model,
@@ -407,6 +427,7 @@ async def stream_and_capture(
     tool_messages: list = None,
     pending_fragment_ids: list = None,
     extraction_round_count: int = None,
+    pending_memory_ids: list = None,
 ):
     """流式响应 + 捕获完整回复（原始字节透传，确保SSE格式和thinking数据完整）"""
     full_response = []
@@ -514,6 +535,16 @@ async def stream_and_capture(
             )
         except Exception as e:
             print(f"⚠️ 对话召回 seen 写入失败，保留待下次重试: {e}")
+
+    if stream_succeeded and pending_memory_ids:
+        try:
+            await db_conversations.mark_memories_seen(
+                session_id,
+                pending_memory_ids,
+                shared.MEMORY_SEEN_TTL_HOURS,
+            )
+        except Exception as e:
+            print(f"⚠️ 记忆注入 seen 写入失败，保留待下次重试: {e}")
 
     if stream_usage:
         pt = stream_usage.get("prompt_tokens", 0)

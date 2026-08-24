@@ -1,6 +1,6 @@
 # 🐾 Pawwake · 爪迹
 
-**4.1.0 · Madeleine**
+**4.1.1 · Madeleine**
 
 *Follow the pawprints back.*
 
@@ -114,10 +114,10 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 | `MEMORY_ENABLED` | 开启记忆 | `true` |
 | `MEMORY_MODEL` | 记忆提取、评分、整理共用的模型（推荐便宜的小模型），留空回退到内置默认 | `anthropic/claude-haiku-4.5` |
 | `MEMORY_MAX_TOKENS（可选）` | 记忆提取、评分和整理单批次的输出上限。整理达到上限时会自动拆小批次；提取日志提示截断时可调高此项 | `4000` |
-| `MAX_MEMORIES_INJECT` | 每次注入的最大记忆条数 | `15` |
+| `MAX_MEMORIES_INJECT` | 每次注入的最大记忆条数，`0` 禁用自动注入 | `15` |
+| `MEMORY_SEEN_TTL_HOURS` | 分区模式按 `memories.id` 去重的小时数；成功响应后标记，`0` 关闭 | `6` |
 | `MIN_SCORE_THRESHOLD` | 记忆搜索最低分数阈值，低于此分数的记忆不注入（0=不过滤） | `0.15` |
 | `MEMORY_EXTRACT_INTERVAL` | 记忆提取间隔（0=禁用/1=每轮/N=每 N 轮；N 越大调用越少） | `1` |
-| `MEMORY_EXTRACT_ENABLED（可选）` | 记忆提取+注入总开关，false时只存消息不提取记忆 | `true` |
 | `TIMEZONE_HOURS` | 时区偏移（小时），用于记忆注入时的日期显示 | `8`（UTC+8） |
 | `FORCE_STREAM（可选）` | 强制所有请求走流式传输（解决部分客户端thinking不显示） | `false` |
 | `REASONING_EFFORT（可选）` | 推理强度（low/medium/high），注入请求启用思维链。注意部分模型不支持 medium | 留空不注入 |
@@ -369,6 +369,11 @@ A: 打开 `https://你的网关地址/dashboard`，在「导出备份」页面�
 A: 能。这个项目的第一个部署者就是不会写代码的——代码是 AI 写的，部署是她自己看文档搞定的。
 
 ## 📋 更新日志
+
+### v4.1.1 · Madeleine（2026-08-24）
+
+- **记忆注入短窗去重** — 分区模式按 session 记录实际成功注入的 `memories.id`，默认 6 小时内不重复注入；逐条独立过期并由后排候选递补，客户端取消或上游失败不落账，`MEMORY_SEEN_TTL_HOURS=0` 可关闭
+- **BREAKING：移除重复的自动流水线开关** — 删除 `MEMORY_EXTRACT_ENABLED`；原先设为 `false` 的部署，升级前请改设 `MEMORY_EXTRACT_INTERVAL=0` 与 `MAX_MEMORIES_INJECT=0`。前者禁用自动提取，后者禁用自动注入；消息持久化和手动记忆管理不受影响。旧环境仍保留该变量时，启动日志会说明它已被忽略并给出两个替代键
 
 ### v4.1.0 · Madeleine（2026-08-24）
 
