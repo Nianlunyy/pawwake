@@ -488,13 +488,24 @@ def _completion_metadata(data, max_tokens):
 async def _post_consolidation_completion(client, prompt, model, max_tokens, label):
     """调用整理模型；仅对 429 做有界重试。"""
     last_error = None
+
+    if shared.is_vertex_endpoint() and "/" not in model:
+        model = f"google/{model}"
+
+    headers = {
+        "Authorization": f"Bearer {shared.get_memory_api_key()}",
+        "Content-Type": "application/json"
+    }
+    if shared.is_vertex_endpoint():
+        try:
+            headers["Authorization"] = f"Bearer {shared.get_vertex_access_token()}"
+        except Exception as e:
+            print(f"⚠️ 记忆整理模型 Vertex Token 获取失败: {e}")
+
     for attempt in range(3):
         response = await client.post(
             shared.API_BASE_URL,
-            headers={
-                "Authorization": f"Bearer {shared.get_memory_api_key()}",
-                "Content-Type": "application/json"
-            },
+            headers=headers,
             json={
                 "model": model,
                 "messages": [{"role": "user", "content": prompt}],

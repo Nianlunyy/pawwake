@@ -313,6 +313,18 @@ async def _chat_completions_inner(request: Request):
     if "openrouter" in shared.API_BASE_URL:
         headers["HTTP-Referer"] = shared.EXTRA_REFERER
         headers["X-Title"] = shared.EXTRA_TITLE
+    if shared.is_vertex_endpoint():
+        try:
+            fresh_token = shared.get_vertex_access_token()
+            headers["Authorization"] = f"Bearer {fresh_token}"
+            print(f"🔑 Vertex Token 已注入, 前缀: {fresh_token[:20]}..., 长度: {len(fresh_token)}")
+        except Exception as e:
+            print(f"⚠️ 动态生成 Vertex Token 失败: {e}")
+            from fastapi import HTTPException
+            raise HTTPException(status_code=502, detail=f"Vertex AI 认证令牌获取失败: {str(e)}")
+        if "/" not in body.get("model", ""):
+            body["model"] = f"google/{body['model']}"
+            print(f"🏷️ 已补全 Vertex publisher 前缀: model={body['model']}")
 
     is_stream = body.get("stream", False)
 
@@ -324,12 +336,19 @@ async def _chat_completions_inner(request: Request):
 
     # 注入推理参数（解决客户端走网关时不带reasoning参数的问题）
     if shared.REASONING_EFFORT and not skip_conversation_log:
-        # 统一用 reasoning_effort（Claude/OpenAI/Google Gemini OpenAI兼容端点都支持）
-        # 先删除客户端可能已带的值，确保用我们配置的
         body.pop("reasoning_effort", None)
         body.pop("google", None)
-        body["reasoning_effort"] = shared.REASONING_EFFORT
-        print(f"🧠 注入推理参数: reasoning_effort={shared.REASONING_EFFORT}")
+        if shared.is_vertex_endpoint():
+            body["google"] = {
+                "thinking_config": {
+                    "thinking_level": shared.REASONING_EFFORT,
+                    "include_thoughts": True
+                }
+            }
+            print(f"🧠 注入推理参数(Gemini): thinking_level={shared.REASONING_EFFORT}, include_thoughts=True")
+        else:
+            body["reasoning_effort"] = shared.REASONING_EFFORT
+            print(f"🧠 注入推理参数: reasoning_effort={shared.REASONING_EFFORT}")
 
     print(f"📡 请求: model={model}, stream={is_stream}, memory={'on' if shared.MEMORY_ENABLED else 'off'}", flush=True)
 
@@ -362,6 +381,8 @@ async def _chat_completions_inner(request: Request):
 
             if response.status_code == 200:
                 resp_data = response.json()
+                print(f"🔬 原始响应完整结构: {json.dumps(resp_data.get('choices', [{}])[0].get('message', {}), ensure_ascii=False)[:2000]}")
+                print(f"🔍 完整usage原始数据(排查缓存字段用): {json.dumps(resp_data.get('usage', {}), ensure_ascii=False)}")
                 assistant_msg = ""
                 assistant_tool_calls = None
                 assistant_reasoning = None
@@ -437,6 +458,16 @@ async def stream_and_capture(
     accumulated_tool_calls = {}  # index -> OpenAI-compatible tool call
     stream_succeeded = False
 
+    if shared.is_vertex_endpoint():
+        try:
+            fresh_token = shared.get_vertex_access_token()
+            headers["Authorization"] = f"Bearer {fresh_token}"
+            print(f"🔑 Vertex Token 已注入, 前缀: {fresh_token[:20]}..., 长度: {len(fresh_token)}")
+        except Exception as e:
+            print(f"⚠️ 动态生成 Vertex Token 失败: {e}")
+            from fastapi import HTTPException
+            raise HTTPException(status_code=502, detail=f"Vertex AI 认证令牌获取失败: {str(e)}")
+
     async with httpx.AsyncClient(timeout=300) as client:
         async with client.stream("POST", shared.API_BASE_URL, headers=headers, json=body) as response:
             # 打印上游响应头（排查thinking问题用）
@@ -452,34 +483,45 @@ async def stream_and_capture(
             is_error = response.status_code != 200
 
             async for chunk in response.aiter_bytes():
-                # 原始字节直接透传给客户端
-                yield chunk
-
                 if is_error:
+                    yield chunk
                     error_body_parts.append(chunk)
                     continue
 
-                # 旁路解析：从字节流中提取assistant回复内容，用于后续记忆提取
+                # 旁路解析：按行处理每条SSE事件；命中思考内容（带extra_content标记）时
+                # 改写为reasoning_content字段再转发，其余原样透传
                 text = chunk.decode("utf-8", errors="ignore")
                 line_buffer += text
                 while "\n" in line_buffer:
                     line, line_buffer = line_buffer.split("\n", 1)
-                    line = line.strip()
-                    if line.startswith("data: ") and line != "data: [DONE]":
+                    stripped_line = line.strip()
+                    if stripped_line.startswith("data: ") and stripped_line != "data: [DONE]":
                         try:
-                            data = json.loads(line[6:])
+                            data = json.loads(stripped_line[6:])
 
                             if "usage" in data:
                                 stream_usage = data["usage"]
 
-                            delta = data.get("choices", [{}])[0].get("delta", {})
+                            choices = data.get("choices") or [{}]
+                            delta = choices[0].get("delta", {}) if choices else {}
                             content = delta.get("content", "")
-                            if content:
-                                full_response.append(content)
+                            is_thinking_chunk = "extra_content" in delta and content
 
-                            # 收集reasoning_content（deepseek thinking mode）
+                            if is_thinking_chunk:
+                                full_reasoning.append(content)
+                                delta["reasoning_content"] = content
+                                delta.pop("content", None)
+                                choices[0]["delta"] = delta
+                                data["choices"] = choices
+                                rewritten_line = "data: " + json.dumps(data, ensure_ascii=False)
+                                yield (rewritten_line + "\n").encode("utf-8")
+                            else:
+                                if content:
+                                    full_response.append(content)
+                                yield (line + "\n").encode("utf-8")
+
                             reasoning = delta.get("reasoning_content", "")
-                            if reasoning:
+                            if reasoning and not is_thinking_chunk:
                                 full_reasoning.append(reasoning)
 
                             # 累积tool_calls
@@ -508,8 +550,12 @@ async def stream_and_capture(
                                             if key not in {"name", "arguments"}:
                                                 accumulated_tool_calls[idx]["function"][key] = value
                         except (json.JSONDecodeError, KeyError, IndexError):
-                            pass
-            stream_succeeded = response.status_code == 200
+                            yield (line + "\n").encode("utf-8")
+                    else:
+                        yield (line + "\n").encode("utf-8")
+        if line_buffer:
+            yield line_buffer.encode("utf-8")
+        stream_succeeded = response.status_code == 200
 
     assistant_msg = "".join(full_response)
     assistant_reasoning = "".join(full_reasoning) if full_reasoning else None
@@ -550,6 +596,7 @@ async def stream_and_capture(
         pt = stream_usage.get("prompt_tokens", 0)
         ct = stream_usage.get("completion_tokens", 0)
         tt = stream_usage.get("total_tokens", 0)
+        print(f"🔍 完整usage原始数据(排查缓存字段用): {json.dumps(stream_usage, ensure_ascii=False)}")
         if shared.DATABASE_ENABLED and tt > 0 and not skip_conversation_log:
             asyncio.create_task(db_conversations.save_token_usage(session_id, model, pt, ct, tt))
             print(f"📊 Stream Token: {pt} + {ct} = {tt}")
@@ -563,3 +610,4 @@ async def stream_and_capture(
                                         tool_messages=tool_messages, assistant_tool_calls=assistant_tool_calls,
                                         assistant_reasoning=assistant_reasoning)
         )
+

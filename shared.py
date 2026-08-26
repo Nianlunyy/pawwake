@@ -145,6 +145,45 @@ MEMORY_API_KEY = os.getenv("MEMORY_API_KEY", "")
 def get_memory_api_key() -> str:
     return MEMORY_API_KEY or API_KEY
 
+
+# ---- Vertex AI 动态令牌获取（带缓存）----
+import time as _time
+_cached_vertex_token = None
+_cached_vertex_token_expiry = 0
+
+def get_vertex_access_token() -> str:
+    global _cached_vertex_token, _cached_vertex_token_expiry
+    if _cached_vertex_token and _time.time() < _cached_vertex_token_expiry - 60:
+        return _cached_vertex_token
+    import json as _json
+    import google.auth
+    from google.oauth2 import service_account
+    from google.auth.transport.requests import Request as GoogleAuthRequest
+
+    sa_json_str = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
+    if sa_json_str:
+        info = _json.loads(sa_json_str)
+        credentials = service_account.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+    else:
+        credentials, _ = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+
+    credentials.refresh(GoogleAuthRequest())
+
+    _cached_vertex_token = credentials.token
+    _cached_vertex_token_expiry = (
+        credentials.expiry.timestamp() if credentials.expiry else _time.time() + 50 * 60
+    )
+    return _cached_vertex_token
+
+
+def is_vertex_endpoint() -> bool:
+    """判断当前 API_BASE_URL 是否指向 Vertex AI。"""
+    return "aiplatform.googleapis.com" in API_BASE_URL
+
 def sync_memory_extractor_config():
     """把配置推给 memory_extractor：它在 import 时就把这几个读成了自己的模块级全局，
     之后改 os.environ 或 main 的 globals 都够不着，面板换了模型/换了 key，提取那边

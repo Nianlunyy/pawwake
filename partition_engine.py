@@ -194,10 +194,18 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
         if "openrouter" in shared.API_BASE_URL:
             headers["HTTP-Referer"] = shared.EXTRA_REFERER
             headers["X-Title"] = shared.EXTRA_TITLE
+        summary_model = shared.CACHE_SUMMARY_MODEL
+        if shared.is_vertex_endpoint():
+            try:
+                headers["Authorization"] = f"Bearer {shared.get_vertex_access_token()}"
+            except Exception as e:
+                print(f"⚠️ 摘要模型 Vertex Token 获取失败: {e}")
+            if "/" not in summary_model:
+                summary_model = f"google/{summary_model}"
 
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(shared.API_BASE_URL, headers=headers, json={
-                "model": shared.CACHE_SUMMARY_MODEL,
+                "model": summary_model,
                 # 推理模型的思考也消耗max_tokens，给足空间避免content为空
                 "max_tokens": shared.CACHE_SUMMARY_MAX_TOKENS,
                 "messages": [{"role": "user", "content": prompt}],
@@ -416,7 +424,15 @@ async def build_partitioned_messages(
 
     rotation_count = 0
     max_rotations = CACHE_MAX_ROTATIONS if shared.CACHE_PARTITION_TRIGGER == "time" else 999
-    while _should_rotate(b_rounds_count, X, a_msgs) and rotation_count < max_rotations:
+    # 安全底线：不管追赶式轮转还想推进几次，B区必须至少留1轮。
+    # 防止 time 模式下深度历史+连续快速请求导致 a_start_round 追到没有余量，
+    # 把正在进行中（尤其是等待工具结果）的当前轮次误划进A区，被剥离tool_calls/tool内容。
+    MIN_B_ROUNDS_FLOOR = 1
+    while (
+        _should_rotate(b_rounds_count, X, a_msgs)
+        and rotation_count < max_rotations
+        and (total_rounds - (a_start_round + X)) >= MIN_B_ROUNDS_FLOOR
+    ):
         rotation_count += 1
         trigger_info = f"B区{b_rounds_count}轮 >= X={X}" if shared.CACHE_PARTITION_TRIGGER != "time" else f"A区首条消息超出{shared.CACHE_PARTITION_WINDOW}分钟窗口"
         print(f"🔄 轮转#{rotation_count}: session={session_id}, {trigger_info}")
