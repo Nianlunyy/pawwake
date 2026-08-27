@@ -4,9 +4,9 @@
    配色变量
    ============================================ */
 :root {
-    --primary: #E75A7C;
-    --primary-dark: #d64d6f;
-    --primary-light: #f0899e;
+    --primary: #7768ec;
+    --primary-dark: #6a5ae7;
+    --primary-light: #a398fa;
     --text: #2C363F;
     --text-light: #6B7280;
     --text-muted: #9ca3af;
