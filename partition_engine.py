@@ -416,6 +416,18 @@ async def build_partitioned_messages(
 
     # 计算A/B区（按逻辑轮切片）
     a_end_round = a_start_round + X
+
+    # 保护：如果最新一轮仍在等待工具结果（未闭合），强制把它排除在A区之外，
+    # 不管 a_start_round 算出来的边界落在哪里——避免正在进行中的工具调用
+    # 被误划进候选摘要区、被剥离 tool_calls/tool 内容，导致模型看不到自己的搜索历史，
+    # 反复重新发起搜索（区别于 MIN_B_ROUNDS_FLOOR：那个防的是追赶式轮转掏空B区，
+    # 这个防的是B区自然处于低谷期时，正好撞上进行中的工具调用）。
+    if history and a_end_round >= total_rounds:
+        last_msg = history[-1]
+        round_pending_tool = last_msg.get('role') != 'assistant' or bool(last_msg.get('tool_calls'))
+        if round_pending_tool and total_rounds > 0:
+            a_end_round = max(a_start_round, total_rounds - 1)
+
     a_round_groups = rounds[a_start_round : a_end_round]
     b_round_groups = rounds[a_end_round :]
     a_msgs = [msg for rnd in a_round_groups for msg in rnd]
