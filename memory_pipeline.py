@@ -58,7 +58,7 @@ async def build_system_prompt_with_memories(user_message: str, base_prompt: str)
 {memory_text}
 
 # 记忆应用
-- 像朋友般自然运用这些记忆，不刻意展示
+- 自然运用这些记忆，不刻意展示
 - 仅在相关话题出现时引用，避免主动提及
 - 对重要信息（如健康、日期、约定）保持一致性
 - 新信息与记忆冲突时，以新信息为准
