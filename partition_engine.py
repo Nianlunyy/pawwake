@@ -190,7 +190,7 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
 - 无意义寒暄与重复性原理展开。
 
 # 格式与字数
-- 300-400字，高密度第一人称叙事短句，拒绝干瘪会议纪要。"""
+- 300-400字，高密度第一人称叙事短句，拒绝干瘪会议纪要。
 
 ---
 {conversation_text}
