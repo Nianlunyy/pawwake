@@ -15,7 +15,70 @@ from memory_extractor import extract_memories
 # 记忆注入
 # ============================================================
 
+# 一条到期提醒每次只交给一个请求处理。处理时限要盖过上游 300s 的单次网络等待；
+# 发送期间每隔 RENEW 秒延长时限，进程崩溃后则由下一次请求重新处理
+REMINDER_LEASE_SECONDS = 330
+REMINDER_LEASE_RENEW_SECONDS = 100
+
+
+def _local_minute_text(dt) -> str:
+    try:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone(timedelta(hours=shared.TIMEZONE_HOURS))).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return str(dt)[:16]
+
+
+async def _claim_due_reminders() -> list:
+    """取全部到期提醒并暂时占用，避免并发请求重复处理。
+
+    提醒文本构造成功后才记进 pending；构造失败时立即解除占用。
+    """
+    try:
+        due = await db_memories.claim_due_reminders(REMINDER_LEASE_SECONDS)
+    except Exception as e:
+        print(f"⚠️ 到期提醒读取失败: {e}")
+        return []
+    if due:
+        print(f"⏰ 到期提醒 {len(due)} 条并入本次注入")
+    return due
+
+
+def _commit_reminder_claims(pending_reminder_claims, due: list) -> None:
+    if due and pending_reminder_claims is not None:
+        pending_reminder_claims.extend((mem["id"], mem["reminder_claimed_at"]) for mem in due)
+
+
+async def _release_due_rows(due: list) -> None:
+    if not due:
+        return
+    try:
+        await db_memories.release_reminder_claims([(mem["id"], mem["reminder_claimed_at"]) for mem in due])
+    except Exception as e:
+        print(f"⚠️ 提醒处理权交回失败，等处理时限结束后自动重试: {e}")
+
+
+async def _search_memories_or_empty(user_message: str) -> list:
+    """非分区路径的普通检索单独兜底：失败只影响普通记忆，不影响到期提醒的注入。签名与 4.1.0 相同，不带 exclude_ids。"""
+    try:
+        return await db_memories.search_memories(user_message, limit=shared.MAX_MEMORIES_INJECT) or []
+    except Exception as e:
+        print(f"⚠️  记忆检索失败: {e}")
+        return []
+
+
+def _merge_due_reminders(due: list, memories: list) -> list:
+    """到期提醒排最前，不受关键词/语义门和 seen 去重影响；与搜索结果按 id 去重。"""
+    if not due:
+        return list(memories or [])
+    due_ids = {mem["id"] for mem in due}
+    return list(due) + [mem for mem in (memories or []) if mem.get("id") not in due_ids]
+
+
 def _memory_date_prefix(mem: dict) -> str:
+    if mem.get("remind_at"):
+        return f"[提醒 {_local_minute_text(mem['remind_at'])}] "
     if mem.get("event_date"):
         return f"[{str(mem['event_date'])[:10]}] "
     if mem.get("created_at"):
@@ -29,7 +92,11 @@ def _memory_date_prefix(mem: dict) -> str:
     return ""
 
 
-async def build_system_prompt_with_memories(user_message: str, base_prompt: str) -> str:
+async def build_system_prompt_with_memories(
+    user_message: str,
+    base_prompt: str,
+    pending_reminder_claims: list = None,
+) -> str:
     """
     构建带记忆的 system prompt
     1. 用用户消息搜索相关记忆
@@ -38,12 +105,13 @@ async def build_system_prompt_with_memories(user_message: str, base_prompt: str)
     if not shared.memory_injection_enabled():
         return base_prompt
 
+    # 到期提醒先占用；普通检索失败不影响提醒注入
+    due = await _claim_due_reminders()
+    memories = _merge_due_reminders(due, await _search_memories_or_empty(user_message))
+    if not memories:
+        return base_prompt
+
     try:
-        memories = await db_memories.search_memories(user_message, limit=shared.MAX_MEMORIES_INJECT)
-
-        if not memories:
-            return base_prompt
-
         # 格式化记忆文本（带日期，帮助模型判断新旧）
         # event_date 优先：整理产物的 created_at 是整理当天，真实发生日存在 event_date 里。
         # event_date 本身就是本地日期，不做时区换算
@@ -71,22 +139,28 @@ async def build_system_prompt_with_memories(user_message: str, base_prompt: str)
 
 记忆是丰富对话的工具，而非对话焦点。"""
 
+        # 提醒文本已经进 prompt，才交给本次请求负责
+        _commit_reminder_claims(pending_reminder_claims, due)
         print(f"📚 注入了 {len(memories)} 条相关记忆")
         return enhanced_prompt
 
     except Exception as e:
-        print(f"⚠️  记忆检索失败: {e}，使用纯人设")
+        print(f"⚠️  记忆格式化失败: {e}，使用纯人设")
+        await _release_due_rows(due)
         return base_prompt
-
 
 async def build_memory_text(
     user_message: str,
     session_id: str = None,
     injected_ids: list = None,
+    pending_reminder_claims: list = None,
 ) -> str:
     """搜索记忆并格式化为注入文本（分区缓存模式用）。"""
     if not shared.memory_injection_enabled():
         return ""
+
+    # 到期提醒先占用，不受 seen 去重和检索门限影响；普通检索失败不影响提醒注入
+    due = await _claim_due_reminders()
     try:
         excluded_ids = []
         if session_id and shared.MEMORY_SEEN_TTL_HOURS > 0:
@@ -94,14 +168,20 @@ async def build_memory_text(
                 session_id,
                 shared.MEMORY_SEEN_TTL_HOURS,
             )
-        memories = await db_memories.search_memories(
+        searched = await db_memories.search_memories(
             user_message,
             limit=shared.MAX_MEMORIES_INJECT,
             exclude_ids=excluded_ids,
-        )
-        if not memories:
-            return ""
+        ) or []
+    except Exception as e:
+        print(f"⚠️ 记忆检索失败: {e}")
+        searched = []
 
+    memories = _merge_due_reminders(due, searched)
+    if not memories:
+        return ""
+
+    try:
         memory_lines = []
         for mem in memories:
             memory_lines.append(f"- {_memory_date_prefix(mem)}{mem['content']}")
@@ -109,21 +189,24 @@ async def build_memory_text(
         if injected_ids is not None:
             injected_ids.extend(
                 mem["id"]
-                for mem in memories
+                for mem in searched
                 if isinstance(mem.get("id"), int) and not isinstance(mem.get("id"), bool)
             )
 
-        print(f"📚 注入了 {len(memories)} 条相关记忆")
-        return (
+        text = (
             "<retrieved_memories>\n"
             "以下是网关从过往对话中自动检索的相关记忆，供参考，非用户本次输入：\n"
             + "\n".join(memory_lines)
             + "\n</retrieved_memories>"
         )
+        # 提醒文本已经构造成功，才交给本次请求负责
+        _commit_reminder_claims(pending_reminder_claims, due)
+        print(f"📚 注入了 {len(memories)} 条相关记忆")
+        return text
     except Exception as e:
-        print(f"⚠️ 记忆检索失败: {e}")
+        print(f"⚠️ 记忆格式化失败: {e}")
+        await _release_due_rows(due)
         return ""
-
 
 def _format_recall_timestamp(raw_ts) -> str:
     """召回片段时间前缀：按 TIMEZONE_HOURS（环境变量，启动时生效）转本地时间到分钟。
@@ -390,8 +473,17 @@ async def process_memories_background(
         filtered_memories = []
         for mem in new_memories:
             if mem.get("action") == "duplicate":
-                print(f"⏭️ 跳过重复记忆: {mem['content'][:60]}...")
-                continue
+                if mem.get("remind_at") is None:
+                    print(f"⏭️ 跳过重复记忆: {mem['content'][:60]}...")
+                    continue
+                # 事实已存在但这次新增了明确提醒：给已有候选设提醒，候选无效则按 new 保住这条提醒
+                candidate_id = mem.get("candidate_id")
+                if candidate_id in candidate_ids and await db_memories.set_memory_reminder(
+                    candidate_id, mem["remind_at"]
+                ):
+                    print(f"⏰ 已有记忆 #{candidate_id} 设置提醒 {mem['remind_at']}")
+                    continue
+                mem = {**mem, "action": "new", "candidate_id": None}
             content = mem["content"]
             if any(kw in content for kw in META_BLACKLIST):
                 print(f"🚫 过滤掉meta记忆: {content[:60]}...")
@@ -415,6 +507,7 @@ async def process_memories_background(
                     else None
                 ),
                 candidate_ids=candidate_ids,
+                remind_at=mem.get("remind_at"),
             )
             if result["action"] == "supersede":
                 superseded_count += 1

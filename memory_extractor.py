@@ -10,6 +10,7 @@ v2.3 改进：提取时注入已有记忆，让模型对比后只提取全新信
 import os
 import json
 import httpx
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict
 
 import shared
@@ -60,6 +61,48 @@ def _diagnose_incomplete(finish_reason, completion_tokens, reasoning_tokens) -> 
     )
 
 
+_WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+
+def _local_now():
+    """提取 prompt 用的本地时间快照：一次构造里当前时间、日期对照表和动态示例共用同一个 now。"""
+    return datetime.now(timezone(timedelta(hours=shared.TIMEZONE_HOURS)))
+
+
+def _now_local_text(local) -> str:
+    """写进提取 prompt 的当前本地时间，外加未来十四天的日期对照表：
+    模型自己推"下周三"容易差一天，给它查表比让它算靠谱；十四天保证任何一天看到的"下周X"都在表里。"""
+    sign = "+" if shared.TIMEZONE_HOURS >= 0 else "-"
+    head = f"{local.strftime('%Y-%m-%d %H:%M')} {_WEEKDAYS[local.weekday()]}（UTC{sign}{abs(shared.TIMEZONE_HOURS):02d}:00）"
+    labels = {1: "明天", 2: "后天"}
+    days = []
+    for offset in range(1, 15):
+        day = local + timedelta(days=offset)
+        tag = f"，{labels[offset]}" if offset in labels else ""
+        days.append(f"{day.strftime('%m-%d')} {_WEEKDAYS[day.weekday()]}{tag}")
+    return head + "\n- 未来两周日期对照：" + "；".join(days)
+
+
+def _remind_example(local) -> str:
+    """示例随当前时间生成（明天 15:00 本地），不会变成过去时间。"""
+    return (local + timedelta(days=1)).replace(hour=15, minute=0, second=0, microsecond=0).isoformat()
+
+
+def parse_remind_at(value):
+    """模型给的 remind_at：必须是带时区偏移的 ISO 8601 且在将来，其余一律当 null。"""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    if parsed <= datetime.now(timezone.utc):
+        return None
+    return parsed
+
+
 EXTRACTION_PROMPT = """你是信息提取专家，负责从对话中识别并提取值得长期记住的关键信息。
 
 # 提取重点
@@ -80,6 +123,13 @@ EXTRACTION_PROMPT = """你是信息提取专家，负责从对话中识别并提
 # 提取要求
 - 事件类记忆保留双方的关键原话，用引号标注是谁说的
 - 项目/技术进展只记要点（改了什么、解决了什么），不记调试过程
+
+# 提醒时间（remind_at）
+- 当前本地时间：{now_local}
+- 只有当用户明确要求届时提醒（"提醒我""到时候叫我""别忘了提醒"），或双方明确承诺到了那个时间再提这件事，才填写 remind_at
+- 单纯说到计划、安排、日程、回忆，或时间已经过去，一律填 null；不确定就填 null
+- 格式为带时区偏移的 ISO 8601，如 {remind_example}；相对日期按上面的当前本地时间和日期对照表换算
+- 明确要求提醒但只给了截止日期、没给提醒时点或提前量的（"月底要交报告，你提醒我"），落在截止日当天 00:00；"别让我拖到最后一天"这类话不推成提前，只有用户明确说了"提前一天提醒"之类才往前移
 
 # 不要提取
 - 日常寒暄（"你好""在吗"）
@@ -103,9 +153,10 @@ EXTRACTION_PROMPT = """你是信息提取专家，负责从对话中识别并提
 # 输出格式
 请用以下 JSON 格式返回（不要包含其他内容）：
 [
-  {{"content": "记忆内容", "importance": 分数, "action": "new", "candidate_id": null}},
-  {{"content": "记忆内容", "importance": 分数, "action": "duplicate", "candidate_id": 旧记忆ID}},
-  {{"content": "记忆内容", "importance": 分数, "action": "supersede", "candidate_id": 被取代的旧记忆ID}}
+  {{"content": "记忆内容", "importance": 分数, "action": "new", "candidate_id": null, "remind_at": null}},
+  {{"content": "记忆内容", "importance": 分数, "action": "duplicate", "candidate_id": 旧记忆ID, "remind_at": null}},
+  {{"content": "记忆内容", "importance": 分数, "action": "supersede", "candidate_id": 被取代的旧记忆ID, "remind_at": null}},
+  {{"content": "用户明天下午三点要交报告，让我到时候提醒", "importance": 分数, "action": "new", "candidate_id": null, "remind_at": "{remind_example}"}}
 ]
 
 importance 分数 1-10，10 最重要。
@@ -159,23 +210,21 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
         memories_text = "（暂无已知信息）"
 
     # 把已有记忆填入prompt
-    prompt = EXTRACTION_PROMPT.format(existing_memories=memories_text)
+    local_now = _local_now()
+    prompt = EXTRACTION_PROMPT.format(
+        existing_memories=memories_text,
+        now_local=_now_local_text(local_now),
+        remind_example=_remind_example(local_now),
+    )
 
     # 调用 LLM 提取记忆
     try:
-        headers = {
-            "Authorization": f"Bearer {get_memory_api_key()}",
-            "Content-Type": "application/json",
-        }
-        if "openrouter" in API_BASE_URL:
-            headers["HTTP-Referer"] = shared.EXTRA_REFERER
-            headers["X-Title"] = shared.EXTRA_TITLE
-
         async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(
+            response = await shared.post_chat_completion(
+                client,
                 API_BASE_URL,
-                headers=headers,
-                json={
+                get_memory_api_key(),
+                {
                     "model": MEMORY_MODEL,
                     "max_tokens": MEMORY_MAX_TOKENS,
                     "messages": [
@@ -273,6 +322,7 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
                         "importance": int(mem.get("importance", 5)),
                         "action": action,
                         "candidate_id": candidate_id,
+                        "remind_at": parse_remind_at(mem.get("remind_at")),
                     })
 
             print(f"📝 从对话中提取了 {len(valid_memories)} 条新记忆（已对比 {len(existing_memories or [])} 条已有记忆）")
@@ -319,13 +369,11 @@ async def score_memories(texts: List[str]) -> List[Dict]:
 
     try:
         async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(
+            response = await shared.post_chat_completion(
+                client,
                 API_BASE_URL,
-                headers={
-                    "Authorization": f"Bearer {get_memory_api_key()}",
-                    "Content-Type": "application/json",
-                },
-                json={
+                get_memory_api_key(),
+                {
                     "model": MEMORY_MODEL,
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0,

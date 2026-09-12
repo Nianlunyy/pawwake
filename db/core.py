@@ -206,6 +206,17 @@ async def init_tables():
             ALTER TABLE memories ADD COLUMN IF NOT EXISTS event_date DATE DEFAULT NULL;
         """)
 
+        # remind_at: 对话里明确的未来约定，到期后强制注入一次；claimed/delivered 记录处理时间与送达时间
+        await conn.execute("""
+            ALTER TABLE memories ADD COLUMN IF NOT EXISTS remind_at TIMESTAMPTZ DEFAULT NULL;
+        """)
+        await conn.execute("""
+            ALTER TABLE memories ADD COLUMN IF NOT EXISTS reminder_claimed_at TIMESTAMPTZ DEFAULT NULL;
+        """)
+        await conn.execute("""
+            ALTER TABLE memories ADD COLUMN IF NOT EXISTS reminder_delivered_at TIMESTAMPTZ DEFAULT NULL;
+        """)
+
         # external_id: 调用方提供的稳定幂等键
         await conn.execute("""
             ALTER TABLE memories
@@ -250,6 +261,11 @@ async def init_tables():
         """)
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_memories_event_date ON memories (event_date);
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memories_remind_due
+            ON memories (remind_at)
+            WHERE remind_at IS NOT NULL AND reminder_delivered_at IS NULL;
         """)
 
         # 尝试启用pgvector扩展（向量搜索）

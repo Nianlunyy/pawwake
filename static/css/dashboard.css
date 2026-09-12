@@ -409,6 +409,7 @@ body {
 .col-importance { width: 80px; }
 .col-source { width: 110px; font-size: 12px; color: var(--text-muted); }
 .col-time { width: 160px; font-size: 12px; color: var(--text-muted); }
+.col-time .reminder-tag { margin-top: 4px; font-size: 11px; color: var(--text-muted); white-space: nowrap; }
 .col-actions { width: 150px; }
 
 /* 表格内输入框 */

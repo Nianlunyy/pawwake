@@ -72,6 +72,7 @@ CACHE_PARTITION_ENABLED = DATABASE_ENABLED and os.getenv("CACHE_PARTITION_ENABLE
 CACHE_PARTITION_X = int(os.getenv("CACHE_PARTITION_X", "15"))
 CACHE_SUMMARY_MODEL = os.getenv("CACHE_SUMMARY_MODEL", "")  # 留空=不生成摘要，轮转时A区直接滑出（纯轮转模式）
 CACHE_SUMMARY_MAX_TOKENS = int(os.getenv("CACHE_SUMMARY_MAX_TOKENS", "2000"))  # 摘要输出上限，跟记忆提取的 MEMORY_MAX_TOKENS 各管各的。失败日志拿它当分母
+CACHE_SUMMARY_BUDGET_CHARS = int(os.getenv("CACHE_SUMMARY_BUDGET_CHARS", "8000"))  # 摘要区总字符预算，超过才折叠最旧的段；0=不折叠（旧行为）
 CACHE_PARTITION_TRIGGER = os.getenv("CACHE_PARTITION_TRIGGER", "rounds")  # rounds=按轮次 | time=按时间窗口
 CACHE_PARTITION_WINDOW = int(os.getenv("CACHE_PARTITION_WINDOW", "30"))  # 时间窗口（分钟），仅 trigger=time 时生效
 CACHE_TTL = os.getenv("CACHE_TTL", "5m")  # 缓存TTL：5m(默认) | 1h。1h写入费2x(5m是1.25x)读都0.1x，消息间隔常超5分钟的慢聊场景1h更划算
@@ -130,7 +131,7 @@ MEMORY_HW_KEYWORD = float(os.getenv("MEMORY_HW_KEYWORD", "0.35"))
 MEMORY_HW_SEMANTIC = float(os.getenv("MEMORY_HW_SEMANTIC", "0.35"))
 MEMORY_HW_IMPORTANCE = float(os.getenv("MEMORY_HW_IMPORTANCE", "0.15"))
 MEMORY_HW_RECENCY = float(os.getenv("MEMORY_HW_RECENCY", "0.15"))
-MEMORY_SEMANTIC_THRESHOLD = float(os.getenv("MEMORY_SEMANTIC_THRESHOLD", "0.5"))
+MEMORY_SEMANTIC_THRESHOLD = float(os.getenv("MEMORY_SEMANTIC_THRESHOLD", "0.7"))
 
 # 非分区模式没有稳定 session 历史，保留进程内提取计数。
 _nonpartition_round_counter = 0
@@ -162,6 +163,7 @@ SETTINGS_TYPES = {
     "CACHE_PARTITION_TRIGGER": str,
     "CACHE_PARTITION_WINDOW": int,
     "CACHE_SUMMARY_MODEL": str,
+    "CACHE_SUMMARY_BUDGET_CHARS": lambda value: max(0, int(value)),
     "CACHE_TTL": str,
     "FORCE_STREAM": lambda value: _parse_bool(value),
     "REASONING_EFFORT": str,
@@ -203,6 +205,17 @@ def sync_memory_extractor_config():
 # 额外的请求头（有些 API 需要，比如 OpenRouter 需要 Referer）
 EXTRA_REFERER = os.getenv("EXTRA_REFERER", "https://github.com/garan0613/pawwake")
 EXTRA_TITLE = os.getenv("EXTRA_TITLE", "Pawwake")
+
+
+async def post_chat_completion(client, url, api_key, payload):
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    if "openrouter" in url:
+        headers["HTTP-Referer"] = EXTRA_REFERER
+        headers["X-Title"] = EXTRA_TITLE
+    return await client.post(url, headers=headers, json=payload)
 
 
 # ============================================================
