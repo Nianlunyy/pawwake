@@ -26,6 +26,11 @@ let currentMemoryStatus = 'active';
 let memoryLayerStats = null;
 let memCurrentPage = 1;
 let manageMsgTimer = null;
+let mergeMemoryIds = [];
+let organizeDrafts = [];
+let currentOrganizeDraftIndex = null;
+let organizePollTimer = null;
+let organizeConfirming = false;
 const MEM_PER_PAGE = 50;
 
 const LAYER_NAMES = {
@@ -125,6 +130,7 @@ function switchMemoryStatus(status) {
     });
     document.getElementById('consolidateBtn').style.display = status === 'active' ? '' : 'none';
     document.getElementById('semanticSearchBtn').style.display = status === 'active' ? '' : 'none';
+    document.getElementById('coreCandidatesBtn').style.display = status === 'active' ? '' : 'none';
     document.getElementById('cleanupArchivedCard').style.display = status === 'archived' ? '' : 'none';
     updateLayerCounts(memoryLayerStats);
     filterAndSort();
@@ -186,6 +192,9 @@ function renderTable(mems, startIndex) {
         const rowClass = isInactive ? 'inactive-row' : '';
         const titleDisplay = m.title || '';
         const mergedFrom = m.merged_from || [];
+        const candidateInfo = m.candidate_reasons && m.candidate_reasons.length
+            ? '<small class="form-hint">候选：' + escHtml(m.candidate_reasons.join('；')) + '</small>'
+            : '';
         
         // 层级下拉选择器
         const layerSelect = '<select class="layer-select" id="l_' + m.id + '" onchange="changeLayer(' + m.id + ')">' +
@@ -215,6 +224,9 @@ function renderTable(mems, startIndex) {
         if (layer === 2 && mergedFrom.length > 0) {
             revertBtn = '<button class="btn btn-warning btn-sm" onclick="revertMerge(' + m.id + ')">撤回</button>';
         }
+        const promoteBtn = candidateInfo
+            ? '<button class="btn btn-success btn-sm" onclick="promoteCandidate(' + m.id + ')">升级核心</button>'
+            : '';
         
         // 恢复按钮（只有已归档的记忆显示）
         let restoreBtn = '';
@@ -233,12 +245,15 @@ function renderTable(mems, startIndex) {
             '<td class="col-check"><input type="checkbox" class="mem-check" value="' + m.id + '" onchange="updateFloatingBar()"></td>' +
             '<td class="col-id">' + (startIndex + i + 1) + mergeInfo + versionInfo + '</td>' +
             '<td class="col-layer">' + layerSelect + '</td>' +
-            '<td class="col-title"><input type="text" class="title-input" id="t_' + m.id + '" value="' + escHtml(titleDisplay) + '" placeholder="无标题"></td>' +
+            '<td class="col-title"><input type="text" class="title-input" id="t_' + m.id + '" value="' + escHtml(titleDisplay) + '" placeholder="无标题">' + candidateInfo + '</td>' +
             '<td class="col-content"><textarea class="content-textarea" id="c_' + m.id + '">' + escHtml(m.content) + '</textarea></td>' +
             '<td class="col-importance"><input type="number" class="importance-input" id="i_' + m.id + '" value="' + m.importance + '" min="1" max="10"></td>' +
-            '<td class="col-time">' + fmtTime(m.event_date || m.created_at) + '</td>' +
+            '<td class="col-time">' + fmtTime(m.event_date || m.created_at) +
+                (m.remind_at ? '<div class="reminder-tag" title="到期后自动注入一次">⏰ ' + escHtml(m.remind_at.slice(0, 16)) + (m.reminder_delivered_at ? '（已提醒）' : '') + '</div>' : '') +
+            '</td>' +
             '<td class="col-actions"><div class="row-actions">' +
                 '<button class="btn btn-primary btn-sm" onclick="saveMem(' + m.id + ')">保存</button>' +
+                promoteBtn +
                 revertBtn +
                 restoreBtn +
                 deleteBtn +
@@ -784,12 +799,14 @@ async function revertMerge(id) {
 // ============================================
 // 合并弹窗
 // ============================================
-function openMergeModal() {
-    const checked = [...document.querySelectorAll('.mem-check:checked')].map(c => parseInt(c.value));
-    if (checked.length < 2) {
+function openMergeModal(draft = null, draftIndex = null) {
+    const checked = draft?.source_ids || [...document.querySelectorAll('.mem-check:checked')].map(c => parseInt(c.value));
+    if (checked.length < 2 && !draft) {
         showManageMsg('error', '请至少选择 2 条记忆进行合并');
         return;
     }
+    mergeMemoryIds = [...checked];
+    currentOrganizeDraftIndex = draftIndex;
     
     const selectedContents = checked.map(id => {
         const mem = allMemories.find(m => m.id === id);
@@ -797,20 +814,42 @@ function openMergeModal() {
     }).join('\n\n---\n\n');
     
     document.getElementById('mergeCount').textContent = checked.length;
-    document.getElementById('mergeContent').value = selectedContents;
+    document.getElementById('mergeContent').value = draft?.content ?? selectedContents;
     document.getElementById('mergeContent').placeholder = '请编辑合并后的完整描述...';
-    document.getElementById('mergeTitle').value = '';
-    document.getElementById('mergeImportance').value = '5';
-    document.getElementById('mergeLayer').value = '2';
+    document.getElementById('mergeTitle').value = draft?.title || '';
+    document.getElementById('mergeImportance').value = String(draft?.importance ?? 5);
+    document.getElementById('mergeLayer').value = String(draft?.layer ?? 2);
+    document.getElementById('consolidateModal').style.display = 'none';
     document.getElementById('mergeModal').style.display = 'flex';
 }
 
-function closeMergeModal() {
+function closeMergeModal(reopenOrganizer = true) {
+    const cameFromOrganizer = currentOrganizeDraftIndex !== null;
     document.getElementById('mergeModal').style.display = 'none';
+    mergeMemoryIds = [];
+    currentOrganizeDraftIndex = null;
+    if (cameFromOrganizer && reopenOrganizer) {
+        document.getElementById('consolidateModal').style.display = 'flex';
+    }
+}
+
+async function submitMemoryMerge(draft) {
+    const resp = await fetch('/api/memories/merge', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+            ids: draft.source_ids,
+            title: draft.title || '',
+            content: draft.content,
+            importance: draft.importance ?? 5,
+            layer: draft.layer ?? 2
+        })
+    });
+    return await resp.json();
 }
 
 async function doMerge() {
-    const checked = [...document.querySelectorAll('.mem-check:checked')].map(c => parseInt(c.value));
+    const checked = [...mergeMemoryIds];
     const title = document.getElementById('mergeTitle').value.trim();
     const content = document.getElementById('mergeContent').value.trim();
     const importance = parseInt(document.getElementById('mergeImportance').value);
@@ -818,19 +857,75 @@ async function doMerge() {
     
     if (!content) { showManageMsg('error', '请输入合并后的内容'); return; }
     try {
-        const resp = await fetch('/api/memories/merge', {
+        const draftIndex = currentOrganizeDraftIndex;
+        const data = await submitMemoryMerge({
+            source_ids: checked,
+            title,
+            content,
+            importance,
+            layer
+        });
+        if (data.error) {
+            showManageMsg('error', '❌ ' + data.error);
+        } else {
+            showManageMsg('success', '✅ 已合并 ' + data.merged + ' 条为新记忆');
+            closeMergeModal(false);
+            clearSelection();
+            await loadMemories();
+            if (draftIndex !== null) {
+                organizeDrafts.splice(draftIndex, 1);
+                renderOrganizeDrafts();
+                document.getElementById('consolidateModal').style.display = 'flex';
+            }
+        }
+    } catch(e) {
+        showManageMsg('error', '❌ ' + e.message);
+    }
+}
+
+async function showCoreCandidates() {
+    document.getElementById('stats').textContent = '候选分析中...';
+    try {
+        const resp = await fetch('/api/memories/core-candidates');
+        const data = await resp.json();
+        if (data.error) {
+            showManageMsg('error', '❌ ' + data.error);
+            return;
+        }
+        renderTable(data.candidates || []);
+        const paginationEl = document.getElementById('mem-pagination');
+        if (paginationEl) paginationEl.innerHTML = '';
+        const stats = document.getElementById('stats');
+        stats.textContent = '核心候选 ' + data.total + ' 条  ';
+        const backLink = document.createElement('a');
+        backLink.href = '#';
+        backLink.textContent = '返回全部';
+        backLink.addEventListener('click', event => {
+            event.preventDefault();
+            filterAndSort();
+        });
+        stats.appendChild(backLink);
+    } catch(e) {
+        showManageMsg('error', '❌ ' + e.message);
+    }
+}
+
+async function promoteCandidate(id) {
+    const title = document.getElementById('t_' + id)?.value || null;
+    if (!confirm('确定将这条候选升级为核心记忆？')) return;
+    try {
+        const resp = await fetch('/api/memories/' + id + '/promote', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ ids: checked, title, content, importance, layer })
+            body: JSON.stringify({title})
         });
         const data = await resp.json();
         if (data.error) {
             showManageMsg('error', '❌ ' + data.error);
         } else {
-            showManageMsg('success', '✅ 已合并 ' + data.merged + ' 条为新记忆');
-            closeMergeModal();
-            clearSelection();
-            loadMemories();
+            showManageMsg('success', '✅ 已升级为核心记忆');
+            await loadMemories();
+            await showCoreCandidates();
         }
     } catch(e) {
         showManageMsg('error', '❌ ' + e.message);
@@ -841,6 +936,15 @@ async function doMerge() {
 // 整理弹窗
 // ============================================
 function openConsolidateModal() {
+    const selected = [...document.querySelectorAll('.mem-check:checked')]
+        .map(checkbox => parseInt(checkbox.value));
+    const selectedOption = document.getElementById('consolidateSelectedOption');
+    selectedOption.disabled = selected.length < 2;
+    selectedOption.textContent = '整理当前选中（' + selected.length + ' 条）';
+    document.getElementById('consolidateSelectedCount').textContent = selected.length;
+    document.getElementById('consolidateMode').value = selected.length >= 2 ? 'selected' : 'date';
+    updateConsolidateMode();
+    renderOrganizeDrafts();
     document.getElementById('consolidateModal').style.display = 'flex';
 }
 
@@ -848,66 +952,230 @@ function closeConsolidateModal() {
     document.getElementById('consolidateModal').style.display = 'none';
 }
 
-async function doConsolidate() {
-    const startDate = document.getElementById('consolidateDateStart').value;
-    const endDate = document.getElementById('consolidateDateEnd').value;
-    
-    if (!startDate || !endDate) { 
-        showManageMsg('error', '请选择开始和结束日期'); 
-        return; 
+function updateConsolidateMode() {
+    const selectedMode = document.getElementById('consolidateMode').value === 'selected';
+    document.getElementById('consolidateSelectedFields').style.display = selectedMode ? '' : 'none';
+    document.getElementById('consolidateDateFields').style.display = selectedMode ? 'none' : '';
+}
+
+function renderOrganizeDrafts() {
+    const container = document.getElementById('consolidateDrafts');
+    const confirmAllButton = document.getElementById('confirmAllOrganizeBtn');
+    const generateButton = document.getElementById('consolidateGenerateBtn');
+    const bulkDraftCount = organizeDrafts.filter(draft => !draft.contains_core_source).length;
+    confirmAllButton.style.display = bulkDraftCount ? '' : 'none';
+    confirmAllButton.disabled = organizeConfirming;
+    if (!generateButton.disabled) {
+        generateButton.textContent = organizeDrafts.length ? '重新生成' : '生成预览';
+        generateButton.className = organizeDrafts.length ? 'btn btn-secondary' : 'btn btn-primary';
     }
-    if (startDate > endDate) {
-        showManageMsg('error', '开始日期不能晚于结束日期');
+    if (!organizeDrafts.length) {
+        container.innerHTML = '';
         return;
     }
-    
-    showManageMsg('info', '正在提交整理任务...');
-    closeConsolidateModal();
+    const disabled = organizeConfirming ? ' disabled' : '';
+    container.innerHTML = '<h4 style="margin-bottom: 10px;">待确认草稿</h4>' + organizeDrafts.map((draft, index) => {
+        const title = escapeHtml(draft.title || '未命名草稿');
+        const content = escapeHtml(draft.content || '');
+        const layer = LAYER_NAMES[draft.layer] || '事件';
+        const sourceCount = Array.isArray(draft.source_ids) ? draft.source_ids.length : 0;
+        const coreNotice = draft.contains_core_source ? ' · 含核心来源，需单独确认' : '';
+        const error = draft.confirm_error
+            ? `<div style="color:var(--danger); margin-bottom:10px;">确认失败：${escapeHtml(draft.confirm_error)}</div>`
+            : '';
+        return `
+            <div class="card" style="margin-bottom: 10px; padding: 14px;">
+                <div style="display:flex; justify-content:space-between; gap:12px; margin-bottom:8px;">
+                    <strong>${title}</strong>
+                    <span style="color:var(--text-muted); font-size:13px;">${sourceCount} 条来源 · 默认${layer} · 重要度 ${draft.importance ?? 5}${coreNotice}</span>
+                </div>
+                <div style="white-space:pre-wrap; line-height:1.6; margin-bottom:10px;">${content}</div>
+                ${error}
+                <div style="display:flex; justify-content:flex-end; gap:8px;">
+                    <button class="btn btn-secondary btn-sm" onclick="skipOrganizeDraft(${index})"${disabled}>跳过</button>
+                    <button class="btn btn-secondary btn-sm" onclick="editOrganizeDraft(${index})"${disabled}>编辑</button>
+                    <button class="btn btn-primary btn-sm" onclick="confirmOrganizeDraft(${index})"${disabled}>确认</button>
+                </div>
+            </div>`;
+    }).join('');
+}
+
+function skipOrganizeDraft(index) {
+    if (organizeConfirming) return;
+    organizeDrafts.splice(index, 1);
+    renderOrganizeDrafts();
+}
+
+function editOrganizeDraft(index) {
+    if (organizeConfirming) return;
+    const draft = organizeDrafts[index];
+    if (draft) openMergeModal(draft, index);
+}
+
+function setOrganizeConfirming(confirming) {
+    organizeConfirming = confirming;
+    document.getElementById('consolidateGenerateBtn').disabled = confirming;
+    renderOrganizeDrafts();
+}
+
+async function confirmOrganizeDraft(index) {
+    if (organizeConfirming) return;
+    const draft = organizeDrafts[index];
+    if (!draft) return;
+
+    delete draft.confirm_error;
+    setOrganizeConfirming(true);
+    try {
+        const data = await submitMemoryMerge(draft);
+        if (data.error) {
+            draft.confirm_error = data.error;
+            showManageMsg('error', '❌ 确认失败：' + data.error);
+        } else {
+            organizeDrafts.splice(index, 1);
+            await loadMemories();
+            showManageMsg('success', '✅ 已确认草稿并合并 ' + data.merged + ' 条来源');
+        }
+    } catch(e) {
+        draft.confirm_error = e.message;
+        showManageMsg('error', '❌ 确认失败：' + e.message);
+    } finally {
+        setOrganizeConfirming(false);
+    }
+}
+
+async function confirmAllOrganizeDrafts() {
+    if (organizeConfirming || !organizeDrafts.length) return;
+    const drafts = [...organizeDrafts];
+    const bulkDrafts = drafts.filter(draft => !draft.contains_core_source);
+    const coreDraftCount = drafts.length - bulkDrafts.length;
+    if (!bulkDrafts.length) {
+        showManageMsg('info', '含核心来源的草稿需要单独确认');
+        return;
+    }
+    const coreNotice = coreDraftCount ? '；另有 ' + coreDraftCount + ' 组含核心来源，将保留待单独确认' : '';
+    if (!confirm('将按当前草稿确认 ' + bulkDrafts.length + ' 组，写入 ' + bulkDrafts.length + ' 条记忆并归档各组来源' + coreNotice + '。继续？')) return;
+
+    setOrganizeConfirming(true);
+    const failed = [];
+    let confirmed = 0;
+    try {
+        for (let index = 0; index < bulkDrafts.length; index++) {
+            const draft = bulkDrafts[index];
+            delete draft.confirm_error;
+            document.getElementById('confirmAllOrganizeBtn').textContent = '确认中 ' + (index + 1) + '/' + bulkDrafts.length;
+            try {
+                const data = await submitMemoryMerge(draft);
+                if (data.error) {
+                    draft.confirm_error = data.error;
+                    failed.push(draft);
+                } else {
+                    confirmed++;
+                }
+            } catch(e) {
+                draft.confirm_error = e.message;
+                failed.push(draft);
+            }
+        }
+        organizeDrafts = drafts.filter(draft => draft.contains_core_source || failed.includes(draft));
+        await loadMemories();
+        if (failed.length) {
+            const coreResult = coreDraftCount ? '，' + coreDraftCount + ' 组含核心来源待单独确认' : '';
+            showManageMsg('error', '⚠️ 已确认 ' + confirmed + ' 组，' + failed.length + ' 组失败' + coreResult + '，原因已标在草稿上');
+        } else if (coreDraftCount) {
+            showManageMsg('success', '✅ 已确认 ' + confirmed + ' 组，' + coreDraftCount + ' 组含核心来源，已保留待单独确认');
+        } else {
+            showManageMsg('success', '✅ 已确认全部 ' + confirmed + ' 组草稿');
+        }
+    } finally {
+        document.getElementById('confirmAllOrganizeBtn').textContent = '全部确认';
+        setOrganizeConfirming(false);
+    }
+}
+
+async function doConsolidate() {
+    if (organizeConfirming) return;
+    const mode = document.getElementById('consolidateMode').value;
+    let payload;
+    if (mode === 'selected') {
+        const ids = [...document.querySelectorAll('.mem-check:checked')]
+            .map(checkbox => parseInt(checkbox.value));
+        if (ids.length < 2) {
+            showManageMsg('error', '请至少选择 2 条记忆');
+            return;
+        }
+        payload = {ids};
+    } else {
+        const startDate = document.getElementById('consolidateDateStart').value;
+        const endDate = document.getElementById('consolidateDateEnd').value;
+        if (!startDate || !endDate) {
+            showManageMsg('error', '请选择开始和结束日期');
+            return;
+        }
+        if (startDate > endDate) {
+            showManageMsg('error', '开始日期不能晚于结束日期');
+            return;
+        }
+        payload = {start_date: startDate, end_date: endDate};
+    }
+
+    if (organizeDrafts.length && !confirm('重新生成会丢弃当前 ' + organizeDrafts.length + ' 组待确认草稿。继续？')) return;
+
+    const button = document.getElementById('consolidateGenerateBtn');
+    organizeDrafts = [];
+    renderOrganizeDrafts();
+    button.disabled = true;
+    button.textContent = '生成中...';
+    showManageMsg('info', '正在生成整理草稿...');
     try {
         const resp = await fetch('/api/memories/consolidate', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({start_date: startDate, end_date: endDate})
+            body: JSON.stringify(payload)
         });
         const data = await resp.json();
         if (data.error) {
             showManageMsg('error', '❌ ' + data.error);
+            button.disabled = false;
+            button.textContent = '生成预览';
             return;
         }
-        if (data.status === 'already_running') {
-            showManageMsg('info', '⏳ 整理任务正在运行中...');
-        } else {
-            showManageMsg('info', '⏳ 整理任务已启动，后台处理中...');
-        }
-        // 轮询状态
-        const pollInterval = setInterval(async () => {
+        showManageMsg('info', data.status === 'already_running'
+            ? '⏳ 整理任务正在运行中...'
+            : '⏳ 正在生成整理草稿...');
+        if (organizePollTimer) clearInterval(organizePollTimer);
+        organizePollTimer = setInterval(async () => {
             try {
                 const statusResp = await fetch('/api/memories/consolidate/status');
                 const status = await statusResp.json();
                 if (status.running) {
                     showManageMsg('info', '⏳ 整理进行中（' + (status.started_at || '') + '）...');
-                } else {
-                    clearInterval(pollInterval);
-                    if (status.error) {
-                        showManageMsg('error', '❌ 整理失败: ' + status.error);
-                    } else if (status.result) {
-                        const r = status.result;
-                        if (r.status === 'no_fragments') {
-                            showManageMsg('info', '📝 该时间段没有需要整理的碎片记忆');
-                        } else if (r.status === 'ok') {
-                            showManageMsg('success', '✅ 整理完成！处理了 ' + r.fragments_processed + ' 条碎片，生成了 ' + r.events_created + ' 条事件记忆');
-                            loadMemories();
-                        } else if (r.status === 'error') {
-                            showManageMsg('error', '❌ ' + (r.error || '未知错误'));
-                        }
-                    }
+                    return;
+                }
+                clearInterval(organizePollTimer);
+                organizePollTimer = null;
+                button.disabled = false;
+                button.textContent = '生成预览';
+                if (status.error) {
+                    showManageMsg('error', '❌ 整理失败: ' + status.error);
+                } else if (status.result?.status === 'no_memories') {
+                    showManageMsg('info', '📝 该时间段没有需要整理的碎片或事件记忆');
+                } else if (status.result?.status === 'ok') {
+                    organizeDrafts = status.result.drafts || [];
+                    renderOrganizeDrafts();
+                    document.getElementById('consolidateModal').style.display = 'flex';
+                    showManageMsg('success', '✅ 已生成 ' + organizeDrafts.length + ' 条待确认草稿');
                 }
             } catch(e) {
-                clearInterval(pollInterval);
+                clearInterval(organizePollTimer);
+                organizePollTimer = null;
+                button.disabled = false;
+                button.textContent = '生成预览';
                 showManageMsg('error', '❌ 状态查询失败: ' + e.message);
             }
         }, 3000);
     } catch(e) {
+        button.disabled = false;
+        button.textContent = '生成预览';
         showManageMsg('error', '❌ ' + e.message);
     }
 }
@@ -2154,7 +2422,7 @@ let _modelList = [];
 const _SETTINGS_FIELDS = {
     str: ['API_BASE_URL', 'API_KEY', 'DEFAULT_MODEL', 'MEMORY_API_KEY', 'MEMORY_MODEL',
           'CACHE_SUMMARY_MODEL', 'CACHE_TTL', 'CACHE_PARTITION_TRIGGER', 'EMBEDDING_API_KEY', 'EMBEDDING_BASE_URL', 'EMBEDDING_MODEL', 'REASONING_EFFORT'],
-    int: ['MAX_MEMORIES_INJECT', 'MAX_CONVERSATIONS_INJECT', 'MEMORY_EXTRACT_INTERVAL', 'CACHE_PARTITION_X', 'CACHE_PARTITION_WINDOW', 'EMBEDDING_DIM'],
+    int: ['MAX_MEMORIES_INJECT', 'MAX_CONVERSATIONS_INJECT', 'MEMORY_EXTRACT_INTERVAL', 'CACHE_PARTITION_X', 'CACHE_PARTITION_WINDOW', 'CACHE_SUMMARY_BUDGET_CHARS', 'EMBEDDING_DIM'],
     float: ['MIN_SCORE_THRESHOLD', 'CONVERSATION_MIN_SCORE_THRESHOLD',
             'MEMORY_SEEN_TTL_HOURS', 'CONVERSATION_SEEN_TTL_HOURS'],
     bool: ['MEMORY_ENABLED', 'CONVERSATION_RECALL_ENABLED', 'CACHE_PARTITION_ENABLED', 'MEMORY_VECTOR_ENABLED', 'FORCE_STREAM'],
@@ -2392,7 +2660,7 @@ function showSettingsMsg(type, text) {
     const el = document.getElementById('settings-msg');
     if (!el) return;
     el.style.display = 'block';
-    el.className = 'msg-box msg-' + type;
+    el.className = 'msg-container msg msg-' + type;
     el.textContent = text;
     setTimeout(() => { el.style.display = 'none'; }, 5000);
 }

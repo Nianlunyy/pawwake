@@ -200,31 +200,28 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
 
 摘要："""
 
+    summary = await _call_summary_model(prompt, "摘要生成")
+    if summary:
+        print(f"📝 摘要生成完成: {len(summary)}字 (压缩{len(messages)}条消息)")
+    return summary
+
+
+async def _call_summary_model(prompt: str, label: str = "摘要生成") -> str:
+    """用摘要模型跑一段 prompt，返回去空白后的正文；失败返回空串并自己打日志。"""
     try:
         # 摘要请求发往主API_BASE_URL，直接用主API_KEY（MEMORY_API_KEY可能是其他提供商的key）
-        headers = {
-            "Authorization": f"Bearer {shared.API_KEY}",
-            "Content-Type": "application/json",
-        }
-        if "openrouter" in shared.API_BASE_URL:
-            headers["HTTP-Referer"] = shared.EXTRA_REFERER
-            headers["X-Title"] = shared.EXTRA_TITLE
-        summary_model = shared.CACHE_SUMMARY_MODEL
-        if shared.is_vertex_endpoint():
-            try:
-                headers["Authorization"] = f"Bearer {shared.get_vertex_access_token()}"
-            except Exception as e:
-                print(f"⚠️ 摘要模型 Vertex Token 获取失败: {e}")
-            if "/" not in summary_model:
-                summary_model = f"google/{summary_model}"
-
         async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(shared.API_BASE_URL, headers=headers, json={
-                "model": summary_model,
-                # 推理模型的思考也消耗max_tokens，给足空间避免content为空
-                "max_tokens": shared.CACHE_SUMMARY_MAX_TOKENS,
-                "messages": [{"role": "user", "content": prompt}],
-            })
+            response = await shared.post_chat_completion(
+                client,
+                shared.API_BASE_URL,
+                shared.API_KEY,
+                {
+                    "model": shared.CACHE_SUMMARY_MODEL,
+                    # 推理模型的思考也消耗max_tokens，给足空间避免content为空
+                    "max_tokens": shared.CACHE_SUMMARY_MAX_TOKENS,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+            )
             if response.status_code == 200:
                 data = response.json()
                 if "choices" in data:
@@ -235,7 +232,6 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
                     content = message.get("content") or ""
                     summary = content.strip()
                     if summary:
-                        print(f"📝 摘要生成完成: {len(summary)}字 (压缩{len(messages)}条消息)")
                         return summary
 
                     # 空content分不清是额度被思考吃光还是模型没给答案，把上游的判据一起打出来
@@ -255,16 +251,76 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
                         if reasoning_text:
                             usage_part += f"（上游未给推理token，reasoning正文 {len(reasoning_text)} 字符）"
                     print(
-                        f"⚠️ 摘要生成失败: 模型返回空content, model={shared.CACHE_SUMMARY_MODEL}, "
-                        f"finish_reason={finish_reason}{usage_part}，本次轮转将推迟重试"
+                        f"⚠️ {label}失败: 模型返回空content, model={shared.CACHE_SUMMARY_MODEL}, "
+                        f"finish_reason={finish_reason}{usage_part}"
                     )
                     return ""
 
-        print(f"⚠️ 摘要生成失败: HTTP {response.status_code}, model={shared.CACHE_SUMMARY_MODEL}: {response.text[:500]}")
+        print(f"⚠️ {label}失败: HTTP {response.status_code}, model={shared.CACHE_SUMMARY_MODEL}: {response.text[:500]}")
         return ""
     except Exception as e:
-        print(f"⚠️ 摘要生成异常: {e}")
+        print(f"⚠️ {label}异常: {e}")
         return ""
+
+
+# 折叠时保留最近几段旧摘要原文（本轮新生成的段另外全保护，不占这个名额）
+SUMMARY_KEEP_RECENT = 2
+
+
+async def fold_summary_parts(summary_parts: list, protected_tail: int = 0):
+    """
+    摘要区有界折叠：总字符超过 CACHE_SUMMARY_BUDGET_CHARS 时，把最旧的几段合成一段基础摘要，
+    保留最近 SUMMARY_KEEP_RECENT 段旧摘要原文，外加尾部 protected_tail 段本轮新生成的摘要。
+
+    返回新的段列表；无需折叠时原样返回；折叠调用失败返回 None（调用方整份丢弃本轮候选状态）。
+    """
+    budget = shared.CACHE_SUMMARY_BUDGET_CHARS
+    if budget <= 0 or not summary_parts:
+        return summary_parts
+    total = sum(len(p) for p in summary_parts)
+    if total <= budget:
+        return summary_parts
+    if not shared.CACHE_SUMMARY_MODEL:
+        print(f"📝 摘要区{total}字超预算{budget}，但摘要模型未配置，跳过折叠")
+        return summary_parts
+
+    keep = SUMMARY_KEEP_RECENT + max(0, protected_tail)
+    if len(summary_parts) <= keep:
+        print(f"📝 摘要区{total}字超预算{budget}，但只有{len(summary_parts)}段无可折叠（受保护{keep}段不丢）")
+        return summary_parts
+
+    old_parts = summary_parts[:-keep]
+    recent_parts = summary_parts[-keep:]
+    old_total = sum(len(p) for p in old_parts)
+    target_chars = max(300, budget // 3)  # 基础摘要目标字数，模型返回后按它校验
+    old_text = "\n\n".join(f"【第{i + 1}段】\n{p}" for i, p in enumerate(old_parts))
+    prompt = f"""下面是同一段对话历史的多段摘要，按时间从早到晚排列。请把它们合并压缩成一段更精简的基础摘要。
+仍以AI的第一人称视角叙述（"我"指AI，用户用摘要中的称呼）。
+优先保留：情感节点、关系里程碑、双方的约定和决定、仍在进行的话题；重复出现的内容只留一次。
+保留双方的关键原话，用引号标注是谁说的。控制在{target_chars}字以内。
+
+---
+{old_text}
+---
+
+合并后的摘要："""
+
+    base = await _call_summary_model(prompt, "摘要折叠")
+    if not base:
+        return None
+    # 不能全信模型守字数：基础摘要必须比被折叠的旧段短，且不超过目标；否则预算形同虚设，按失败走整轮回滚
+    if len(base) > target_chars or len(base) >= old_total:
+        print(
+            f"⚠️ 摘要折叠失败: 模型返回{len(base)}字，超过目标{target_chars}字或不短于原{old_total}字，"
+            f"本次折叠结果不保存"
+        )
+        return None
+    folded = [base] + recent_parts
+    print(
+        f"📝 摘要折叠完成: {len(old_parts)}段/{old_total}字 → 1段/{len(base)}字，"
+        f"摘要区 {len(summary_parts)}段/{total}字 → {len(folded)}段/{sum(len(p) for p in folded)}字"
+    )
+    return folded
 
 
 def group_by_rounds(history: list) -> list:
@@ -310,24 +366,26 @@ def _should_rotate(b_rounds_count: int, X: int, a_msgs: list) -> bool:
     判断是否应该触发A区→摘要的轮转。
 
     rounds模式（默认）：B区轮数 >= X 时触发
-    time模式：A区最早消息距今 >= 时间窗口 时触发（短时间内大量消息不频繁摘要）
+    time模式：A区最晚一条消息距今 >= 时间窗口 时触发。
+        看的是即将被压缩的整批：只要A区末条仍在窗口内，说明这批里还有新对话，不轮转；
+        短时间内大量消息不会被频繁摘要，长时间沉默后恢复聊天时旧A区也能及时退出。
     """
     if b_rounds_count == 0:
         return False
 
     if shared.CACHE_PARTITION_TRIGGER == "time":
-        a_first_time = None
-        for msg in a_msgs:
+        a_last_time = None
+        for msg in reversed(a_msgs):
             t = msg.get('created_at')
             if t:
-                a_first_time = t
+                a_last_time = t
                 break
 
-        if a_first_time:
+        if a_last_time:
             now = datetime.now(timezone.utc)
-            if a_first_time.tzinfo is None:
-                a_first_time = a_first_time.replace(tzinfo=timezone.utc)
-            age_minutes = (now - a_first_time).total_seconds() / 60
+            if a_last_time.tzinfo is None:
+                a_last_time = a_last_time.replace(tzinfo=timezone.utc)
+            age_minutes = (now - a_last_time).total_seconds() / 60
             return age_minutes >= shared.CACHE_PARTITION_WINDOW
 
         return b_rounds_count >= X
@@ -449,6 +507,10 @@ async def build_partitioned_messages(
     b_msgs = [msg for rnd in b_round_groups for msg in rnd]
     b_rounds_count = len(b_round_groups)
 
+    # 折叠失败要能整份退回：进循环前把摘要和滑窗留底
+    orig_summary_parts = list(summary_parts)
+    orig_a_start_round = a_start_round
+
     rotation_count = 0
     max_rotations = CACHE_MAX_ROTATIONS if shared.CACHE_PARTITION_TRIGGER == "time" else 999
     # 安全底线：不管追赶式轮转还想推进几次，B区必须至少留1轮。
@@ -461,7 +523,7 @@ async def build_partitioned_messages(
         and (total_rounds - (a_start_round + X)) >= MIN_B_ROUNDS_FLOOR
     ):
         rotation_count += 1
-        trigger_info = f"B区{b_rounds_count}轮 >= X={X}" if shared.CACHE_PARTITION_TRIGGER != "time" else f"A区首条消息超出{shared.CACHE_PARTITION_WINDOW}分钟窗口"
+        trigger_info = f"B区{b_rounds_count}轮 >= X={X}" if shared.CACHE_PARTITION_TRIGGER != "time" else f"A区末条消息超出{shared.CACHE_PARTITION_WINDOW}分钟窗口"
         print(f"🔄 轮转#{rotation_count}: session={session_id}, {trigger_info}")
 
         new_summary = await generate_summary(a_msgs, session_id)
@@ -483,9 +545,24 @@ async def build_partitioned_messages(
         b_rounds_count = len(b_round_groups)
 
     if rotation_count > 0:
-        await db_conversations.save_session_cache_state(session_id, summary_parts, a_start_round)
-        summary_total = sum(len(p) for p in summary_parts)
-        print(f"🔄 轮转完成(共{rotation_count}次): 摘要{len(summary_parts)}段/{summary_total}字, A区{len(a_msgs)}条, B区{len(b_msgs)}条")
+        # 同一次请求里先轮转再折叠，两次模型调用都在事务外；全部成功才一次落库
+        folded = await fold_summary_parts(summary_parts, protected_tail=rotation_count)
+        if folded is None:
+            print(f"⚠️ 摘要折叠失败，本次{rotation_count}次轮转整份丢弃，状态不推进，下次请求重试（A区消息未丢失）")
+            summary_parts = orig_summary_parts
+            a_start_round = orig_a_start_round
+            a_end_round = a_start_round + X
+            a_round_groups = rounds[a_start_round : a_end_round]
+            b_round_groups = rounds[a_end_round :]
+            a_msgs = [msg for rnd in a_round_groups for msg in rnd]
+            b_msgs = [msg for rnd in b_round_groups for msg in rnd]
+            b_rounds_count = len(b_round_groups)
+            rotation_count = 0
+        else:
+            summary_parts = folded
+            await db_conversations.save_session_cache_state(session_id, summary_parts, a_start_round)
+            summary_total = sum(len(p) for p in summary_parts)
+            print(f"🔄 轮转完成(共{rotation_count}次): 摘要{len(summary_parts)}段/{summary_total}字, A区{len(a_msgs)}条, B区{len(b_msgs)}条")
 
     # 拼装messages
     result = []

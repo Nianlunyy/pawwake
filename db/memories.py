@@ -52,6 +52,7 @@ async def save_extracted_memory(
     source_session: str,
     supersede_id=None,
     candidate_ids=None,
+    remind_at=None,
 ):
     """Save one extracted fact and atomically retire an allowed active predecessor."""
     allowed_ids = {
@@ -70,27 +71,41 @@ async def save_extracted_memory(
             row = await conn.fetchrow(
                 """
                 INSERT INTO memories
-                    (content, importance, source_session, layer, is_active)
-                VALUES ($1, $2, $3, 1, TRUE)
+                    (content, importance, source_session, layer, is_active, remind_at)
+                VALUES ($1, $2, $3, 1, TRUE, $4)
                 RETURNING id
                 """,
                 content,
                 importance,
                 source_session,
+                remind_at,
             )
             new_id = int(row["id"])
             retired_id = None
             if requested_id in allowed_ids:
                 predecessor = await conn.fetchrow(
                     """
-                    SELECT id, is_active, superseded_by
+                    SELECT id, is_active, superseded_by, layer
                     FROM memories
                     WHERE id = $1
                     FOR UPDATE
                     """,
                     requested_id,
                 )
+                predecessor_layer = (predecessor.get("layer") if predecessor else None) or 1
                 if (
+                    predecessor
+                    and predecessor["is_active"] is True
+                    and predecessor["superseded_by"] is None
+                    and predecessor_layer != 1
+                ):
+                    # 后台提取只允许接管碎片层；事件/核心记忆不在这里静默归档，
+                    # 新事实照常按碎片保存，旧行保持 active，冲突留给整理流程处理。
+                    print(
+                        f"🛡️ 记忆 {requested_id}（layer {predecessor_layer}）拒绝后台自动取代，"
+                        f"新事实已按碎片保存为 {new_id}，旧记忆保持活跃"
+                    )
+                elif (
                     predecessor
                     and predecessor["is_active"] is True
                     and predecessor["superseded_by"] is None
@@ -138,6 +153,127 @@ async def get_memory_by_external_id(external_id: str):
             external_id,
         )
     return dict(row) if row else None
+
+
+async def claim_due_reminders(lease_seconds: float) -> list:
+    """取出全部到期未送达的提醒，并确保同一条只交给一个请求处理。
+
+    处理超时或进程崩溃后，提醒可由下一次请求重新处理。不设条数上限。
+    返回行含 reminder_claimed_at，调用方用 (id, claimed_at) 延长处理时限、标记送达或交回。
+    """
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            UPDATE memories SET reminder_claimed_at = NOW()
+            WHERE id IN (
+                SELECT id FROM memories
+                WHERE is_active = TRUE
+                  AND remind_at IS NOT NULL AND remind_at <= NOW()
+                  AND reminder_delivered_at IS NULL
+                  AND (reminder_claimed_at IS NULL
+                       OR reminder_claimed_at < NOW() - make_interval(secs => $1))
+                ORDER BY remind_at ASC, importance DESC
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING id, content, importance, created_at, event_date, remind_at, reminder_claimed_at
+            """,
+            float(lease_seconds),
+        )
+    return [dict(row) for row in rows]
+
+
+def _normalize_reminder_claims(claims) -> list:
+    return [
+        (int(memory_id), claimed_at)
+        for memory_id, claimed_at in (claims or [])
+        if isinstance(memory_id, int) and not isinstance(memory_id, bool) and claimed_at is not None
+    ]
+
+
+async def mark_reminders_delivered(claims) -> int:
+    """按 (id, claimed_at) 标记送达；处理时间已变化的行不会被旧请求覆盖。"""
+    pairs = _normalize_reminder_claims(claims)
+    if not pairs:
+        return 0
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            UPDATE memories SET reminder_delivered_at = NOW()
+            WHERE reminder_delivered_at IS NULL
+              AND (id, reminder_claimed_at) IN (
+                  SELECT * FROM unnest($1::int[], $2::timestamptz[])
+              )
+            RETURNING id
+            """,
+            [memory_id for memory_id, _ in pairs],
+            [claimed_at for _, claimed_at in pairs],
+        )
+    return len(rows)
+
+
+async def renew_reminder_claims(claims) -> list:
+    """发送期间延长处理时限，只返回仍由本次请求处理且未送达的提醒。"""
+    pairs = _normalize_reminder_claims(claims)
+    if not pairs:
+        return []
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            UPDATE memories SET reminder_claimed_at = NOW()
+            WHERE reminder_delivered_at IS NULL
+              AND (id, reminder_claimed_at) IN (
+                  SELECT * FROM unnest($1::int[], $2::timestamptz[])
+              )
+            RETURNING id, reminder_claimed_at
+            """,
+            [memory_id for memory_id, _ in pairs],
+            [claimed_at for _, claimed_at in pairs],
+        )
+    return [(int(row["id"]), row["reminder_claimed_at"]) for row in rows]
+
+
+async def set_memory_reminder(memory_id: int, remind_at) -> bool:
+    """给已有活跃记忆设置或改期提醒，并清空旧的处理时间与送达记录。"""
+    if not isinstance(memory_id, int) or isinstance(memory_id, bool) or remind_at is None:
+        return False
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE memories
+            SET remind_at = $2, reminder_claimed_at = NULL, reminder_delivered_at = NULL
+            WHERE id = $1 AND is_active = TRUE
+            RETURNING id
+            """,
+            memory_id,
+            remind_at,
+        )
+    return row is not None
+
+
+async def release_reminder_claims(claims) -> int:
+    """失败时交回仍由本次请求处理的提醒，让下一次请求立即重试。"""
+    pairs = _normalize_reminder_claims(claims)
+    if not pairs:
+        return 0
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            UPDATE memories SET reminder_claimed_at = NULL
+            WHERE reminder_delivered_at IS NULL
+              AND (id, reminder_claimed_at) IN (
+                  SELECT * FROM unnest($1::int[], $2::timestamptz[])
+              )
+            RETURNING id
+            """,
+            [memory_id for memory_id, _ in pairs],
+            [claimed_at for _, claimed_at in pairs],
+        )
+    return len(rows)
 
 
 def _normalize_excluded_ids(exclude_ids) -> list:
@@ -258,8 +394,6 @@ async def search_memories_hybrid(
 
     权重：MEMORY_HW_KEYWORD + MEMORY_HW_SEMANTIC + MEMORY_HW_IMPORTANCE + MEMORY_HW_RECENCY
     """
-    from datetime import datetime, timezone
-
     excluded_ids = _normalize_excluded_ids(exclude_ids)
     keywords = db_search.extract_search_keywords(query)
     query_embedding = await db_search.get_query_embedding(query) if shared.EMBEDDING_API_KEY else []
@@ -319,39 +453,23 @@ async def search_memories_hybrid(
         if query_embedding:
             if db_core.HAS_PGVECTOR:
                 vec_str = '[' + ','.join(str(f) for f in query_embedding) + ']'
-                if excluded_ids:
-                    sem_rows = await conn.fetch("""
-                        SELECT id, content, importance, created_at, event_date,
-                               1 - (embedding <=> $1::vector) as similarity
-                        FROM memories
-                        WHERE embedding IS NOT NULL AND is_active = TRUE
-                          AND NOT (id = ANY($2::int[]))
-                        ORDER BY embedding <=> $1::vector
-                        LIMIT $3
-                    """, vec_str, excluded_ids, limit * 3)
-                else:
-                    sem_rows = await conn.fetch("""
-                        SELECT id, content, importance, created_at, event_date,
-                               1 - (embedding <=> $1::vector) as similarity
-                        FROM memories
-                        WHERE embedding IS NOT NULL AND is_active = TRUE
-                        ORDER BY embedding <=> $1::vector
-                        LIMIT $2
-                    """, vec_str, limit * 3)
+                sem_rows = await conn.fetch("""
+                    SELECT id, content, importance, created_at, event_date,
+                           1 - (embedding <=> $1::vector) as similarity
+                    FROM memories
+                    WHERE embedding IS NOT NULL AND is_active = TRUE
+                      AND NOT (id = ANY($2::int[]))
+                    ORDER BY embedding <=> $1::vector
+                    LIMIT $3
+                """, vec_str, excluded_ids, limit * 3)
             else:
                 # Python端计算cosine
-                if excluded_ids:
-                    all_mem = await conn.fetch("""
-                        SELECT id, content, importance, created_at, event_date, embedding_json
-                        FROM memories
-                        WHERE embedding_json IS NOT NULL AND is_active = TRUE
-                          AND NOT (id = ANY($1::int[]))
-                    """, excluded_ids)
-                else:
-                    all_mem = await conn.fetch("""
-                        SELECT id, content, importance, created_at, event_date, embedding_json
-                        FROM memories WHERE embedding_json IS NOT NULL AND is_active = TRUE
-                    """)
+                all_mem = await conn.fetch("""
+                    SELECT id, content, importance, created_at, event_date, embedding_json
+                    FROM memories
+                    WHERE embedding_json IS NOT NULL AND is_active = TRUE
+                      AND NOT (id = ANY($1::int[]))
+                """, excluded_ids)
 
                 scored = []
                 for row in all_mem:
@@ -399,7 +517,7 @@ async def search_memories_hybrid(
         kw_norm = db_search._min_max_normalize({mid: v['kw_score'] for mid, v in candidates.items()})
         sem_norm = db_search._min_max_normalize({mid: v['similarity'] for mid, v in candidates.items()})
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(dt_timezone.utc)
         final = []
         for mid, info in candidates.items():
             kw = kw_norm.get(mid, 0.0)
@@ -608,16 +726,12 @@ async def get_extraction_candidates(
 
 async def get_pending_memory_embedding_count():
     """查询还没有embedding的记忆数量"""
+    embedding_column = "embedding" if db_core.HAS_PGVECTOR else "embedding_json"
     pool = await db_core.get_pool()
     async with pool.acquire() as conn:
-        if db_core.HAS_PGVECTOR:
-            return await conn.fetchval(
-                "SELECT COUNT(*) FROM memories WHERE embedding IS NULL AND content IS NOT NULL"
-            )
-        else:
-            return await conn.fetchval(
-                "SELECT COUNT(*) FROM memories WHERE embedding_json IS NULL AND content IS NOT NULL"
-            )
+        return await conn.fetchval(
+            f"SELECT COUNT(*) FROM memories WHERE {embedding_column} IS NULL AND content IS NOT NULL"
+        )
 
 
 async def backfill_memory_embeddings(batch_size: int = 20):
@@ -626,24 +740,17 @@ async def backfill_memory_embeddings(batch_size: int = 20):
         print("⚠️ EMBEDDING_API_KEY 未设置，无法补算embedding")
         return 0
 
+    embedding_column = "embedding" if db_core.HAS_PGVECTOR else "embedding_json"
     pool = await db_core.get_pool()
     total_updated = 0
 
     async with pool.acquire() as conn:
-        if db_core.HAS_PGVECTOR:
-            rows = await conn.fetch("""
-                SELECT id, content FROM memories
-                WHERE embedding IS NULL AND content IS NOT NULL
-                ORDER BY id
-                LIMIT $1
-            """, batch_size)
-        else:
-            rows = await conn.fetch("""
-                SELECT id, content FROM memories
-                WHERE embedding_json IS NULL AND content IS NOT NULL
-                ORDER BY id
-                LIMIT $1
-            """, batch_size)
+        rows = await conn.fetch(f"""
+            SELECT id, content FROM memories
+            WHERE {embedding_column} IS NULL AND content IS NOT NULL
+            ORDER BY id
+            LIMIT $1
+        """, batch_size)
 
     if not rows:
         print("✅ 所有记忆已有embedding，无需补算")
@@ -663,10 +770,9 @@ async def backfill_memory_embeddings(batch_size: int = 20):
 
     # 检查剩余
     async with pool.acquire() as conn:
-        if db_core.HAS_PGVECTOR:
-            remaining = await conn.fetchval("SELECT COUNT(*) FROM memories WHERE embedding IS NULL AND content IS NOT NULL")
-        else:
-            remaining = await conn.fetchval("SELECT COUNT(*) FROM memories WHERE embedding_json IS NULL AND content IS NOT NULL")
+        remaining = await conn.fetchval(
+            f"SELECT COUNT(*) FROM memories WHERE {embedding_column} IS NULL AND content IS NOT NULL"
+        )
 
     print(f"✅ 本批补算完成：{total_updated}/{len(rows)} 条成功" + (f"，剩余 {remaining} 条待处理" if remaining > 0 else ""))
     return total_updated
@@ -701,7 +807,8 @@ async def get_all_memories():
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT id, content, importance, source_session, created_at,
-                   layer, title, is_active, merged_from, event_date, superseded_by
+                   layer, title, is_active, merged_from, event_date, superseded_by,
+                   remind_at, reminder_delivered_at
             FROM memories ORDER BY id
         """)
         memories = [dict(r) for r in rows]
@@ -864,8 +971,9 @@ async def import_memories_v2(memories: list, schema_version: int = 2):
                     continue
                 row = await conn.fetchrow("""
                     INSERT INTO memories (content, importance, source_session, created_at,
-                                          layer, title, is_active, event_date)
-                    VALUES ($1, $2, $3, COALESCE($4, NOW()), $5, $6, $7, $8)
+                                          layer, title, is_active, event_date,
+                                          remind_at, reminder_delivered_at)
+                    VALUES ($1, $2, $3, COALESCE($4, NOW()), $5, $6, $7, $8, $9, $10)
                     RETURNING id
                 """,
                     content,
@@ -876,6 +984,9 @@ async def import_memories_v2(memories: list, schema_version: int = 2):
                     mem.get("title") or "",
                     bool(mem.get("is_active", True)),
                     _parse_backup_date(mem.get("event_date")),
+                    # schema 4 起备份提醒与送达时间；临时处理时间不进备份
+                    _parse_backup_datetime(mem.get("remind_at")),
+                    _parse_backup_datetime(mem.get("reminder_delivered_at")),
                 )
                 id_map[bid] = int(row["id"])
                 imported += 1
@@ -953,13 +1064,15 @@ async def import_memories_v2(memories: list, schema_version: int = 2):
     return result
 
 
-async def get_all_memories_detail(limit: int = None, layer: int = None, active_only: bool = None):
+async def get_all_memories_detail(limit: int = None, layer: int = None,
+                                  active_only: bool = None, memory_ids: list = None):
     """获取所有记忆（含 id，用于管理页面）
 
     Args:
         limit: 可选，限制返回数量
         layer: 可选，筛选指定层级（1=原始碎片, 2=事件记忆, 3=核心记忆）
         active_only: 可选，是否只返回 is_active=true 的记忆
+        memory_ids: 可选，只返回指定 ID
     """
     pool = await db_core.get_pool()
     async with pool.acquire() as conn:
@@ -977,6 +1090,11 @@ async def get_all_memories_detail(limit: int = None, layer: int = None, active_o
             params.append(active_only)
             param_idx += 1
 
+        if memory_ids is not None:
+            conditions.append(f"id = ANY(${param_idx}::int[])")
+            params.append(memory_ids)
+            param_idx += 1
+
         where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
         if limit is not None:
@@ -987,13 +1105,40 @@ async def get_all_memories_detail(limit: int = None, layer: int = None, active_o
 
         rows = await conn.fetch(f"""
             SELECT id, content, importance, source_session, created_at,
-                   layer, title, is_active, merged_from, event_date, superseded_by
+                   layer, title, is_active, merged_from, event_date, superseded_by,
+                   remind_at, reminder_delivered_at
             FROM memories
             {where_clause}
             ORDER BY id
             {limit_clause}
         """, *params)
         return [dict(r) for r in rows]
+
+
+async def get_core_candidate_memories(min_merged_sources: int, min_importance: int,
+                                      limit: int):
+    """Return the bounded active layer-2 rows that match core-candidate rules."""
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        # Dashboard-only scan; add an expression index only if measured latency warrants it.
+        rows = await conn.fetch("""
+            SELECT id, content, importance, source_session, created_at,
+                   layer, title, is_active, merged_from, event_date, superseded_by,
+                   remind_at, reminder_delivered_at
+            FROM memories
+            WHERE layer = 2
+              AND is_active = TRUE
+              AND (
+                  cardinality(COALESCE(merged_from, '{}'::int[])) >= $1
+                  OR importance >= $2
+              )
+            ORDER BY (
+                (cardinality(COALESCE(merged_from, '{}'::int[])) >= $1)::int
+                + (importance >= $2)::int
+            ) DESC, id
+            LIMIT $3
+        """, min_merged_sources, min_importance, limit)
+        return [dict(row) for row in rows]
 
 
 async def delete_archived_memory(memory_id: int):
@@ -1127,138 +1272,22 @@ async def undo_memory_supersession(memory_id: int):
 # 三层记忆架构（碎片/事件/核心）
 # ============================================================
 
-async def get_fragments_by_date(event_date):
-    """获取指定日期的原始碎片（用于每日整理）"""
-    # 把本地日期转成UTC时间范围，避免DATE()用UTC截断导致日期偏移
-    local_tz = dt_timezone(timedelta(hours=shared.TIMEZONE_HOURS))
-    start_utc = datetime(event_date.year, event_date.month, event_date.day, tzinfo=local_tz).astimezone(dt_timezone.utc)
-    end_utc = start_utc + timedelta(days=1)
-
+async def get_organizable_memories_by_date(event_date):
+    """获取指定本地日期的活跃碎片和事件记忆。"""
     pool = await db_core.get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT id, content, importance, created_at
+            SELECT id, content, importance, created_at, event_date, layer, title
             FROM memories
-            WHERE layer = 1 AND is_active = TRUE
-            AND created_at >= $1 AND created_at < $2
-            ORDER BY created_at
-        """, start_utc, end_utc)
+            WHERE layer IN (1, 2) AND is_active = TRUE
+            AND COALESCE(
+                event_date,
+                ((created_at AT TIME ZONE 'UTC') + make_interval(hours => $2))::date
+            ) = $1
+            AND NOT (remind_at IS NOT NULL AND reminder_delivered_at IS NULL)
+            ORDER BY created_at, id
+        """, event_date, shared.TIMEZONE_HOURS)
         return [dict(r) for r in rows]
-
-
-async def deactivate_memories(memory_ids: list):
-    """将记忆标记为不活跃（合并后的碎片）"""
-    if not memory_ids:
-        return
-    pool = await db_core.get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            UPDATE memories SET is_active = FALSE
-            WHERE id = ANY($1::int[])
-        """, memory_ids)
-
-
-async def create_consolidated_events(events: list, expected_fragment_ids: list):
-    """原子地创建整理事件并归档被完整覆盖的来源碎片。
-
-    模型结果必须完整且唯一地覆盖 expected_fragment_ids。事务开始后再次锁定并
-    验证所有来源仍是活跃碎片，避免并发整理或手动操作造成部分提交。
-    """
-    expected_ids = [int(memory_id) for memory_id in expected_fragment_ids]
-    expected_set = set(expected_ids)
-    if not expected_ids:
-        return []
-    if len(expected_ids) != len(expected_set):
-        raise ValueError("expected_fragment_ids 存在重复")
-
-    merged_ids = []
-    seen_ids = set()
-    for event in events:
-        if not isinstance(event, dict):
-            raise ValueError("整理事件必须是JSON对象")
-        if not isinstance(event.get("content"), str) or not event["content"].strip():
-            raise ValueError("整理事件缺少 content")
-        event_ids = event.get("merged_ids", [])
-        if not event_ids:
-            raise ValueError("整理事件缺少 merged_ids")
-        for memory_id in event_ids:
-            if isinstance(memory_id, bool) or not isinstance(memory_id, int):
-                raise ValueError(f"整理事件包含非法碎片ID: {memory_id}")
-            if memory_id not in expected_set:
-                raise ValueError(f"整理事件引用了范围外碎片: {memory_id}")
-            if memory_id in seen_ids:
-                raise ValueError(f"碎片被多个事件重复引用: {memory_id}")
-            seen_ids.add(memory_id)
-            merged_ids.append(memory_id)
-
-    missing_ids = expected_set - seen_ids
-    if missing_ids:
-        raise ValueError(f"整理事件未覆盖全部碎片: {sorted(missing_ids)}")
-
-    pool = await db_core.get_pool()
-    created = []
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            rows = await conn.fetch("""
-                SELECT id
-                FROM memories
-                WHERE id = ANY($1::int[])
-                  AND layer = 1
-                  AND is_active = TRUE
-                FOR UPDATE
-            """, expected_ids)
-            active_ids = {int(row["id"]) for row in rows}
-            if active_ids != expected_set:
-                unavailable = sorted(expected_set - active_ids)
-                raise RuntimeError(f"部分来源碎片已被其他操作修改: {unavailable}")
-
-            for event in events:
-                row = await conn.fetchrow("""
-                    INSERT INTO memories (
-                        content, importance, layer, title,
-                        is_active, merged_from, event_date
-                    )
-                    VALUES ($1, $2, 2, $3, TRUE, $4, $5)
-                    RETURNING id
-                """,
-                    event.get("content", ""),
-                    event.get("importance", 5),
-                    event.get("title", ""),
-                    event["merged_ids"],
-                    event.get("event_date"),
-                )
-                if not row:
-                    raise RuntimeError("创建事件记忆失败")
-                created.append({
-                    "id": int(row["id"]),
-                    "content": event.get("content", ""),
-                })
-
-            result = await conn.execute("""
-                UPDATE memories
-                SET is_active = FALSE
-                WHERE id = ANY($1::int[])
-                  AND layer = 1
-                  AND is_active = TRUE
-            """, merged_ids)
-            updated = int(result.split()[-1]) if result else 0
-            if updated != len(expected_ids):
-                raise RuntimeError(
-                    f"归档来源碎片数量不符: expected={len(expected_ids)}, updated={updated}"
-                )
-
-    # embedding 失败不影响事件与来源碎片的原子提交，和旧逻辑保持一致。
-    if shared.MEMORY_VECTOR_ENABLED and created:
-        async with pool.acquire() as conn:
-            for event in created:
-                try:
-                    embedding = await db_search.compute_embedding(event["content"])
-                    if embedding:
-                        await db_search.save_memory_embedding(conn, event["id"], embedding)
-                except Exception as exc:
-                    print(f"⚠️ 事件记忆embedding计算失败（id={event['id']}）: {exc}")
-
-    return [event["id"] for event in created]
 
 
 async def promote_to_core(memory_id: int, title: str = None):
@@ -1282,26 +1311,65 @@ async def merge_memories(memory_ids: list, new_title: str, new_content: str,
     """合并多条记忆为一条新记忆"""
     if not memory_ids:
         return None
+    if any(isinstance(memory_id, bool) or not isinstance(memory_id, int) for memory_id in memory_ids):
+        raise ValueError("记忆 ID 必须是整数")
+    requested_ids = set(memory_ids)
+    if len(requested_ids) != len(memory_ids):
+        raise ValueError("记忆 ID 不能重复")
 
     pool = await db_core.get_pool()
     async with pool.acquire() as conn:
-        # 获取原记忆的日期（取最早的；来源含事件记忆时优先其真实发生日，而非整理日）
-        rows = await conn.fetch("""
-            SELECT MIN(COALESCE(event_date, DATE(created_at))) as event_date
-            FROM memories WHERE id = ANY($1::int[])
-        """, memory_ids)
-        event_date = rows[0]['event_date'] if rows else None
+        new_id = None
+        async with conn.transaction():
+            # 锁住全部来源行，在同一事务、同一连接里复验、插入、归档：
+            # 后台此刻给某条来源写提醒会等在锁上，提交后它看到的是已归档行，set_memory_reminder 落空、按 new 保住提醒
+            rows = await conn.fetch("""
+                SELECT id, layer, is_active, remind_at, reminder_delivered_at FROM memories
+                WHERE id = ANY($1::int[])
+                ORDER BY id
+                FOR UPDATE
+            """, memory_ids)
+            rows_by_id = {int(row["id"]): row for row in rows}
+            unavailable = sorted(
+                (requested_ids - rows_by_id.keys())
+                | {memory_id for memory_id, row in rows_by_id.items() if not row["is_active"]}
+            )
+            if unavailable:
+                raise ValueError(f"记忆 {unavailable} 不存在或已失效，不能合并")
+            # 带未送达提醒的记忆不能被合并归档，否则提醒随之消失；先等送达或清除提醒
+            blocked = sorted(
+                int(r["id"]) for r in rows
+                if r["remind_at"] is not None and r["reminder_delivered_at"] is None
+            )
+            if blocked:
+                raise ValueError(f"记忆 {blocked} 带有未送达的提醒，不能合并；请等提醒送达后再合并")
 
-        # 创建新记忆
-        row = await conn.fetchrow("""
-            INSERT INTO memories (content, importance, layer, title, is_active, merged_from, event_date)
-            VALUES ($1, $2, $3, $4, TRUE, $5, $6)
-            RETURNING id
-        """, new_content, importance, layer, new_title, memory_ids, event_date)
+            # 取最早发生日；事件记忆用 event_date，碎片按 Dashboard 的本地时区换算 created_at
+            date_rows = await conn.fetch("""
+                SELECT MIN(COALESCE(
+                    event_date,
+                    ((created_at AT TIME ZONE 'UTC') + make_interval(hours => $2))::date
+                )) as event_date
+                FROM memories WHERE id = ANY($1::int[])
+            """, memory_ids, shared.TIMEZONE_HOURS)
+            event_date = date_rows[0]['event_date'] if date_rows else None
 
-        new_id = row['id'] if row else None
+            # 创建新记忆
+            row = await conn.fetchrow("""
+                INSERT INTO memories (content, importance, layer, title, is_active, merged_from, event_date)
+                VALUES ($1, $2, $3, $4, TRUE, $5, $6)
+                RETURNING id
+            """, new_content, importance, layer, new_title, memory_ids, event_date)
+            new_id = row['id'] if row else None
 
-        # 向量搜索：计算并保存 embedding
+            # 将来源记忆标记为不活跃，与新记忆一起提交
+            if new_id:
+                await conn.execute("""
+                    UPDATE memories SET is_active = FALSE
+                    WHERE id = ANY($1::int[])
+                """, memory_ids)
+
+        # 向量搜索：事务提交后再算并保存 embedding，外部调用不占着行锁
         if shared.MEMORY_VECTOR_ENABLED and new_id:
             try:
                 embedding = await db_search.compute_embedding(new_content)
@@ -1309,10 +1377,6 @@ async def merge_memories(memory_ids: list, new_title: str, new_content: str,
                     await db_search.save_memory_embedding(conn, new_id, embedding)
             except Exception as e:
                 print(f"⚠️ 合并记忆embedding计算失败（id={new_id}）: {e}")
-
-        # 将原记忆标记为不活跃
-        if new_id:
-            await deactivate_memories(memory_ids)
 
         return new_id
 

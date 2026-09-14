@@ -28,6 +28,10 @@ EN_WORD_PATTERN = re.compile(r'[a-zA-Z][a-zA-Z0-9]*')
 NUM_PATTERN = re.compile(r'\d{2,}')
 # 清理查询开头的时间戳（如 "2026-05-02 20:26"）
 TIMESTAMP_PATTERN = re.compile(r'^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}\s*\d{1,2}:\d{1,2}\s*')
+# 清理查询结尾的 Cuplivo 时间戳（如 "(Sun 26-09-06 22:52:55)"）
+CUPLIVO_TIMESTAMP_SUFFIX_PATTERN = re.compile(
+    r'\s*\((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) \d{2}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\)\s*$'
+)
 _CONVERSATION_CANDIDATE_POOL = 20
 
 # 中文停用词（高频但无搜索价值的词）
@@ -43,12 +47,16 @@ _STOP_WORDS = frozenset({
     "然后", "因为", "所以", "虽然", "但是", "可以", "已经",
     "一个", "一些", "一下", "一点", "一起", "一样",
     "比较", "应该", "可能", "如果", "这个", "那个",
-    "自己", "知道", "觉得", "感觉", "时候", "现在", 
+    "自己", "知道", "觉得", "感觉", "时候", "现在",
     # 常见虚词的双字组合（单字版本已在上面拉黑，但分词按词切分，
     # 双字组合不会被单字规则自动挡住，需要单独补充）
     "不是", "没有", "就是", "还有", "只是", "一直", "其实",
     "真的", "确实", "肯定", "应该是", "是不是", "有没有",
     "今天", "昨天", "明天", "刚才", "最近", "以前", "后来", "现在是",
+    # 上游新增高频低价值中文词（并集补齐）
+    "这样", "记得",
+    # 本地定制：角色专属称呼（高频全库泛滥词，拉黑防止污染 BM25 关键词检索导致误召回）
+    "阿澈", "阿狸", "狸宝",
 })
 
 # jieba 用户词典补充（默认词典缺失的词）
@@ -60,7 +68,7 @@ def extract_search_keywords(query: str) -> List[str]:
     """
     从查询中提取搜索关键词（TF-IDF + 正则）
 
-    1. 去掉开头的时间戳噪音
+    1. 去掉明确的时间戳前后缀噪音
     2. 用 jieba.analyse.extract_tags (TF-IDF) 提取中文关键词
     3. 正则提取英文单词
     4. 保留4位以上数字（年份等，过滤短数字噪音）
@@ -71,8 +79,8 @@ def extract_search_keywords(query: str) -> List[str]:
     "春节干了什么" → ["春节"]
     "2026除夕"    → ["2026", "除夕"]
     """
-    # 去掉时间戳前缀
-    cleaned = TIMESTAMP_PATTERN.sub('', query).strip()
+    # 去掉明确的时间戳前后缀
+    cleaned = CUPLIVO_TIMESTAMP_SUFFIX_PATTERN.sub('', TIMESTAMP_PATTERN.sub('', query)).strip()
     if not cleaned:
         cleaned = query
 
@@ -328,7 +336,7 @@ def _min_max_normalize(scores: dict) -> dict:
     min_v, max_v = min(vals), max(vals)
     spread = max_v - min_v
     if spread == 0:
-        return {k: 1.0 for k in scores}
+        return {k: 0.0 if max_v == 0 else 1.0 for k in scores}
     return {k: (v - min_v) / spread for k, v in scores.items()}
 
 

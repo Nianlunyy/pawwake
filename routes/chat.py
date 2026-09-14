@@ -8,6 +8,7 @@ import uuid
 import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 import shared
 import partition_engine
@@ -19,6 +20,142 @@ from db import memories as db_memories
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+class _ReminderLeaseKeeper:
+    """发送期间延长到期提醒的处理时限。
+
+    停止时先等正在更新的时间落库，避免结算使用旧时间而无法标记送达。
+    """
+
+    def __init__(self, pending_reminder_claims):
+        self.claims = pending_reminder_claims
+        self._task = None
+        self._inflight = None
+
+    def start(self):
+        self._task = asyncio.create_task(self._loop())
+        return self
+
+    async def _renew_once(self):
+        renewed = await db_memories.renew_reminder_claims(list(self.claims))
+        self.claims[:] = renewed
+
+    async def _loop(self):
+        while True:
+            await asyncio.sleep(memory_pipeline.REMINDER_LEASE_RENEW_SECONDS)
+            self._inflight = asyncio.ensure_future(self._renew_once())
+            try:
+                await asyncio.shield(self._inflight)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"⚠️ 提醒处理时限延长失败: {e}")
+
+    async def stop(self):
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+        inflight = self._inflight
+        if inflight is not None and not inflight.done():
+            try:
+                await inflight
+            except Exception as e:
+                print(f"⚠️ 提醒处理时限延长失败: {e}")
+
+    @property
+    def done(self) -> bool:
+        return self._task is None or self._task.done()
+
+
+def _start_reminder_lease_keeper(pending_reminder_claims):
+    """没有待处理提醒时不启动延时。"""
+    if not pending_reminder_claims:
+        return None
+    return _ReminderLeaseKeeper(pending_reminder_claims).start()
+
+
+async def _stop_reminder_lease_keeper(keeper):
+    """停稳延时循环，确保结算拿到最新的待处理提醒。"""
+    if keeper is not None:
+        await keeper.stop()
+
+
+async def _release_reminder_claims(pending_reminder_claims):
+    """上游失败时交回到期提醒，让下次请求立即重试。"""
+    if pending_reminder_claims:
+        try:
+            await db_memories.release_reminder_claims(list(pending_reminder_claims))
+            pending_reminder_claims.clear()
+        except Exception as e:
+            print(f"⚠️ 提醒处理权交回失败，等处理时限结束后自动重试: {e}")
+
+
+async def _settle_reminder_claims(lease_keeper, pending_reminder_claims, delivered_ok: bool):
+    """请求结束时标记已送达提醒；未完整送达的交回给下次请求。"""
+    await _stop_reminder_lease_keeper(lease_keeper)
+    if not pending_reminder_claims:
+        return
+    if delivered_ok:
+        try:
+            delivered = await db_memories.mark_reminders_delivered(list(pending_reminder_claims))
+        except Exception as e:
+            print(f"⚠️ 提醒送达标记失败，交回后等下次请求重试: {e}")
+            delivered = 0
+        print(f"⏰ 提醒送达 {delivered}/{len(pending_reminder_claims)} 条")
+        if delivered == len(pending_reminder_claims):
+            pending_reminder_claims.clear()
+            return
+        print("⚠️ 提醒送达数不足，未送达项交回等待重试")
+    await _release_reminder_claims(pending_reminder_claims)
+
+
+async def _close_stream_and_release(stream, pending_reminder_claims):
+    """响应任务退出后（自然结束、客户端断开、建好响应却没开始消费）显式关掉生成器，
+    让它的 finally 立即运行；生成器未启动或收尾被取消时，这里交回剩余提醒。
+    自然结束时两步都是空操作。"""
+    try:
+        await stream.aclose()
+    except Exception as e:
+        print(f"⚠️ 关闭流式生成器失败: {e}")
+    finally:
+        await _release_reminder_claims(pending_reminder_claims)
+
+
+def _streaming_response(stream, pending_reminder_claims) -> StreamingResponse:
+    """流式响应统一在这里建。Starlette 收到 http.disconnect 只取消发送任务，不会替我们关 body iterator，
+    所以挂 BackgroundTask 在响应任务退出后显式 aclose 并交回剩余提醒。"""
+    return StreamingResponse(
+        stream,
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        background=BackgroundTask(_close_stream_and_release, stream, pending_reminder_claims),
+    )
+
+
+async def _mark_pending_seen(session_id, pending_fragment_ids, pending_memory_ids):
+    if pending_fragment_ids:
+        try:
+            await db_conversations.mark_fragments_seen(
+                session_id,
+                pending_fragment_ids,
+                shared.CONVERSATION_SEEN_TTL_HOURS,
+            )
+        except Exception as e:
+            print(f"⚠️ 对话召回 seen 写入失败，保留待下次重试: {e}")
+
+    if pending_memory_ids:
+        try:
+            await db_conversations.mark_memories_seen(
+                session_id,
+                pending_memory_ids,
+                shared.MEMORY_SEEN_TTL_HOURS,
+            )
+        except Exception as e:
+            print(f"⚠️ 记忆注入 seen 写入失败，保留待下次重试: {e}")
 
 # ============================================================
 # API 接口
@@ -37,7 +174,7 @@ async def health_check():
 
     return {
         "status": "running",
-        "gateway": "Pawwake v4.1.1",
+        "gateway": "Pawwake v4.1.3",
         "system_prompt_loaded": len(resolved_system_prompt) > 0,
         "system_prompt_length": len(resolved_system_prompt),
         "database_enabled": shared.DATABASE_ENABLED,
@@ -75,21 +212,30 @@ async def chat_completions(request: Request):
             content={"error": "API_KEY 未设置，请在环境变量中配置"},
         )
 
+    # 到期提醒由这条路由负责兜底：里层抛异常或非流式返回时仍未结清，就在这里交回；
+    # 流式由生成器的 finally 结算
+    pending_reminder_claims = []
     try:
-        return await _chat_completions_inner(request)
+        response = await _chat_completions_inner(request, pending_reminder_claims)
     except Exception:
         logger.exception("Chat completion gateway failed")
+        await _release_reminder_claims(pending_reminder_claims)
         return JSONResponse(
             status_code=500,
             content={"error": {"message": "Gateway internal error", "type": "gateway_error"}},
         )
+    if pending_reminder_claims and not isinstance(response, StreamingResponse):
+        await _release_reminder_claims(pending_reminder_claims)
+    return response
 
 
-async def _chat_completions_inner(request: Request):
+async def _chat_completions_inner(request: Request, pending_reminder_claims: list = None):
     body = await request.json()
     messages = body.get("messages", [])
     pending_fragment_ids = []
     pending_memory_ids = []
+    if pending_reminder_claims is None:
+        pending_reminder_claims = []
 
     # ---------- 检测是否应跳过对话存储 ----------
     # 优先尊重客户端显式声明；无法加 header 的客户端则识别其标题生成模板。
@@ -231,7 +377,7 @@ async def _chat_completions_inner(request: Request):
         print(f"📦 分区模式: DB历史{len(db_msgs)}条 + 客户端消息{len(client_new_msgs)}条")
 
         partition_prompt = resolved_system_prompt
-        if shared.MEMORY_ENABLED and shared.MAX_MEMORIES_INJECT > 0:
+        if shared.memory_injection_enabled():
             partition_prompt = (resolved_system_prompt or "") + partition_engine.MEMORY_USAGE_GUIDE
         # 保留客户端自带的 system（工具说明等），拼接到网关 prompt 之后，
         # 与非分区路径的行为对齐（前端 system 稳定时不影响 BP1 缓存命中）
@@ -248,6 +394,7 @@ async def _chat_completions_inner(request: Request):
                     message,
                     session_id,
                     pending_memory_ids,
+                    pending_reminder_claims,
                 )
 
             messages = await partition_engine.build_partitioned_messages(
@@ -260,6 +407,7 @@ async def _chat_completions_inner(request: Request):
             )
         except Exception as e:
             print(f"❌ 分区缓存不可用：读取轮转状态失败: {e}")
+            await _release_reminder_claims(pending_reminder_claims)
             return JSONResponse(
                 status_code=503,
                 content={
@@ -278,6 +426,7 @@ async def _chat_completions_inner(request: Request):
                 enhanced_prompt = await memory_pipeline.build_system_prompt_with_memories(
                     user_message,
                     resolved_system_prompt,
+                    pending_reminder_claims,
                 )
             else:
                 enhanced_prompt = resolved_system_prompt
@@ -358,83 +507,70 @@ async def _chat_completions_inner(request: Request):
         print(f"📡 推理字段: {debug_keys}", flush=True)
 
     if is_stream:
-        return StreamingResponse(
-            stream_and_capture(
-                headers,
-                body,
-                session_id,
-                user_message,
-                model,
-                extraction_context_messages,
-                skip_conversation_log,
-                tool_messages,
-                pending_fragment_ids,
-                extraction_round_count,
-                pending_memory_ids,
-            ),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        stream = stream_and_capture(
+            headers,
+            body,
+            session_id,
+            user_message,
+            model,
+            extraction_context_messages,
+            skip_conversation_log,
+            tool_messages,
+            pending_fragment_ids,
+            extraction_round_count,
+            pending_memory_ids,
+            pending_reminder_claims,
         )
+        return _streaming_response(stream, pending_reminder_claims)
     else:
-        async with httpx.AsyncClient(timeout=300) as client:
-            response = await client.post(shared.API_BASE_URL, headers=headers, json=body)
+        # 非流式发送期间延长提醒处理时限；退出时标记送达或交回等待重试
+        delivered_ok = False
+        lease_keeper = _start_reminder_lease_keeper(pending_reminder_claims)
+        try:
+            async with httpx.AsyncClient(timeout=300) as client:
+                response = await client.post(shared.API_BASE_URL, headers=headers, json=body)
 
-            if response.status_code == 200:
-                resp_data = response.json()
-                print(f"🔬 原始响应完整结构: {json.dumps(resp_data.get('choices', [{}])[0].get('message', {}), ensure_ascii=False)[:2000]}")
-                print(f"🔍 完整usage原始数据(排查缓存字段用): {json.dumps(resp_data.get('usage', {}), ensure_ascii=False)}")
-                assistant_msg = ""
-                assistant_tool_calls = None
-                assistant_reasoning = None
-                try:
-                    msg_obj = resp_data["choices"][0]["message"]
-                    assistant_msg = msg_obj.get("content") or ""
-                    if msg_obj.get("tool_calls"):
-                        assistant_tool_calls = msg_obj["tool_calls"]
-                        print(f"🔧 Response 包含 {len(assistant_tool_calls)} 个工具调用")
-                    if msg_obj.get("reasoning_content"):
-                        assistant_reasoning = msg_obj["reasoning_content"]
-                        print(f"🧠 Response 包含 reasoning_content ({len(assistant_reasoning)}字符)")
-                except (KeyError, IndexError):
-                    pass
-
-                if pending_fragment_ids:
+                if response.status_code == 200:
+                    resp_data = response.json()
+                    print(f"🔬 原始响应完整结构: {json.dumps(resp_data.get('choices', [{}])[0].get('message', {}), ensure_ascii=False)[:2000]}")
+                    print(f"🔍 完整usage原始数据(排查缓存字段用): {json.dumps(resp_data.get('usage', {}), ensure_ascii=False)}")
+                    assistant_msg = ""
+                    assistant_tool_calls = None
+                    assistant_reasoning = None
                     try:
-                        await db_conversations.mark_fragments_seen(
-                            session_id,
-                            pending_fragment_ids,
-                            shared.CONVERSATION_SEEN_TTL_HOURS,
-                        )
-                    except Exception as e:
-                        print(f"⚠️ 对话召回 seen 写入失败，保留待下次重试: {e}")
+                        msg_obj = resp_data["choices"][0]["message"]
+                        assistant_msg = msg_obj.get("content") or ""
+                        if msg_obj.get("tool_calls"):
+                            assistant_tool_calls = msg_obj["tool_calls"]
+                            print(f"🔧 Response 包含 {len(assistant_tool_calls)} 个工具调用")
+                        if msg_obj.get("reasoning_content"):
+                            assistant_reasoning = msg_obj["reasoning_content"]
+                            print(f"🧠 Response 包含 reasoning_content ({len(assistant_reasoning)}字符)")
+                    except (KeyError, IndexError):
+                        pass
 
-                if pending_memory_ids:
+                    await _mark_pending_seen(session_id, pending_fragment_ids, pending_memory_ids)
+                    delivered_ok = True
+
+                    if shared.conversation_persistence_enabled() and (user_message or tool_messages):
+                        asyncio.create_task(
+                            memory_pipeline.process_memories_background(session_id, user_message, assistant_msg, model,
+                                                        context_messages=extraction_context_messages,
+                                                        context_round_count=extraction_round_count,
+                                                        skip_conversation_log=skip_conversation_log,
+                                                        tool_messages=tool_messages, assistant_tool_calls=assistant_tool_calls,
+                                                        assistant_reasoning=assistant_reasoning)
+                        )
+
+                    return JSONResponse(status_code=200, content=resp_data)
+                else:
                     try:
-                        await db_conversations.mark_memories_seen(
-                            session_id,
-                            pending_memory_ids,
-                            shared.MEMORY_SEEN_TTL_HOURS,
-                        )
-                    except Exception as e:
-                        print(f"⚠️ 记忆注入 seen 写入失败，保留待下次重试: {e}")
-
-                if shared.conversation_persistence_enabled() and (user_message or tool_messages):
-                    asyncio.create_task(
-                        memory_pipeline.process_memories_background(session_id, user_message, assistant_msg, model,
-                                                    context_messages=extraction_context_messages,
-                                                    context_round_count=extraction_round_count,
-                                                    skip_conversation_log=skip_conversation_log,
-                                                    tool_messages=tool_messages, assistant_tool_calls=assistant_tool_calls,
-                                                    assistant_reasoning=assistant_reasoning)
-                    )
-
-                return JSONResponse(status_code=200, content=resp_data)
-            else:
-                try:
-                    error_content = response.json()
-                except Exception:
-                    error_content = {"error": {"message": response.text[:500], "type": "upstream_error"}}
-                return JSONResponse(status_code=response.status_code, content=error_content)
+                        error_content = response.json()
+                    except Exception:
+                        error_content = {"error": {"message": response.text[:500], "type": "upstream_error"}}
+                    return JSONResponse(status_code=response.status_code, content=error_content)
+        finally:
+            await _settle_reminder_claims(lease_keeper, pending_reminder_claims, delivered_ok)
 
 
 async def stream_and_capture(
@@ -449,6 +585,46 @@ async def stream_and_capture(
     pending_fragment_ids: list = None,
     extraction_round_count: int = None,
     pending_memory_ids: list = None,
+    pending_reminder_claims: list = None,
+):
+    """流式发送期间延长提醒处理时限；结束时标记送达或交回等待重试。"""
+    stream_state = {"terminal": False}
+    lease_keeper = _start_reminder_lease_keeper(pending_reminder_claims)
+    try:
+        async for chunk in _stream_and_capture_inner(
+            headers,
+            body,
+            session_id,
+            user_message,
+            model,
+            extraction_context_messages,
+            skip_conversation_log,
+            tool_messages,
+            pending_fragment_ids,
+            extraction_round_count,
+            pending_memory_ids,
+            pending_reminder_claims,
+            stream_state,
+        ):
+            yield chunk
+    finally:
+        await _settle_reminder_claims(lease_keeper, pending_reminder_claims, stream_state["terminal"])
+
+
+async def _stream_and_capture_inner(
+    headers: dict,
+    body: dict,
+    session_id: str,
+    user_message: str,
+    model: str,
+    extraction_context_messages: list = None,
+    skip_conversation_log: bool = False,
+    tool_messages: list = None,
+    pending_fragment_ids: list = None,
+    extraction_round_count: int = None,
+    pending_memory_ids: list = None,
+    pending_reminder_claims: list = None,
+    stream_state: dict = None,
 ):
     """流式响应 + 捕获完整回复（原始字节透传，确保SSE格式和thinking数据完整）"""
     full_response = []
@@ -457,6 +633,13 @@ async def stream_and_capture(
     line_buffer = ""
     accumulated_tool_calls = {}  # index -> OpenAI-compatible tool call
     stream_succeeded = False
+    saw_terminal = False  # 见到 data: [DONE] 或 finish_reason 才算 SSE 完整结束
+
+    def _mark_terminal():
+        nonlocal saw_terminal
+        saw_terminal = True
+        if stream_state is not None:
+            stream_state["terminal"] = True
 
     if shared.is_vertex_endpoint():
         try:
@@ -484,18 +667,23 @@ async def stream_and_capture(
 
             async for chunk in response.aiter_bytes():
                 if is_error:
-                    yield chunk
                     error_body_parts.append(chunk)
+                    yield chunk
                     continue
 
-                # 旁路解析：按行处理每条SSE事件；命中思考内容（带extra_content标记）时
-                # 改写为reasoning_content字段再转发，其余原样透传
+                # 旁路解析先于透传：按行处理每条SSE事件；命中思考内容（带extra_content标记）时
+                # 改写为reasoning_content字段再转发，其余原样透传。
+                # 终止信号要在 yield 之前登记，外壳才能据此结算送达
                 text = chunk.decode("utf-8", errors="ignore")
                 line_buffer += text
                 while "\n" in line_buffer:
                     line, line_buffer = line_buffer.split("\n", 1)
                     stripped_line = line.strip()
-                    if stripped_line.startswith("data: ") and stripped_line != "data: [DONE]":
+                    if stripped_line == "data: [DONE]":
+                        _mark_terminal()
+                        yield (line + "\n").encode("utf-8")
+                        continue
+                    if stripped_line.startswith("data: "):
                         try:
                             data = json.loads(stripped_line[6:])
 
@@ -503,7 +691,12 @@ async def stream_and_capture(
                                 stream_usage = data["usage"]
 
                             choices = data.get("choices") or [{}]
-                            delta = choices[0].get("delta", {}) if choices else {}
+                            first_choice = choices[0] if choices else {}
+                            finish_reason = first_choice.get("finish_reason")
+                            if finish_reason:
+                                print(f"🏁 finish_reason: {finish_reason}")
+                                _mark_terminal()
+                            delta = first_choice.get("delta", {})
                             content = delta.get("content", "")
                             is_thinking_chunk = "extra_content" in delta and content
 
@@ -553,9 +746,9 @@ async def stream_and_capture(
                             yield (line + "\n").encode("utf-8")
                     else:
                         yield (line + "\n").encode("utf-8")
-        if line_buffer:
-            yield line_buffer.encode("utf-8")
-        stream_succeeded = response.status_code == 200
+            if line_buffer:
+                yield line_buffer.encode("utf-8")
+            stream_succeeded = response.status_code == 200
 
     assistant_msg = "".join(full_response)
     assistant_reasoning = "".join(full_reasoning) if full_reasoning else None
@@ -572,25 +765,11 @@ async def stream_and_capture(
     if assistant_tool_calls:
         print(f"🔧 Stream response 包含 {len(assistant_tool_calls)} 个工具调用")
 
-    if stream_succeeded and pending_fragment_ids:
-        try:
-            await db_conversations.mark_fragments_seen(
-                session_id,
-                pending_fragment_ids,
-                shared.CONVERSATION_SEEN_TTL_HOURS,
-            )
-        except Exception as e:
-            print(f"⚠️ 对话召回 seen 写入失败，保留待下次重试: {e}")
-
-    if stream_succeeded and pending_memory_ids:
-        try:
-            await db_conversations.mark_memories_seen(
-                session_id,
-                pending_memory_ids,
-                shared.MEMORY_SEEN_TTL_HOURS,
-            )
-        except Exception as e:
-            print(f"⚠️ 记忆注入 seen 写入失败，保留待下次重试: {e}")
+    if stream_succeeded:
+        # seen 账沿用 200 即成功的旧口径；提醒送达账由外壳按终止信号统一结算
+        await _mark_pending_seen(session_id, pending_fragment_ids, pending_memory_ids)
+        if pending_reminder_claims and not saw_terminal:
+            print("⚠️ 流式 200 但未见到 [DONE]/finish_reason，提醒不记送达并交回")
 
     if stream_usage:
         pt = stream_usage.get("prompt_tokens", 0)
