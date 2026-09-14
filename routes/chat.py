@@ -692,7 +692,9 @@ async def _stream_and_capture_inner(
 
                             choices = data.get("choices") or [{}]
                             first_choice = choices[0] if choices else {}
-                            if first_choice.get("finish_reason"):
+                            finish_reason = first_choice.get("finish_reason")
+                            if finish_reason:
+                                print(f"🏁 finish_reason: {finish_reason}")
                                 _mark_terminal()
                             delta = first_choice.get("delta", {})
                             content = delta.get("content", "")
