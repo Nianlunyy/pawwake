@@ -86,6 +86,7 @@
                     <div class="toolbar">
                         <input type="text" id="searchBox" class="search-input" placeholder="搜索记忆..." oninput="memCurrentPage=1;filterAndSort()">
                         <button class="btn btn-sm" id="semanticSearchBtn" onclick="semanticSearch()" title="使用后端混合搜索（关键词+向量）" style="white-space: nowrap;">语义搜索</button>
+                        <button class="btn btn-sm" id="coreCandidatesBtn" onclick="showCoreCandidates()" title="按可解释规则查看核心记忆候选" style="white-space: nowrap;">核心候选</button>
                         <div class="toolbar-group">
                             <input type="date" id="dateFilter" class="date-input" onchange="memCurrentPage=1;filterAndSort()" title="按日期筛选">
                             <button class="btn btn-icon" onclick="clearDateFilter()" title="清除日期">✕</button>
@@ -97,7 +98,7 @@
                             <option value="imp-asc">权重从低到高</option>
                         </select>
                         <div class="toolbar-actions">
-                            <button class="btn btn-warning" id="consolidateBtn" onclick="openConsolidateModal()">整理记忆</button>
+                            <button class="btn btn-warning" id="consolidateBtn" onclick="openConsolidateModal()">自动整理记忆</button>
                             <label class="checkbox-label">
                                 <input type="checkbox" id="selectAll" onchange="toggleAll()">
                                 <span>全选</span>
@@ -189,23 +190,35 @@
 
             <!-- 整理弹窗 -->
             <div id="consolidateModal" class="modal" style="display:none;">
-                <div class="modal-content">
-                    <h3>整理记忆</h3>
-                    <p>将指定时间段的碎片记忆整理合并为事件记忆</p>
+                <div class="modal-content modal-wide">
+                    <h3>自动整理记忆</h3>
+                    <p>AI 先生成可编辑草稿，确认后才会合并并归档来源记忆。</p>
                     <div class="form-group">
-                        <label class="form-label">开始日期：</label>
-                        <input type="date" id="consolidateDateStart" class="form-input">
+                        <label class="form-label">整理范围：</label>
+                        <select id="consolidateMode" class="select-input" onchange="updateConsolidateMode()">
+                            <option value="selected" id="consolidateSelectedOption">整理当前选中</option>
+                            <option value="date">按日期整理碎片和事件</option>
+                        </select>
                     </div>
-                    <div class="form-group">
-                        <label class="form-label">结束日期：</label>
-                        <input type="date" id="consolidateDateEnd" class="form-input">
+                    <div id="consolidateSelectedFields" class="form-group">
+                        <p class="hint">当前选中 <span id="consolidateSelectedCount">0</span> 条活跃记忆，支持混合碎片、事件和核心层级。</p>
                     </div>
-                    <div class="form-group">
-                        <p class="hint">整理过程会调用 AI 将这段时间内的碎片合并成完整事件，合并后的碎片将被标记为"已归档"。跨天的相关碎片也会被合并到一起。</p>
+                    <div id="consolidateDateFields" style="display:none;">
+                        <div class="form-group">
+                            <label class="form-label">开始日期：</label>
+                            <input type="date" id="consolidateDateStart" class="form-input">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">结束日期：</label>
+                            <input type="date" id="consolidateDateEnd" class="form-input">
+                        </div>
+                        <p class="hint">AI 会把这段时间内的活跃碎片和事件分成多组草稿；核心记忆不会被日期范围选中。</p>
                     </div>
+                    <div id="consolidateDrafts" style="margin-top: 16px;"></div>
                     <div class="modal-actions">
                         <button class="btn btn-secondary" onclick="closeConsolidateModal()">取消</button>
-                        <button class="btn btn-primary" onclick="doConsolidate()">开始整理</button>
+                        <button class="btn btn-primary" id="consolidateGenerateBtn" onclick="doConsolidate()">生成预览</button>
+                        <button class="btn btn-primary" id="confirmAllOrganizeBtn" onclick="confirmAllOrganizeDrafts()" style="display:none;">全部确认</button>
                     </div>
                 </div>
             </div>
@@ -447,7 +460,7 @@
             <section id="section-settings" class="section">
                 <div class="section-header">
                     <h2>设置</h2>
-                    <div id="settings-msg" class="msg-box" style="display:none;"></div>
+                    <div id="settings-msg" class="msg-container" style="display:none;"></div>
                 </div>
 
                 <!-- 基础连接 -->
@@ -565,12 +578,12 @@
                             <option value="rounds">按轮次 (rounds)</option>
                             <option value="time">按时间窗口 (time)</option>
                         </select>
-                        <small class="form-hint">rounds = B区满X轮触发；time = A区最早消息超过时间窗口触发</small>
+                        <small class="form-hint">rounds = B区满X轮触发；time = A区最新消息距今超过时间窗口触发</small>
                     </div>
                     <div class="settings-field" id="field-CACHE_PARTITION_WINDOW">
                         <label>时间窗口（分钟）</label>
                         <input type="number" id="set-CACHE_PARTITION_WINDOW" class="input" min="5" max="1440">
-                        <small class="form-hint">仅 time 模式生效，A区最早消息超过此时间后触发轮转</small>
+                        <small class="form-hint">仅 time 模式生效，A区最新消息距今超过此时间后触发轮转</small>
                     </div>
                     <div class="settings-field">
                         <label>缓存TTL (CACHE_TTL)</label>
@@ -586,6 +599,11 @@
                             <input type="text" id="set-CACHE_SUMMARY_MODEL" class="combo-input" placeholder="搜索或输入模型名..." autocomplete="off">
                             <div class="combo-dropdown" id="dropdown-CACHE_SUMMARY_MODEL"></div>
                         </div>
+                    </div>
+                    <div class="settings-field">
+                        <label>摘要区总预算（字符）(CACHE_SUMMARY_BUDGET_CHARS)</label>
+                        <input type="number" id="set-CACHE_SUMMARY_BUDGET_CHARS" class="input" min="0" step="500">
+                        <small class="form-hint">轮转后摘要区超过此字数时，把最旧的几段合并成一段基础摘要；固定保留最近 2 段旧摘要和本轮新段。0 = 不折叠</small>
                     </div>
                 </div>
 
@@ -676,6 +694,6 @@
         </main>
     </div>
 
-    <script src="/static/js/dashboard.js?v=4.1.1"></script>
+    <script src="/static/js/dashboard.js?v=4.1.3-1"></script>
 </body>
 </html>

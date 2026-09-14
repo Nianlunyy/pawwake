@@ -1,6 +1,6 @@
 # 🐾 Pawwake · 爪迹
 
-**4.1.1 · Madeleine**
+**4.1.3 · Madeleine**
 
 *Follow the pawprints back.*
 
@@ -18,7 +18,7 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 
 - **自定义人设** — 可用 `system_prompt.txt` 提供默认人设，也可在 Dashboard 热更新运行时人设
 - **长期记忆** — 自动从对话中提取关键信息，下次聊天时自动回忆相关内容
-- **三层记忆架构** — 碎片（自动提取的原始记忆）→ 事件（整理合并后的完整事件）→ 核心（手动标记的重要记忆），支持 AI 自动整理、手动合并、撤回合并、查看合并来源
+- **三层记忆架构** — 碎片（自动提取的原始记忆）→ 事件（整理合并后的完整事件）→ 核心（手动标记的重要记忆），支持 AI 生成可编辑的整理草稿、核心候选、手动合并、撤回合并和查看来源
 - **分区缓存** — 自动管理对话上下文，通过 A/B 区轮转 + 摘要压缩，利用 prompt caching 大幅节省 token 费用。兼容 tool 调用消息
 - **对话线管理** — 固定 session ID 实现跨平台对话衔接，支持多对话线切换、摘要编辑
 - **对话记录** — 浏览、搜索、批量管理历史对话，支持 session 合并
@@ -167,6 +167,7 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 | `CACHE_PARTITION_X` | 轮转周期（轮数）。1轮 = 一次用户发言 + AI回复。B 区攒满 X 轮触发，首次摘要生成需先装满 A、B 两区共 2X 轮 | `15` |
 | `CACHE_SUMMARY_MODEL` | 摘要模型。**留空 = 不生成摘要**，轮转时旧消息直接滑出上下文（纯轮转模式）。从旧版本升级的用户注意：旧版此项有默认模型，新版默认为空，需要摘要请显式配置。不建议使用推理模型（思考可能耗尽输出token导致摘要为空） | 空 |
 | `CACHE_SUMMARY_MAX_TOKENS`（可选） | 摘要的输出上限，日志出现"摘要生成失败: 模型返回空content"且 `finish_reason=length` 时调高此项 | `2000` |
+| `CACHE_SUMMARY_BUDGET_CHARS`（可选） | 摘要区总字符预算。轮转后摘要区超过此值时，把最旧的几段合并压缩成一段基础摘要，摘要区不再无限增长。`0` = 不折叠（旧行为）。折叠时固定保留最近 2 段旧摘要和本轮新生成的摘要原文；折叠失败时本次轮转整体不生效，下次请求重试。升级后默认即有界 | `8000` |
 | `PARTITION_SESSION_ID` | 固定的 session ID | `my-thread` |
 | `CACHE_PARTITION_TRIGGER`（可选） | 轮转触发方式：`rounds`（按轮次，默认）或 `time`（按时间窗口，适合微信等消息频率高的场景） | `rounds` |
 | `CACHE_PARTITION_WINDOW`（可选） | 时间窗口（分钟），仅 `trigger=time` 时生效。窗口内的消息不触发摘要压缩 | `30` |
@@ -198,10 +199,11 @@ pawwake/
 ├── partition_engine.py        # 分区上下文、轮转与摘要
 ├── memory_pipeline.py         # 记忆注入、对话召回与后台提取
 ├── memory_extractor.py        # AI 记忆提取器
+├── memory_consolidator.py     # 自动整理预览与核心候选
 ├── routes/                    # 按领域拆分的 HTTP 路由
 │   ├── chat.py                # 健康检查与 OpenAI 兼容聊天
 │   ├── dashboard.py           # Dashboard、模型列表与设置
-│   ├── memories.py            # 记忆管理、导入、整理与补算
+│   ├── memories.py            # 记忆管理、导入、整理接口与补算
 │   ├── conversations.py       # 对话管理与片段检索
 │   └── partition.py           # 分区状态与对话线管理
 ├── db/                        # PostgreSQL 数据层
@@ -239,9 +241,10 @@ pawwake/
 | `/import/seed-memories` | GET | 执行预置记忆导入（开发者用） |
 | `/api/memories` | GET/POST | 获取记忆，或显式创建一条记忆 |
 | `/api/memories/search` | GET/POST | 混合搜索记忆；私密查询推荐 POST JSON `{"q":"..."}` |
-| `/api/memories/consolidate` | POST | 手动触发记忆整理（异步，碎片 → 事件） |
-| `/api/memories/consolidate/status` | GET | 查询整理任务状态 |
+| `/api/memories/consolidate` | POST | 按当前所选活跃记忆，或日期范围内的活跃碎片与事件异步生成可编辑草稿，不写数据库 |
+| `/api/memories/consolidate/status` | GET | 查询整理草稿生成状态与结果 |
 | `/api/memories/merge` | POST | 手动合并多条记忆 |
+| `/api/memories/core-candidates` | GET | 返回最多 20 条可解释的核心记忆候选，不自动升级 |
 | `/api/memories/check-duplicate` | POST | 记忆去重检查 |
 | `/api/memories/cleanup-fragments` | POST | 清理 N 天前的归档碎片 |
 | `/api/memories/layer-stats` | GET | 获取各层记忆统计 |
@@ -308,7 +311,7 @@ pawwake/
 | `MEMORY_HW_SEMANTIC` | 混合搜索：语义相似度权重 | `0.35` |
 | `MEMORY_HW_IMPORTANCE` | 混合搜索：重要程度权重 | `0.15` |
 | `MEMORY_HW_RECENCY` | 混合搜索：时间衰减权重 | `0.15` |
-| `MEMORY_SEMANTIC_THRESHOLD` | 向量相似度阈值 | `0.5` |
+| `MEMORY_SEMANTIC_THRESHOLD` | 向量相似度阈值 | `0.7` |
 
 开启后，新记忆会自动计算 embedding。已有记忆可以在 Dashboard 记忆管理页面点击「开始补算」一键补算。
 
@@ -370,8 +373,26 @@ A: 能。这个项目的第一个部署者就是不会写代码的——代码�
 
 ## 📋 更新日志
 
+### v4.1.3 · Madeleine（2026-09-13）
+
+- **统一自动整理流水线** — 当前勾选可包含任意数量的活跃碎片、事件和核心记忆；按日期只选择活跃碎片与事件，两种范围共用按事件分组、来源覆盖校验和拆批逻辑
+- **保护核心记忆确认** — 含核心来源的草稿明确标记并退出“全部确认”，只能逐组确认或编辑，避免日期范围与批量确认意外归档核心记忆
+
+### v4.1.2 · Madeleine（2026-09-12）
+
+- **限制后台自动接管层级** — 自动提取只允许淘汰碎片记忆；事件记忆和核心记忆保持活跃，新事实改存为独立碎片并记录被拦截的接管
+- **修正时间窗口轮转判断** — 时间触发改为比较 A 区最新消息与当前时间，持续对话也会按窗口正确轮转
+- **限制摘要区总量** — 新增可热更新的 `CACHE_SUMMARY_BUDGET_CHARS`（默认 `8000`，设为 `0` 保留旧行为）；超出预算时折叠最旧摘要，折叠结果无效则放弃本轮轮转并在下次请求重试
+- **新增到期提醒** — 记忆支持 `remind_at` 与 `reminder_delivered_at`；到期项每次只交给一个请求并注入下一次对话，响应成功结束才标记送达，失败或取消后交给后续请求重试
+- **新增自动整理预览** — Dashboard 可整理当前选中的混合层级记忆，也可按日期批量整理碎片；AI 先生成可编辑草稿，用户逐条确认后才写入数据库，核心候选仍只给建议
+- **强化确认合并安全性** — 确认前校验来源 ID，事务内锁定并复验每条来源仍存在、活跃且没有未送达提醒，再创建新记忆并归档来源
+- **统一整理日期口径** — 合并来源没有 `event_date` 时，按 `TIMEZONE_HOURS` 将 `created_at` 换算为 Dashboard 本地日期，避免午夜附近的碎片被记到相邻 UTC 日期
+- **收紧整理辅助查询范围** — 所选记忆只读取指定 ID，核心候选的过滤、排序与上限下推到 SQL
+- **统一辅助模型请求** — 提取、评分、整理、摘要与草稿共用 `shared.post_chat_completion`，统一 OpenAI 兼容请求头，并为 OpenRouter 补齐归属请求头
+
 ### v4.1.1 · Madeleine（2026-08-24）
 
+- **记忆语义阈值默认上调** — `MEMORY_SEMANTIC_THRESHOLD` 从 `0.5` 调整为 `0.7`，减少弱向量候选进入混合排序；只影响未显式配置该值的部署，`.env` 或 Dashboard 已保存的值继续保留，老用户需要时可自行调整
 - **记忆注入短窗去重** — 分区模式按 session 记录实际成功注入的 `memories.id`，默认 6 小时内不重复注入；逐条独立过期并由后排候选递补，客户端取消或上游失败不落账，`MEMORY_SEEN_TTL_HOURS=0` 可关闭
 - **BREAKING：移除重复的自动流水线开关** — 删除 `MEMORY_EXTRACT_ENABLED`；原先设为 `false` 的部署，升级前请改设 `MEMORY_EXTRACT_INTERVAL=0` 与 `MAX_MEMORIES_INJECT=0`。前者禁用自动提取，后者禁用自动注入；消息持久化和手动记忆管理不受影响。旧环境仍保留该变量时，启动日志会说明它已被忽略并给出两个替代键
 

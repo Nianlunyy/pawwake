@@ -10,7 +10,10 @@ v2.3 改进：提取时注入已有记忆，让模型对比后只提取全新信
 import os
 import json
 import httpx
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict
+
+import shared
 
 API_KEY = os.getenv("API_KEY", "")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://openrouter.ai/api/v1/chat/completions")
@@ -75,6 +78,48 @@ def _diagnose_incomplete(finish_reason, completion_tokens, reasoning_tokens) -> 
     )
 
 
+_WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+
+def _local_now():
+    """提取 prompt 用的本地时间快照：一次构造里当前时间、日期对照表和动态示例共用同一个 now。"""
+    return datetime.now(timezone(timedelta(hours=shared.TIMEZONE_HOURS)))
+
+
+def _now_local_text(local) -> str:
+    """写进提取 prompt 的当前本地时间，外加未来十四天的日期对照表：
+    模型自己推"下周三"容易差一天，给它查表比让它算靠谱；十四天保证任何一天看到的"下周X"都在表里。"""
+    sign = "+" if shared.TIMEZONE_HOURS >= 0 else "-"
+    head = f"{local.strftime('%Y-%m-%d %H:%M')} {_WEEKDAYS[local.weekday()]}（UTC{sign}{abs(shared.TIMEZONE_HOURS):02d}:00）"
+    labels = {1: "明天", 2: "后天"}
+    days = []
+    for offset in range(1, 15):
+        day = local + timedelta(days=offset)
+        tag = f"，{labels[offset]}" if offset in labels else ""
+        days.append(f"{day.strftime('%m-%d')} {_WEEKDAYS[day.weekday()]}{tag}")
+    return head + "\n- 未来两周日期对照：" + "；".join(days)
+
+
+def _remind_example(local) -> str:
+    """示例随当前时间生成（明天 15:00 本地），不会变成过去时间。"""
+    return (local + timedelta(days=1)).replace(hour=15, minute=0, second=0, microsecond=0).isoformat()
+
+
+def parse_remind_at(value):
+    """模型给的 remind_at：必须是带时区偏移的 ISO 8601 且在将来，其余一律当 null。"""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    if parsed <= datetime.now(timezone.utc):
+        return None
+    return parsed
+
+
 EXTRACTION_PROMPT = """你是信息提取专家，负责从对话中识别并提取值得长期记住的关键信息。
 
 
@@ -94,7 +139,14 @@ EXTRACTION_PROMPT = """你是信息提取专家，负责从对话中识别并提
 - 每条记忆控制在100-150字以内：谁、发生了什么、情绪归因（一笔点出原因和落点即可，不展开心理活动的过程）、结论/约定——四项齐全就够，舍弃场景铺陈、动作细节、体感描写这类装饰性内容
 - 事件类记忆一般转述为自己的话；仅当涉及具体的承诺/约定内容时，可保留不超过20字的关键原话作为准确记录，其余对话内容一律转述，不引用
 - 技术/工作类：仅记录最终达成的共识与产品决定（如"架构已升级"），绝不记录排查细节
- 
+
+# 提醒时间（remind_at）
+- 当前本地时间：{now_local}
+- 只有当阿狸明确要求届时提醒（"提醒我""到时候叫我""别忘了提醒"），或双方明确承诺到了那个时间再提这件事，才填写 remind_at
+- 单纯说到计划、安排、日程、回忆，或时间已经过去，一律填 null；不确定就填 null
+- 格式为带时区偏移的 ISO 8601，如 {remind_example}；相对日期按上面的当前本地时间和日期对照表换算
+- 明确要求提醒但只给了截止日期、没给提醒时点或提前量的（"月底要交报告，你提醒我"），落在截止日当天 00:00；"别让我拖到最后一天"这类话不推成提前，只有阿狸明确说了"提前一天提醒"之类才往前移
+
 # 严禁提取【噪声过滤】
 - 日常无意义寒暄（"你好""在吗"）
 - 纯知识性讲解（百科、翻译、代码实现等不涉及双方私人关系的内容）
@@ -119,9 +171,10 @@ EXTRACTION_PROMPT = """你是信息提取专家，负责从对话中识别并提
 # 输出格式
 请用以下 JSON 格式返回（不要包含其他内容）：
 [
-  {{"content": "记忆内容", "importance": 分数, "action": "new", "candidate_id": null}},
-  {{"content": "记忆内容", "importance": 分数, "action": "duplicate", "candidate_id": 旧记忆ID}},
-  {{"content": "记忆内容", "importance": 分数, "action": "supersede", "candidate_id": 被取代的旧记忆ID}}
+  {{"content": "记忆内容", "importance": 分数, "action": "new", "candidate_id": null, "remind_at": null}},
+  {{"content": "记忆内容", "importance": 分数, "action": "duplicate", "candidate_id": 旧记忆ID, "remind_at": null}},
+  {{"content": "记忆内容", "importance": 分数, "action": "supersede", "candidate_id": 被取代的旧记忆ID, "remind_at": null}},
+  {{"content": "阿狸明天下午三点要交报告，让我到时候提醒", "importance": 分数, "action": "new", "candidate_id": null, "remind_at": "{remind_example}"}}
 ]
 
 importance 分数 1-10，10 最重要。
@@ -175,19 +228,22 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
         memories_text = "（暂无已知信息）"
 
     # 把已有记忆填入prompt
-    prompt = EXTRACTION_PROMPT.format(existing_memories=memories_text)
+    local_now = _local_now()
+    prompt = EXTRACTION_PROMPT.format(
+        existing_memories=memories_text,
+        now_local=_now_local_text(local_now),
+        remind_example=_remind_example(local_now),
+    )
 
     # 调用 LLM 提取记忆
     try:
         async with httpx.AsyncClient(timeout=60) as client:
-            headers, memory_model = _build_vertex_headers_and_model(MEMORY_MODEL)
-            headers["HTTP-Referer"] = "https://midsummer-gateway.local"
-            headers["X-Title"] = "Midsummer Memory Extraction"
-            response = await client.post(
+            response = await shared.post_chat_completion(
+                client,
                 API_BASE_URL,
-                headers=headers,
-                json={
-                    "model": memory_model,
+                get_memory_api_key(),
+                {
+                    "model": MEMORY_MODEL,
                     "max_tokens": MEMORY_MAX_TOKENS,
                     "messages": [
                         {"role": "system", "content": prompt},
@@ -284,6 +340,7 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
                         "importance": int(mem.get("importance", 5)),
                         "action": action,
                         "candidate_id": candidate_id,
+                        "remind_at": parse_remind_at(mem.get("remind_at")),
                     })
 
             print(f"📝 从对话中提取了 {len(valid_memories)} 条新记忆（已对比 {len(existing_memories or [])} 条已有记忆）")
@@ -316,6 +373,10 @@ SCORING_PROMPT = """你是记忆重要性评分专家。请对以下记忆条目
 只返回 JSON，不要其他文字。"""
 
 
+def _default_scores(texts: List[str]) -> List[Dict]:
+    return [{"content": text, "importance": 5} for text in texts]
+
+
 async def score_memories(texts: List[str]) -> List[Dict]:
     """对纯文本记忆条目批量评分"""
     if not texts:
@@ -326,12 +387,12 @@ async def score_memories(texts: List[str]) -> List[Dict]:
 
     try:
         async with httpx.AsyncClient(timeout=60) as client:
-            headers, memory_model = _build_vertex_headers_and_model(MEMORY_MODEL)
-            response = await client.post(
+            response = await shared.post_chat_completion(
+                client,
                 API_BASE_URL,
-                headers=headers,
-                json={
-                    "model": memory_model,
+                get_memory_api_key(),
+                {
+                    "model": MEMORY_MODEL,
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0,
                     # 跟提取同一个模型同一类活，跟着同一个配置走；写死会让用户调了也不生效
@@ -342,7 +403,7 @@ async def score_memories(texts: List[str]) -> List[Dict]:
             if response.status_code != 200:
                 print(f"⚠️  记忆评分请求失败: {response.status_code}, model={MEMORY_MODEL}: {response.text[:500]}")
                 # 失败时返回默认分数
-                return [{"content": t, "importance": 5} for t in texts]
+                return _default_scores(texts)
 
             data = response.json()
             text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
@@ -365,12 +426,12 @@ async def score_memories(texts: List[str]) -> List[Dict]:
                     try:
                         memories = json.loads(match.group())
                     except json.JSONDecodeError:
-                        return [{"content": t, "importance": 5} for t in texts]
+                        return _default_scores(texts)
                 else:
-                    return [{"content": t, "importance": 5} for t in texts]
+                    return _default_scores(texts)
 
             if not isinstance(memories, list):
-                return [{"content": t, "importance": 5} for t in texts]
+                return _default_scores(texts)
 
             valid = []
             for mem in memories:
@@ -385,4 +446,4 @@ async def score_memories(texts: List[str]) -> List[Dict]:
 
     except Exception as e:
         print(f"⚠️  记忆评分出错: {e}")
-        return [{"content": t, "importance": 5} for t in texts]
+        return _default_scores(texts)

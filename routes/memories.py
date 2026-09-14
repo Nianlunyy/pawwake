@@ -1,16 +1,14 @@
 """Memory CRUD, import, lifecycle, and backfill routes."""
 
 import asyncio
-import json
 import logging
-import os
 from datetime import date, datetime, timedelta, timezone
 
-import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 import shared
+import memory_consolidator
 from db import core as db_core
 from db import search as db_search
 from db import conversations as db_conversations
@@ -60,11 +58,14 @@ async def export_memories():
                 mem["created_at"] = str(mem["created_at"])
             if mem.get("event_date"):
                 mem["event_date"] = str(mem["event_date"])
+            for key in ("remind_at", "reminder_delivered_at"):
+                if mem.get(key):
+                    mem[key] = str(mem[key])
 
         return {
-            "schema_version": 3,
+            "schema_version": 4,
             "total": len(memories),
-            "exported_at": str(__import__("datetime").datetime.now()),
+            "exported_at": str(datetime.now()),
             "memories": memories,
         }
     except db_memories.BrokenMergeReferencesError as e:
@@ -210,11 +211,12 @@ async def api_get_memories(layer: int = None, active_only: bool = None):
     memories = await db_memories.get_all_memories_detail(layer=layer, active_only=active_only)
     tz_offset = timezone(timedelta(hours=shared.TIMEZONE_HOURS))
     for m in memories:
-        if m.get("created_at"):
-            dt = m["created_at"]
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            m["created_at"] = dt.astimezone(tz_offset).strftime("%Y-%m-%d %H:%M:%S")
+        for key in ("created_at", "remind_at", "reminder_delivered_at"):
+            if m.get(key):
+                dt = m[key]
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                m[key] = dt.astimezone(tz_offset).strftime("%Y-%m-%d %H:%M:%S")
     # 获取层级统计
     try:
         layer_stats = await db_memories.get_layer_statistics()
@@ -382,39 +384,6 @@ async def api_batch_restore(request: Request):
 # 三层记忆架构：整理 / 合并 / 升级 / 统计
 # ============================================================
 
-CONSOLIDATION_PROMPT = """
-你是记忆整理助手。请将以下对话碎片整理成完整的事件记录。
-
-人称要求【核心红线】：
-- 涉及我的言行、承诺与主观情绪时统一自称"我"，禁止改写成"阿澈..."这类第三人称表述
-- 涉及阿狸的部分统一使用"阿狸"或"狸宝"。
-
-要求：
-1. 按主题/事件分组，相关的碎片合并到一起
-2. 每个事件一条记录，视合并的碎片数量灵活控制篇幅：合并2-3条时不超过200字，合并4条以上不超过300字——目标是消除同一事件内的信息重复，不是要把原本分散在多条碎片里的不同细节硬塞进跟单条碎片一样窄的空间里
-3. 每条记录包含：标题（10字内）+ 完整描述，描述开头先写最核心的结论/事实，次要的场景细节和过程描述放在后面
-4. 合并重复内容，保留重要细节
-5. 保留原文中的主观感受、情绪表达和个人化用语，不要改写为客观陈述或第三方总结
-6. content字段中不要使用双引号，用单引号或书名号代替
-7. 每个输入碎片ID必须且只能出现在一个事件的merged_ids中，不得遗漏或重复；无法与其他内容合并的碎片也要单独生成一条事件
-8. importance按1-10打分，需要真实反映事件的重要程度：日常寒暄类1-3分，一般性互动4-6分，重要承诺/情绪转折/里程碑事件7-9分，10分仅用于极少数、影响深远的核心事件——禁止不加区分地统一给出同一个分数
-
-碎片记忆：
-{fragments}
-
-请用 JSON 格式输出：
-[
-  {{
-    "title": "事件标题（10字内）",
-    "content": "完整的事件描述",
-    "importance": <1-10的整数，见上方打分标准>,
-    "merged_ids": [1, 2, 3]
-  }}
-]
-
-只输出 JSON，不要其他内容。确保 JSON 语法正确。
-"""
-
 # 整理状态（异步执行，防重入）
 _consolidate_status = {
     "running": False,
@@ -424,395 +393,123 @@ _consolidate_status = {
 }
 
 
-class ConsolidationError(Exception):
-    """记忆整理失败，调用方可以安全地保留全部原始碎片。"""
-
-
-class ConsolidationTruncatedError(ConsolidationError):
-    """模型输出达到上限，不能把残缺 JSON 当成有效结果。"""
-
-
-class ConsolidationCoverageError(ConsolidationError):
-    """模型返回的 merged_ids 没有完整且唯一地覆盖当前批次。"""
-
-
-def _parse_json_array(content):
-    """解析完整 JSON 数组，允许代码围栏和前后说明，不接受半截数组。"""
-    text = (content or "").strip()
-    if text.startswith("```"):
-        first_newline = text.find("\n")
-        text = text[first_newline + 1:] if first_newline >= 0 else ""
-        if text.rstrip().endswith("```"):
-            text = text.rstrip()[:-3]
-        text = text.strip()
-
-    candidates = [text]
-    first_array = text.find("[")
-    if first_array > 0:
-        candidates.append(text[first_array:])
-
-    last_error = None
-    for candidate in candidates:
-        if not candidate:
-            continue
-        try:
-            value, _ = json.JSONDecoder(strict=False).raw_decode(candidate)
-        except json.JSONDecodeError as exc:
-            last_error = exc
-            continue
-        if isinstance(value, list):
-            return value
-        last_error = ValueError("AI 返回的 JSON 顶层不是数组")
-
-    detail = str(last_error) if last_error else "响应为空或未包含 JSON 数组"
-    raise ConsolidationError(f"JSON解析失败: {detail}")
-
-
-def _completion_metadata(data, max_tokens):
-    """读取停止原因和 usage；部分兼容上游只返回其中一项。"""
-    choice = (data.get("choices") or [{}])[0]
-    usage = data.get("usage") or {}
-    completion_tokens = usage.get("completion_tokens")
-    reasoning_tokens = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
-    finish_reason = choice.get("finish_reason")
-    if finish_reason is not None:
-        # 推理模型的思考 token 会计入 completion_tokens，可能超过 max_tokens
-        # 而正文完整。上游明确报 length 才算截断，报 stop 的完整回复直接放行
-        truncated = finish_reason == "length"
-    else:
-        truncated = isinstance(completion_tokens, int) and completion_tokens >= max_tokens
-    return {
-        "content": (choice.get("message") or {}).get("content") or "",
-        "finish_reason": finish_reason,
-        "completion_tokens": completion_tokens,
-        "reasoning_tokens": reasoning_tokens,
-        "truncated": truncated,
-    }
-
-
-async def _post_consolidation_completion(client, prompt, model, max_tokens, label):
-    """调用整理模型；仅对 429 做有界重试。"""
-    last_error = None
-
-    if shared.is_vertex_endpoint() and "/" not in model:
-        model = f"google/{model}"
-
-    headers = {
-        "Authorization": f"Bearer {shared.get_memory_api_key()}",
-        "Content-Type": "application/json"
-    }
-    if shared.is_vertex_endpoint():
-        try:
-            headers["Authorization"] = f"Bearer {shared.get_vertex_access_token()}"
-        except Exception as e:
-            print(f"⚠️ 记忆整理模型 Vertex Token 获取失败: {e}")
-
-    for attempt in range(3):
-        response = await client.post(
-            shared.API_BASE_URL,
-            headers=headers,
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": max_tokens
-            }
-        )
-
-        if response.status_code == 429:
-            wait_time = (attempt + 1) * 10
-            print(f"⚠️ {label} API 429限流，{wait_time}秒后重试（第{attempt + 1}次）")
-            last_error = f"429 Too Many Requests（重试{attempt + 1}次）"
-            await asyncio.sleep(wait_time)
-            continue
-
-        if response.status_code != 200:
-            raise ConsolidationError(
-                f"{label} API调用失败: HTTP {response.status_code}: {response.text[:200]}"
-            )
-
-        try:
-            data = response.json()
-        except Exception as exc:
-            raise ConsolidationError(f"{label} API返回的响应不是JSON: {exc}") from exc
-
-        metadata = _completion_metadata(data, max_tokens)
-        usage_text = (
-            f"{metadata['completion_tokens']}/{max_tokens}"
-            if metadata["completion_tokens"] is not None
-            else f"未知/{max_tokens}"
-        )
-        reasoning_text = (
-            f"，其中推理 {metadata['reasoning_tokens']}"
-            if metadata["reasoning_tokens"] is not None
-            else ""
-        )
-        print(
-            f"🧩 {label}模型返回 {len(metadata['content'])} 字符，"
-            f"finish_reason={metadata['finish_reason']}，"
-            f"completion_tokens={usage_text}{reasoning_text}",
-            flush=True,
-        )
-        return metadata
-
-    raise ConsolidationError(f"{label} API调用失败: {last_error}")
-
-
-async def _request_consolidation_events(client, fragments, model, max_tokens):
-    fragments_text = "\n".join([
-        f"[ID={fragment['id']}] "
-        f"({fragment['created_at'].strftime('%m-%d') if hasattr(fragment['created_at'], 'strftime') else str(fragment['created_at'])[:10]}) "
-        f"{fragment['content']}"
-        for fragment in fragments
-    ])
-    prompt = CONSOLIDATION_PROMPT.format(fragments=fragments_text)
-    metadata = await _post_consolidation_completion(
-        client, prompt, model, max_tokens, "整理"
-    )
-
-    if metadata["truncated"]:
-        raise ConsolidationTruncatedError(
-            f"整理输出达到上限（finish_reason={metadata['finish_reason']}，"
-            f"completion_tokens={metadata['completion_tokens']}/{max_tokens}）"
-        )
-
-    try:
-        return _parse_json_array(metadata["content"])
-    except ConsolidationError as original_error:
-        repair_prompt = (
-            "请修复以下JSON的语法错误，只输出修复后的完整JSON数组，不要删减任何事件，"
-            "不要添加其他内容：\n"
-            f"{metadata['content']}"
-        )
-        repaired = await _post_consolidation_completion(
-            client, repair_prompt, model, max_tokens, "JSON修复"
-        )
-        if repaired["truncated"]:
-            raise ConsolidationTruncatedError(
-                f"JSON修复输出达到上限（finish_reason={repaired['finish_reason']}，"
-                f"completion_tokens={repaired['completion_tokens']}/{max_tokens}）"
-            ) from original_error
-        try:
-            return _parse_json_array(repaired["content"])
-        except ConsolidationError as repair_error:
-            raise ConsolidationError(
-                f"JSON解析失败（AI修复也失败）: {repair_error}"
-            ) from original_error
-
-
-def _normalize_consolidation_events(events, fragments, event_date):
-    """校验模型结果，并把 merged_ids 规范为唯一、完整的整数集合。"""
-    expected_ids = [int(fragment["id"]) for fragment in fragments]
-    expected_set = set(expected_ids)
-    if len(expected_ids) != len(expected_set):
-        raise ConsolidationCoverageError("输入碎片ID存在重复")
-
-    normalized = []
-    seen_ids = set()
-    for index, event in enumerate(events):
-        if not isinstance(event, dict):
-            raise ConsolidationCoverageError(f"第 {index + 1} 个事件不是JSON对象")
-
-        raw_ids = event.get("merged_ids")
-        if not isinstance(raw_ids, list) or not raw_ids:
-            raise ConsolidationCoverageError(f"第 {index + 1} 个事件缺少 merged_ids")
-
-        merged_ids = []
-        for raw_id in raw_ids:
-            if isinstance(raw_id, bool):
-                raise ConsolidationCoverageError(f"非法碎片ID: {raw_id}")
-            if isinstance(raw_id, int):
-                memory_id = raw_id
-            elif isinstance(raw_id, str) and raw_id.strip().isdigit():
-                memory_id = int(raw_id)
-            else:
-                raise ConsolidationCoverageError(f"非法碎片ID: {raw_id}")
-            if memory_id not in expected_set:
-                raise ConsolidationCoverageError(f"模型返回了批次外碎片ID: {memory_id}")
-            if memory_id in seen_ids:
-                raise ConsolidationCoverageError(f"碎片ID被重复合并: {memory_id}")
-            seen_ids.add(memory_id)
-            merged_ids.append(memory_id)
-
-        raw_content = event.get("content")
-        if not isinstance(raw_content, str) or not raw_content.strip():
-            raise ConsolidationCoverageError(f"第 {index + 1} 个事件缺少 content")
-        content = raw_content.strip()
-
-        try:
-            importance = int(event.get("importance", 5))
-        except (TypeError, ValueError):
-            importance = 5
-
-        normalized.append({
-            "title": str(event.get("title", "")).strip(),
-            "content": content,
-            "importance": max(1, min(10, importance)),
-            "merged_ids": merged_ids,
-            "event_date": event_date,
-        })
-
-    missing_ids = expected_set - seen_ids
-    if missing_ids:
-        raise ConsolidationCoverageError(
-            f"模型遗漏碎片ID: {sorted(missing_ids)}"
-        )
-    return normalized
-
-
-async def _consolidate_fragment_batch(client, fragments, event_date, model, max_tokens):
-    """整理一个批次；输出过长或覆盖不全时递归二分，不写数据库。"""
-    try:
-        raw_events = await _request_consolidation_events(
-            client, fragments, model, max_tokens
-        )
-        events = _normalize_consolidation_events(
-            raw_events, fragments, event_date
-        )
-        return {
-            "events": events,
-            "batches": 1,
-            "split_retries": 0,
-        }
-    except (ConsolidationTruncatedError, ConsolidationCoverageError) as exc:
-        if len(fragments) <= 1:
-            raise ConsolidationError(
-                f"单条碎片仍无法安全整理（ID={fragments[0]['id']}）: {exc}"
-            ) from exc
-
-        midpoint = len(fragments) // 2
-        print(
-            f"⚠️ 整理批次需要拆分（{len(fragments)} 条）: {exc}",
-            flush=True,
-        )
-        left = await _consolidate_fragment_batch(
-            client, fragments[:midpoint], event_date, model, max_tokens
-        )
-        right = await _consolidate_fragment_batch(
-            client, fragments[midpoint:], event_date, model, max_tokens
-        )
-        return {
-            "events": left["events"] + right["events"],
-            "batches": left["batches"] + right["batches"],
-            "split_retries": left["split_retries"] + right["split_retries"] + 1,
-        }
-
-
-async def consolidate_memories_for_date_range(start_date, end_date):
-    """按本地日期整理碎片；全部批次成功后再用单个事务写库。"""
-    # 跟提取、评分共用同一份模型配置，面板热更新也一起跟。
-    # 别 fallback 到 DEFAULT_MODEL，那是主聊天模型，拿它跑后台批处理会按主力模型计价
-    import memory_extractor as _me_mod
-    consolidation_model = _me_mod.MEMORY_MODEL
-    consolidation_max_tokens = int(os.getenv("MEMORY_MAX_TOKENS", "4000"))
-
-    try:
-        all_fragments = []
-        all_events = []
-        batches = 0
-        split_retries = 0
-        days_processed = 0
-
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            current_date = start_date
-            while current_date <= end_date:
-                fragments = await db_memories.get_fragments_by_date(current_date)
-                if fragments:
-                    result = await _consolidate_fragment_batch(
-                        client,
-                        fragments,
-                        current_date,
-                        consolidation_model,
-                        consolidation_max_tokens,
-                    )
-                    all_fragments.extend(fragments)
-                    all_events.extend(result["events"])
-                    batches += result["batches"]
-                    split_retries += result["split_retries"]
-                    days_processed += 1
-                current_date += timedelta(days=1)
-
-        if not all_fragments:
-            return {
-                "status": "no_fragments",
-                "start_date": str(start_date),
-                "end_date": str(end_date),
-            }
-
-        expected_fragment_ids = [int(fragment["id"]) for fragment in all_fragments]
-        created_ids = await db_memories.create_consolidated_events(
-            all_events, expected_fragment_ids
-        )
-
-        return {
-            "status": "ok",
-            "start_date": str(start_date),
-            "end_date": str(end_date),
-            "days_processed": days_processed,
-            "batches_processed": batches,
-            "split_retries": split_retries,
-            "fragments_processed": len(all_fragments),
-            "events_created": len(created_ids),
-        }
-    except Exception:
-        logger.exception("Memory consolidation failed")
-        return {"status": "error", "error": "整理失败，原始碎片未归档"}
-
-
 @router.post("/api/memories/consolidate")
 async def api_manual_consolidate(request: Request):
-    """手动触发整理（异步，立即返回）
-
-    Body:
-        start_date: 开始日期（YYYY-MM-DD 格式）
-        end_date: 结束日期（YYYY-MM-DD 格式）
-        或
-        date: 单个日期（兼容旧版）
-    """
+    """Generate editable organization drafts without changing memory state."""
     if not shared.MEMORY_ENABLED:
         return {"error": "记忆系统未启用"}
-
     if _consolidate_status.get("running"):
         return {"status": "already_running", "started_at": _consolidate_status.get("started_at")}
 
-    data = await request.json()
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "请求体必须是 JSON"})
+    if not isinstance(data, dict):
+        return JSONResponse(status_code=400, content={"error": "请求体必须是 JSON 对象"})
 
-    # 解析日期参数
-    if "date" in data and "start_date" not in data:
-        start_date = datetime.strptime(data["date"], "%Y-%m-%d").date()
-        end_date = start_date
+    memory_ids = data.get("ids")
+    if memory_ids is not None:
+        if not isinstance(memory_ids, list):
+            return JSONResponse(status_code=400, content={"error": "ids 必须是整数数组"})
+        if len(memory_ids) < 2:
+            return JSONResponse(status_code=400, content={"error": "请至少选择 2 条记忆"})
+        if any(isinstance(memory_id, bool) or not isinstance(memory_id, int) for memory_id in memory_ids):
+            return JSONResponse(status_code=400, content={"error": "ids 必须是整数数组"})
+        if len(set(memory_ids)) != len(memory_ids):
+            return JSONResponse(status_code=400, content={"error": "ids 不能重复"})
+
+        memories_by_id = {
+            memory["id"]: memory
+            for memory in await db_memories.get_all_memories_detail(
+                active_only=True,
+                memory_ids=memory_ids,
+            )
+        }
+        if any(memory_id not in memories_by_id for memory_id in memory_ids):
+            return JSONResponse(status_code=400, content={"error": "只能整理仍然活跃的记忆"})
+        memories = [memories_by_id[memory_id] for memory_id in memory_ids]
+        blocked = [
+            memory["id"] for memory in memories
+            if memory.get("remind_at") is not None and memory.get("reminder_delivered_at") is None
+        ]
+        if blocked:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"记忆 {blocked} 带有未送达的提醒，不能整理"},
+            )
+        label = f"已选 {len(memories)} 条记忆"
+
+        async def build_preview():
+            return await memory_consolidator.preview_memories(memories)
     else:
-        start_date_str = data.get("start_date")
-        end_date_str = data.get("end_date")
-
-        if not start_date_str or not end_date_str:
-            return {"error": "请提供开始和结束日期"}
-
-        start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
-        end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
-
+        try:
+            if "date" in data and "start_date" not in data:
+                start_date = datetime.strptime(data["date"], "%Y-%m-%d").date()
+                end_date = start_date
+            else:
+                start_date_str = data.get("start_date")
+                end_date_str = data.get("end_date")
+                if not start_date_str or not end_date_str:
+                    return {"error": "请提供已选记忆，或开始和结束日期"}
+                start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+                end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            return JSONResponse(status_code=400, content={"error": "日期格式必须是 YYYY-MM-DD"})
         if start_date > end_date:
             return {"error": "开始日期不能晚于结束日期"}
+        label = f"{start_date}~{end_date}"
+
+        async def build_preview():
+            return await memory_consolidator.preview_date_range(start_date, end_date)
 
     async def _run():
-        _consolidate_status.update({"running": True, "started_at": f"{start_date}~{end_date}", "result": None, "error": None})
         try:
-            result = await consolidate_memories_for_date_range(start_date, end_date)
-            _consolidate_status["result"] = result
-            print(f"[manual/consolidate] 整理 {start_date}~{end_date}: {result}")
-        except Exception:
-            logger.exception("Manual memory consolidation failed for %s~%s", start_date, end_date)
-            _consolidate_status["error"] = "整理失败，原始碎片未归档"
+            _consolidate_status["result"] = await build_preview()
+            print(f"[manual/consolidate] 草稿生成完成: {label}")
+        except Exception as exc:
+            logger.exception("Memory organization preview failed: %s", label)
+            _consolidate_status["error"] = str(exc)
         finally:
             _consolidate_status["running"] = False
 
+    _consolidate_status.update({
+        "running": True,
+        "started_at": label,
+        "result": None,
+        "error": None,
+    })
     asyncio.create_task(_run())
-    return {"status": "started", "start_date": str(start_date), "end_date": str(end_date)}
+    return {"status": "started", "started_at": label}
 
 
 @router.get("/api/memories/consolidate/status")
 async def api_consolidate_status():
     """查询整理任务状态"""
     return _consolidate_status
+
+
+@router.get("/api/memories/core-candidates")
+async def api_core_candidates():
+    """Suggest active layer-2 memories for manual promotion."""
+    if not shared.MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+
+    events = await db_memories.get_core_candidate_memories(
+        memory_consolidator.MIN_CORE_MERGED_SOURCES,
+        memory_consolidator.MIN_CORE_IMPORTANCE,
+        memory_consolidator.MAX_CORE_CANDIDATES,
+    )
+    candidates = memory_consolidator.select_core_candidates(events)
+    tz_offset = timezone(timedelta(hours=shared.TIMEZONE_HOURS))
+    for candidate in candidates:
+        for key in ("created_at", "remind_at", "reminder_delivered_at"):
+            if candidate.get(key):
+                value = candidate[key]
+                if value.tzinfo is None:
+                    value = value.replace(tzinfo=timezone.utc)
+                candidate[key] = value.astimezone(tz_offset).strftime("%Y-%m-%d %H:%M:%S")
+    return {"candidates": candidates, "total": len(candidates)}
 
 
 @router.post("/api/memories/{memory_id}/promote")
@@ -840,11 +537,19 @@ async def api_merge_memories(request: Request):
     new_content = data.get("content", "")
     importance = data.get("importance", 5)
     layer = data.get("layer", 2)
-
     if not memory_ids or not new_content:
         return {"error": "请提供记忆ID列表和合并后内容"}
 
-    new_id = await db_memories.merge_memories(memory_ids, new_title, new_content, importance, layer)
+    try:
+        new_id = await db_memories.merge_memories(
+            memory_ids,
+            new_title,
+            new_content,
+            importance,
+            layer,
+        )
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
     return {"status": "ok", "new_id": new_id, "merged": len(memory_ids)}
 
 
@@ -1024,9 +729,9 @@ async def import_memories(request: Request):
         if not memories:
             return {"error": "没有找到记忆数据，请确认 JSON 格式正确"}
 
-        # v2/v3 版本化备份：v3 额外恢复自动取代版本链
+        # v2/v3/v4 版本化备份：v3 额外恢复自动取代版本链，v4 额外恢复提醒与送达账
         schema_version = data.get("schema_version")
-        if schema_version in (2, 3):
+        if schema_version in (2, 3, 4):
             try:
                 return await db_memories.import_memories_v2(
                     memories,
