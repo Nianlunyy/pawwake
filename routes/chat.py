@@ -697,18 +697,13 @@ async def _stream_and_capture_inner(
                                 print(f"🏁 finish_reason: {finish_reason}")
                                 _mark_terminal()
                             delta = first_choice.get("delta", {})
-
-                            # === 监工排查专用日志 ===
-                            if delta.get("content"):
-                                logger.info(f"🟢 [排查] 收到正文块: {repr(delta['content'][:30])}")
-
-                            finish_reason = choice.get("finish_reason") or delta.get("finish_reason")
-                            if finish_reason:
-                                logger.info(f"🏁 [排查] 捕获到流式 finish_reason: {finish_reason}")
-                            # =======================
-
                             content = delta.get("content", "")
                             is_thinking_chunk = "extra_content" in delta and content
+
+                            # === 监工排查专用日志 ===
+                            if content and not is_thinking_chunk:
+                                logger.info(f"🟢 [排查] 收到正文块: {content[:30]!r}")
+                            # =======================
 
                             if is_thinking_chunk:
                                 full_reasoning.append(content)
