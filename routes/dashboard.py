@@ -119,12 +119,15 @@ async def dashboard_page(request: Request):
 @settings_router.get("/api/models")
 async def get_models():
     """获取可用模型列表（根据 API_BASE_URL 自动适配）"""
+    is_vertex = shared.is_vertex_endpoint()
     is_openrouter = "openrouter.ai" in shared.API_BASE_URL
-    is_google = "googleapis.com" in shared.API_BASE_URL or "generativelanguage" in shared.API_BASE_URL
+    is_google = not is_vertex and ("googleapis.com" in shared.API_BASE_URL or "generativelanguage" in shared.API_BASE_URL)
     is_openai = "api.openai.com" in shared.API_BASE_URL
 
     try:
-        if is_openrouter:
+        if is_vertex:
+            return {"models": [], "total": 0, "provider": "vertex", "note": "Vertex AI 暂不支持动态拉取模型列表，请手动输入模型名"}
+        elif is_openrouter:
             async with httpx.AsyncClient(timeout=30) as client:
                 response = await client.get(
                     "https://openrouter.ai/api/v1/models",
