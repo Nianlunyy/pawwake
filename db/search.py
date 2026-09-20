@@ -297,13 +297,15 @@ async def save_conversation_embedding(conn, message_id: int, embedding: list):
     if db_core.HAS_PGVECTOR:
         vector_text = "[" + ",".join(str(value) for value in embedding) + "]"
         await conn.execute(
-            "UPDATE conversations SET embedding = $1::vector WHERE id = $2",
+            """UPDATE conversations SET embedding = $1::vector
+               WHERE id = $2 AND deleted_at IS NULL""",
             vector_text,
             message_id,
         )
     else:
         await conn.execute(
-            "UPDATE conversations SET embedding_json = $1 WHERE id = $2",
+            """UPDATE conversations SET embedding_json = $1
+               WHERE id = $2 AND deleted_at IS NULL""",
             json.dumps(embedding),
             message_id,
         )
@@ -389,20 +391,38 @@ def _assemble_fragments(all_messages, sorted_indices, matched_indices):
 async def _conversation_tsv_ready(conn) -> bool:
     pending = await conn.fetchval(
         r"""SELECT COUNT(*) FROM conversations
-            WHERE content_tsv IS NULL
+            WHERE deleted_at IS NULL AND content_tsv IS NULL
               AND content IS NOT NULL AND content !~ '^\s*$'"""
     )
     return not pending
 
 
-def _session_exclusion_sql(exclude_session_ids: list, param_index: int) -> tuple[str, list]:
+def _session_exclusion_sql(
+    exclude_session_ids: list,
+    param_index: int,
+    include_session_before: tuple | None = None,
+) -> tuple[str, list]:
     if not exclude_session_ids:
         return "", []
-    return f" AND NOT (session_id = ANY(${param_index}::text[]))", [exclude_session_ids]
+    if not include_session_before:
+        return f" AND NOT (session_id = ANY(${param_index}::text[]))", [exclude_session_ids]
+    session_id, created_at, message_id = include_session_before
+    return (
+        f""" AND (
+                 NOT (session_id = ANY(${param_index}::text[]))
+                 OR (session_id = ${param_index + 1}
+                     AND (created_at, id) <= (
+                         ${param_index + 2}::timestamptz,
+                         ${param_index + 3}::integer
+                     ))
+               )""",
+        [exclude_session_ids, session_id, created_at, message_id],
+    )
 
 
 async def _keyword_session_scores(conn, tsquery: str, keyword_terms: list[str],
-                                  pool_size: int, exclude_session_ids: list):
+                                  pool_size: int, exclude_session_ids: list,
+                                  include_session_before: tuple | None = None):
     if not keyword_terms:
         return {}
 
@@ -413,14 +433,15 @@ async def _keyword_session_scores(conn, tsquery: str, keyword_terms: list[str],
         ]
         params = list(keyword_terms)
         exclusion_sql, exclusion_params = _session_exclusion_sql(
-            exclude_session_ids, len(params) + 1
+            exclude_session_ids, len(params) + 1, include_session_before
         )
         params.extend(exclusion_params)
         rows = await conn.fetch(
             f"""SELECT session_id, COUNT(*)::float AS score,
                        MAX(created_at) AS latest_match
                 FROM conversations
-                WHERE ({' AND '.join(conditions)}) {exclusion_sql}
+                WHERE deleted_at IS NULL
+                  AND ({' AND '.join(conditions)}) {exclusion_sql}
                 GROUP BY session_id
                 ORDER BY score DESC
                 LIMIT {int(pool_size)}""",
@@ -429,7 +450,7 @@ async def _keyword_session_scores(conn, tsquery: str, keyword_terms: list[str],
     else:
         params = [tsquery]
         exclusion_sql, exclusion_params = _session_exclusion_sql(
-            exclude_session_ids, len(params) + 1
+            exclude_session_ids, len(params) + 1, include_session_before
         )
         params.extend(exclusion_params)
         params.append(pool_size)
@@ -438,7 +459,8 @@ async def _keyword_session_scores(conn, tsquery: str, keyword_terms: list[str],
                        MAX(ts_rank(content_tsv, $1::tsquery, 2)) AS score,
                        MAX(created_at) AS latest_match
                 FROM conversations
-                WHERE content_tsv @@ $1::tsquery {exclusion_sql}
+                WHERE deleted_at IS NULL
+                  AND content_tsv @@ $1::tsquery {exclusion_sql}
                 GROUP BY session_id
                 ORDER BY score DESC
                 LIMIT ${len(params)}""",
@@ -454,7 +476,8 @@ async def _keyword_session_scores(conn, tsquery: str, keyword_terms: list[str],
 
 
 async def _semantic_session_scores(conn, query_embedding: list, pool_size: int,
-                                   exclude_session_ids: list):
+                                   exclude_session_ids: list,
+                                   include_session_before: tuple | None = None):
     """先按原始余弦阈值过滤，再交给融合层归一化。"""
     if not query_embedding:
         return {}
@@ -463,7 +486,7 @@ async def _semantic_session_scores(conn, query_embedding: list, pool_size: int,
         vector_text = "[" + ",".join(str(value) for value in query_embedding) + "]"
         params = [vector_text]
         exclusion_sql, exclusion_params = _session_exclusion_sql(
-            exclude_session_ids, len(params) + 1
+            exclude_session_ids, len(params) + 1, include_session_before
         )
         params.extend(exclusion_params)
         ranked_limit = max(100, pool_size * 10)
@@ -477,7 +500,8 @@ async def _semantic_session_scores(conn, query_embedding: list, pool_size: int,
                            1 - (embedding <=> $1::vector) AS similarity,
                            created_at
                     FROM conversations
-                    WHERE embedding IS NOT NULL {exclusion_sql}
+                    WHERE deleted_at IS NULL
+                      AND embedding IS NOT NULL {exclusion_sql}
                     ORDER BY embedding <=> $1::vector
                     LIMIT ${ranked_limit_index}
                 )
@@ -500,13 +524,14 @@ async def _semantic_session_scores(conn, query_embedding: list, pool_size: int,
 
     params = []
     exclusion_sql, exclusion_params = _session_exclusion_sql(
-        exclude_session_ids, 1
+        exclude_session_ids, 1, include_session_before
     )
     params.extend(exclusion_params)
     rows = await conn.fetch(
         f"""SELECT session_id, created_at, embedding_json
             FROM conversations
-            WHERE embedding_json IS NOT NULL {exclusion_sql}""",
+            WHERE deleted_at IS NULL
+              AND embedding_json IS NOT NULL {exclusion_sql}""",
         *params,
     )
     session_best = {}
@@ -538,6 +563,8 @@ async def search_chat_fragments(
     mode: str = "hybrid",
     exclude_session_ids: list | None = None,
     exclude_fragment_ids: list | None = None,
+    include_session_before: tuple | None = None,
+    disjoint_fragments: bool = False,
 ):
     """检索历史对话。raw API 无状态，排除集合完全由调用方传入。"""
     from datetime import datetime, timezone
@@ -565,11 +592,20 @@ async def search_chat_fragments(
     pool = await db_core.get_pool()
     async with pool.acquire() as conn:
         keyword_scores = await _keyword_session_scores(
-            conn, tsquery, keyword_terms, pool_size, exclude_session_ids
+            conn,
+            tsquery,
+            keyword_terms,
+            pool_size,
+            exclude_session_ids,
+            include_session_before=include_session_before,
         )
         semantic_scores = (
             await _semantic_session_scores(
-                conn, query_embedding, pool_size, exclude_session_ids
+                conn,
+                query_embedding,
+                pool_size,
+                exclude_session_ids,
+                include_session_before=include_session_before,
             )
             if mode == "hybrid"
             else {}
@@ -622,25 +658,37 @@ async def search_chat_fragments(
             if len(results) >= max_sessions:
                 break
             if db_core.HAS_PGVECTOR and vector_text:
+                params = [session_id, vector_text]
+                prefix_sql = ""
+                if include_session_before and session_id == include_session_before[0]:
+                    prefix_sql = " AND (created_at, id) <= ($3::timestamptz, $4::integer)"
+                    params.extend(include_session_before[1:])
                 messages = await conn.fetch(
-                    """SELECT id, role, content, created_at,
+                    f"""SELECT id, role, content, created_at,
                               CASE WHEN embedding IS NOT NULL
                                    THEN 1 - (embedding <=> $2::vector)
                                    ELSE 0 END AS sem_sim
                        FROM conversations
-                       WHERE session_id = $1
+                       WHERE session_id = $1 AND deleted_at IS NULL
+                         {prefix_sql}
                        ORDER BY created_at ASC, id ASC""",
-                    session_id, vector_text,
+                    *params,
                 )
             else:
                 embedding_column = "embedding_json" if not db_core.HAS_PGVECTOR else "NULL::text"
+                params = [session_id]
+                prefix_sql = ""
+                if include_session_before and session_id == include_session_before[0]:
+                    prefix_sql = " AND (created_at, id) <= ($2::timestamptz, $3::integer)"
+                    params.extend(include_session_before[1:])
                 messages = await conn.fetch(
                     f"""SELECT id, role, content, created_at,
                                {embedding_column} AS embedding_json
                         FROM conversations
-                        WHERE session_id = $1
+                        WHERE session_id = $1 AND deleted_at IS NULL
+                          {prefix_sql}
                         ORDER BY created_at ASC, id ASC""",
-                    session_id,
+                    *params,
                 )
 
             marked = []
@@ -682,18 +730,22 @@ async def search_chat_fragments(
                 continue
             total_matched = len(match_candidates)
             kept = []
+            used_context_indices = set()
             for match_index, _ in match_candidates:
-                context_indices = range(
+                context_indices = set(range(
                     max(0, match_index - context),
                     min(len(marked), match_index + context + 1),
-                )
+                ))
+                if disjoint_fragments and used_context_indices & context_indices:
+                    continue
                 fragments, fragment_ids = _assemble_fragments(
-                    marked, list(context_indices), {match_index}
+                    marked, sorted(context_indices), {match_index}
                 )
                 fragment_id = fragment_ids[0] if fragment_ids else None
                 if not fragment_id or fragment_id in excluded_fragments:
                     continue
                 kept.append((fragments[0], fragment_id))
+                used_context_indices.update(context_indices)
                 if len(kept) >= max_matches_per_session:
                     break
             if not kept:
@@ -736,7 +788,7 @@ async def rebuild_content_tsv(batch_size: int = 200):
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 r"""SELECT id, content FROM conversations
-                    WHERE content_tsv IS NULL AND id > $2
+                    WHERE deleted_at IS NULL AND content_tsv IS NULL AND id > $2
                       AND content IS NOT NULL AND content !~ '^\s*$'
                     ORDER BY id
                     LIMIT $1""",
@@ -756,7 +808,8 @@ async def rebuild_content_tsv(batch_size: int = 200):
                        string_to_array(batch.tsv_text, ' ')
                    )
                    FROM UNNEST($1::int[], $2::text[]) AS batch(id, tsv_text)
-                   WHERE c.id = batch.id AND c.content_tsv IS NULL""",
+                   WHERE c.id = batch.id AND c.deleted_at IS NULL
+                     AND c.content_tsv IS NULL""",
                 row_ids, tsv_texts,
             )
         total_updated += len(rows)
@@ -821,7 +874,7 @@ async def backfill_conversation_embeddings_once(
             async with pool.acquire() as conn:
                 rows = await conn.fetch(
                     f"""SELECT id, content FROM conversations
-                        WHERE {condition} AND id > $2
+                        WHERE deleted_at IS NULL AND {condition} AND id > $2
                         ORDER BY id
                         LIMIT $1""",
                     EMBED_BACKFILL_BATCH, last_id,
@@ -907,15 +960,18 @@ async def get_embedding_backfill_status():
         pool = await db_core.get_pool()
         async with pool.acquire() as conn:
             remaining = await conn.fetchval(
-                f"SELECT COUNT(*) FROM conversations WHERE {_conversation_embedding_pending_condition()}"
+                f"""SELECT COUNT(*) FROM conversations
+                    WHERE deleted_at IS NULL
+                      AND {_conversation_embedding_pending_condition()}"""
             )
             embedding_column = "embedding" if db_core.HAS_PGVECTOR else "embedding_json"
             cumulative_embedded = await conn.fetchval(
-                f"SELECT COUNT(*) FROM conversations WHERE {embedding_column} IS NOT NULL"
+                f"""SELECT COUNT(*) FROM conversations
+                    WHERE deleted_at IS NULL AND {embedding_column} IS NOT NULL"""
             )
             content_tsv_remaining = await conn.fetchval(
                 r"""SELECT COUNT(*) FROM conversations
-                    WHERE content_tsv IS NULL
+                    WHERE deleted_at IS NULL AND content_tsv IS NULL
                       AND content IS NOT NULL AND content !~ '^\s*$'"""
             )
     except Exception as exc:

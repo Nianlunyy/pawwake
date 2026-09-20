@@ -325,6 +325,27 @@ def group_by_rounds(history: list) -> list:
     return rounds
 
 
+def _clean_orphan_tool_messages(history: list, *, log: bool = False) -> list:
+    """移除前面没有 assistant(tool_calls) 或 tool 的孤立 tool 消息。"""
+    cleaned = []
+    orphan_count = 0
+    for msg in history:
+        if msg.get("role") == "tool":
+            prev = cleaned[-1] if cleaned else None
+            if prev and (
+                prev.get("role") == "tool"
+                or (prev.get("role") == "assistant" and prev.get("tool_calls"))
+            ):
+                cleaned.append(msg)
+            else:
+                orphan_count += 1
+        else:
+            cleaned.append(msg)
+    if log and orphan_count:
+        print(f"⚠️ 清理了 {orphan_count} 条孤立tool消息")
+    return cleaned
+
+
 def _build_memory_extraction_messages(
     context_messages: list,
     assistant_msg: str,
@@ -435,23 +456,8 @@ async def build_partitioned_messages(
     if history and history[-1].get('role') == 'user':
         current_user_msg = history.pop()
 
-    # 清洗孤立的tool消息（前面不是 assistant(tool_calls) 或另一条 tool 的）
     # 防止DB里的重复tool消息导致消息乱序
-    cleaned = []
-    orphan_count = 0
-    for msg in history:
-        if msg.get('role') == 'tool':
-            prev = cleaned[-1] if cleaned else None
-            if prev and (prev.get('role') == 'tool' or
-                        (prev.get('role') == 'assistant' and prev.get('tool_calls'))):
-                cleaned.append(msg)
-            else:
-                orphan_count += 1
-        else:
-            cleaned.append(msg)
-    if orphan_count > 0:
-        print(f"⚠️ 清理了 {orphan_count} 条孤立tool消息")
-    history = cleaned
+    history = _clean_orphan_tool_messages(history, log=True)
 
     # 按逻辑轮分组（解决tool消息导致的轮计数错乱）
     rounds = group_by_rounds(history)
