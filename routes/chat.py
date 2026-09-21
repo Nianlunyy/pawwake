@@ -174,7 +174,7 @@ async def health_check():
 
     return {
         "status": "running",
-        "gateway": "Pawwake v4.1.3",
+        "gateway": "Pawwake v4.1.4",
         "system_prompt_loaded": len(resolved_system_prompt) > 0,
         "system_prompt_length": len(resolved_system_prompt),
         "database_enabled": shared.DATABASE_ENABLED,
@@ -284,10 +284,12 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
         try:
             db_history = await db_conversations.get_conversation_messages(session_id, limit=10000)
             db_msgs = []
+            recall_history = []
             for m in (db_history or []):
                 msg = db_conversations.db_row_to_message(m)
                 msg['created_at'] = m.get('created_at')  # 保留时间戳供分区时间窗口判断
                 db_msgs.append(msg)
+                recall_history.append({**msg, "id": m.get("id")})
         except Exception as e:
             print(f"❌ 分区缓存不可用：读取对话历史失败: {e}")
             return JSONResponse(
@@ -386,7 +388,11 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
             partition_prompt = ((partition_prompt or "") + "\n\n" + client_system_text).strip()
         try:
             conversation_recall_text, pending_fragment_ids = (
-                await memory_pipeline.build_conversation_recall_text(user_message, session_id)
+                await memory_pipeline.build_conversation_recall_text(
+                    user_message,
+                    session_id,
+                    recall_history,
+                )
             )
 
             async def build_session_memory_text(message: str):

@@ -1477,6 +1477,7 @@ async function doExport() {
 let convCurrentPage = 1;
 let convIsSearchMode = false;
 let convSearchQuery = '';
+let convTrashMode = false;
 
 async function loadConvStats() {
     const el = document.getElementById('conv-export-stats');
@@ -1580,30 +1581,38 @@ async function doConvImport() {
 }
 
 // 加载对话列表（分页）
-async function loadConversationList(page = 1) {
+async function loadConversationList(page = 1, trash = false) {
     convCurrentPage = page;
+    convTrashMode = trash;
     convIsSearchMode = false;
     convSearchQuery = '';
     document.getElementById('conv-search-input').value = '';
     document.getElementById('conv-search-status').textContent = '';
-    document.getElementById('conv-list-title').textContent = '对话列表';
+    document.getElementById('conv-list-title').textContent = trash ? '回收站' : '对话列表';
+    document.getElementById('conv-search-card').style.display = trash ? 'none' : '';
+    document.getElementById('conv-trash-toggle').textContent = trash ? '返回对话列表' : '回收站';
     
     const container = document.getElementById('conv-list-container');
     container.innerHTML = '<div style="text-align: center; color: var(--text-muted); padding: 20px 0;">加载中...</div>';
     
     try {
-        const resp = await fetch('/api/conversations?page=' + page + '&per_page=20');
+        const resp = await fetch('/api/conversations?page=' + page + '&per_page=20&deleted=' + trash);
         const data = await resp.json();
         if (data.error) {
             container.innerHTML = '<div style="color: var(--error); padding: 20px 0;">加载失败: ' + data.error + '</div>';
             return;
         }
-        renderConvList(data.conversations);
-        renderConvPagination(data.page, data.total_pages, data.total);
-        document.getElementById('conv-list-count').textContent = `共 ${data.total} 个对话`;
+        renderConvList(data.conversations, false, trash);
+        renderConvPagination(data.page, data.total_pages, data.total, trash);
+        document.getElementById('conv-list-count').textContent = `共 ${data.total} 个${trash ? '已删除' : ''}对话`;
     } catch(e) {
         container.innerHTML = '<div style="color: var(--error); padding: 20px 0;">请求失败: ' + e.message + '</div>';
     }
+}
+
+function toggleConversationTrash() {
+    closeConvDetail();
+    loadConversationList(1, !convTrashMode);
 }
 
 // 搜索对话
@@ -1646,11 +1655,11 @@ function clearConvSearch() {
 }
 
 // 渲染对话列表
-function renderConvList(conversations, isSearch = false) {
+function renderConvList(conversations, isSearch = false, trash = convTrashMode) {
     const container = document.getElementById('conv-list-container');
     
     if (!conversations || conversations.length === 0) {
-        container.innerHTML = '<div style="text-align: center; color: var(--text-muted); padding: 40px 0;">暂无对话记录</div>';
+        container.innerHTML = `<div style="text-align: center; color: var(--text-muted); padding: 40px 0;">${trash ? '回收站为空' : '暂无对话记录'}</div>`;
         return;
     }
     
@@ -1659,8 +1668,11 @@ function renderConvList(conversations, isSearch = false) {
         <label style="display: flex; align-items: center; gap: 4px; cursor: pointer; font-size: 13px;">
             <input type="checkbox" id="conv-select-all" onchange="toggleConvSelectAll(this.checked)"> 全选
         </label>
-        <button class="btn btn-sm" onclick="batchDeleteConversations()" id="conv-batch-delete-btn" style="display: none; font-size: 12px;">${ICONS.trash(13)} 批量删除</button>
-        <button class="btn btn-sm" onclick="batchMergeSessions()" id="conv-batch-merge-btn" style="display: none; font-size: 12px;">${ICONS.gitMerge(13)} 合并到...</button>
+        ${trash
+            ? `<button class="btn btn-sm conv-batch-action" onclick="batchRestoreConversations()" style="display: none; font-size: 12px;">恢复选中</button>
+               <button class="btn btn-sm conv-batch-action" onclick="batchPermanentlyDeleteConversations()" style="display: none; font-size: 12px; color: var(--error);">${ICONS.trash(13)} 永久删除</button>`
+            : `<button class="btn btn-sm conv-batch-action" onclick="batchDeleteConversations()" style="display: none; font-size: 12px;">${ICONS.trash(13)} 批量删除</button>
+               <button class="btn btn-sm conv-batch-action" onclick="batchMergeSessions()" style="display: none; font-size: 12px;">${ICONS.gitMerge(13)} 合并到...</button>`}
         <span id="conv-selected-count" style="color: var(--text-muted); font-size: 12px; display: none;"></span>
     </div>`;
     
@@ -1671,7 +1683,7 @@ function renderConvList(conversations, isSearch = false) {
         const msgCount = conv.message_count || '';
         const totalTokens = conv.total_tokens || 0;
         const tokenStr = totalTokens > 0 ? (totalTokens >= 1000000 ? (totalTokens / 1000000).toFixed(1) + 'M' : totalTokens >= 1000 ? (totalTokens / 1000).toFixed(1) + 'K' : totalTokens) : '';
-        const lastTime = conv.last_time || conv.updated_at || '';
+        const lastTime = trash ? conv.deleted_at : (conv.last_time || conv.updated_at || '');
         const timeStr = lastTime ? formatConvTime(lastTime) : '';
         
         html += `
@@ -1681,7 +1693,7 @@ function renderConvList(conversations, isSearch = false) {
             <input type="checkbox" class="conv-checkbox" value="${escapeHtml(sid)}" 
                    onchange="updateConvSelectionCount()" 
                    style="margin-right: 10px; margin-top: 4px; cursor: pointer; flex-shrink: 0;">
-            <div style="flex: 1; min-width: 0; cursor: pointer;" onclick="openConvDetail('${escapeHtml(sid)}')">
+            <div style="flex: 1; min-width: 0; cursor: pointer;" onclick="openConvDetail('${escapeHtml(sid)}', ${trash})">
                 <div style="display: flex; justify-content: space-between; align-items: flex-start;">
                     <div style="flex: 1; min-width: 0;">
                         <div style="font-weight: 500; margin-bottom: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${title}</div>
@@ -1701,12 +1713,12 @@ function renderConvList(conversations, isSearch = false) {
 }
 
 // 渲染分页
-function renderConvPagination(currentPage, totalPages, total) {
+function renderConvPagination(currentPage, totalPages, total, trash = convTrashMode) {
     const container = document.getElementById('conv-pagination');
     if (totalPages <= 1) { container.innerHTML = ''; return; }
     
     let html = '';
-    html += `<button class="btn btn-sm" onclick="loadConversationList(${currentPage - 1})" ${currentPage <= 1 ? 'disabled' : ''}>上一页</button>`;
+    html += `<button class="btn btn-sm" onclick="loadConversationList(${currentPage - 1}, ${trash})" ${currentPage <= 1 ? 'disabled' : ''}>上一页</button>`;
     
     // 页码按钮（最多显示5个）
     let startPage = Math.max(1, currentPage - 2);
@@ -1714,10 +1726,10 @@ function renderConvPagination(currentPage, totalPages, total) {
     if (endPage - startPage < 4) startPage = Math.max(1, endPage - 4);
     
     for (let i = startPage; i <= endPage; i++) {
-        html += `<button class="btn btn-sm${i === currentPage ? ' btn-primary' : ''}" onclick="loadConversationList(${i})">${i}</button>`;
+        html += `<button class="btn btn-sm${i === currentPage ? ' btn-primary' : ''}" onclick="loadConversationList(${i}, ${trash})">${i}</button>`;
     }
     
-    html += `<button class="btn btn-sm" onclick="loadConversationList(${currentPage + 1})" ${currentPage >= totalPages ? 'disabled' : ''}>下一页</button>`;
+    html += `<button class="btn btn-sm" onclick="loadConversationList(${currentPage + 1}, ${trash})" ${currentPage >= totalPages ? 'disabled' : ''}>下一页</button>`;
     html += `<span style="color: var(--text-muted); font-size: 12px; margin-left: 8px;">${currentPage}/${totalPages}</span>`;
     
     container.innerHTML = html;
@@ -1726,29 +1738,31 @@ function renderConvPagination(currentPage, totalPages, total) {
 // 打开对话详情
 let convDetailSessionId = '';
 let convDetailLoadedCount = 0;
+let convDetailTrashMode = false;
 
-async function openConvDetail(sessionId) {
+async function openConvDetail(sessionId, trash = false) {
     const panel = document.getElementById('conv-detail-panel');
     const titleEl = document.getElementById('conv-detail-title');
     const messagesEl = document.getElementById('conv-detail-messages');
     
     convDetailSessionId = sessionId;
+    convDetailTrashMode = trash;
     convDetailLoadedCount = 0;
     panel.style.display = 'block';
     titleEl.textContent = '加载中...';
     messagesEl.innerHTML = '<div style="text-align: center; color: var(--text-muted); padding: 20px 0;">加载中...</div>';
     panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
     
-    await loadConvMessages(sessionId, false);
+    await loadConvMessages(sessionId, false, trash);
 }
 
-async function loadConvMessages(sessionId, append = false) {
+async function loadConvMessages(sessionId, append = false, trash = convDetailTrashMode) {
     const titleEl = document.getElementById('conv-detail-title');
     const messagesEl = document.getElementById('conv-detail-messages');
     const offset = append ? convDetailLoadedCount : 0;
     
     try {
-        const resp = await fetch(`/api/conversations/${encodeURIComponent(sessionId)}/messages?limit=50&offset=${offset}`);
+        const resp = await fetch(`/api/conversations/${encodeURIComponent(sessionId)}/messages?limit=50&offset=${offset}&deleted=${trash}`);
         const data = await resp.json();
         
         if (data.error) {
@@ -1764,13 +1778,16 @@ async function loadConvMessages(sessionId, append = false) {
         }
         convDetailLoadedCount += messages.length;
         
-        titleEl.textContent = `对话详情（${convDetailLoadedCount} / ${total} 条消息）`;
+        titleEl.textContent = `${trash ? '回收站' : '对话'}详情（${convDetailLoadedCount} / ${total} 条消息）`;
         
         // 渲染消息
         let html = '';
         if (!append) {
             html += `<div style="margin-bottom: 12px; display: flex; gap: 8px; justify-content: flex-end;">
-                <button class="btn btn-sm" onclick="deleteConversation('${escapeHtml(sessionId)}')">${ICONS.trash(13)} 删除对话</button>
+                ${trash
+                    ? `<button class="btn btn-sm" onclick="restoreConversation('${escapeHtml(sessionId)}')">恢复整段删除</button>
+                       <button class="btn btn-sm" onclick="permanentlyDeleteConversation('${escapeHtml(sessionId)}')" style="color: var(--error);">${ICONS.trash(13)} 永久删除回收站内容</button>`
+                    : `<button class="btn btn-sm" onclick="deleteConversation('${escapeHtml(sessionId)}')">${ICONS.trash(13)} 删除对话</button>`}
             </div>`;
         }
         
@@ -1788,7 +1805,10 @@ async function loadConvMessages(sessionId, append = false) {
                     <span style="font-weight: 500; font-size: 13px;">${roleLabel}</span>
                     <div style="display: flex; align-items: center; gap: 8px;">
                         <span style="color: var(--text-muted); font-size: 12px;">${timeStr}</span>
-                        ${msgId ? `<button class="btn btn-sm" onclick="toggleEditMessage(${msgId})" style="font-size: 11px; padding: 2px 8px;">编辑</button><button class="btn btn-sm" onclick="deleteSingleMessage(${msgId})" style="font-size: 11px; padding: 2px 8px; color: var(--error);">删除</button>` : ''}
+                        ${msgId ? (trash
+                            ? `<button class="btn btn-sm" onclick="restoreSingleMessage(${msgId})" style="font-size: 11px; padding: 2px 8px;">恢复</button><button class="btn btn-sm" onclick="permanentlyDeleteSingleMessage(${msgId})" style="font-size: 11px; padding: 2px 8px; color: var(--error);">永久删除</button>`
+                            : `<button class="btn btn-sm" onclick="toggleEditMessage(${msgId})" style="font-size: 11px; padding: 2px 8px;">编辑</button><button class="btn btn-sm" onclick="deleteSingleMessage(${msgId})" style="font-size: 11px; padding: 2px 8px; color: var(--error);">删除</button>`
+                        ) : ''}
                     </div>
                 </div>
                 <div class="msg-content" id="msg-content-${msgId}" style="white-space: pre-wrap; word-break: break-word; font-size: 14px; line-height: 1.6;">${content}</div>
@@ -1805,7 +1825,7 @@ async function loadConvMessages(sessionId, append = false) {
         // 加载更多按钮
         if (convDetailLoadedCount < total) {
             html += `<div style="text-align: center; padding: 16px 0;">
-                <button class="btn btn-primary" onclick="loadConvMessages('${escapeHtml(sessionId)}', true)">
+                <button class="btn btn-primary" onclick="loadConvMessages('${escapeHtml(sessionId)}', true, ${trash})">
                     加载更多（还有 ${total - convDetailLoadedCount} 条）
                 </button>
             </div>`;
@@ -1873,7 +1893,7 @@ async function saveMessageEdit(msgId) {
 
 // 删除单条消息
 async function deleteSingleMessage(msgId) {
-    if (!confirm('确定删除这条消息？此操作不可撤销。')) return;
+    if (!confirm('确定删除这条消息？（可在回收站恢复）')) return;
     try {
         const resp = await fetch('/api/chat/messages/' + msgId, { method: 'DELETE' });
         const data = await resp.json();
@@ -1892,6 +1912,37 @@ async function deleteSingleMessage(msgId) {
                 titleEl.textContent = `对话详情（${loaded} / ${total} 条消息）`;
             }
         }
+    } catch(e) {
+        alert('请求失败: ' + e.message);
+    }
+}
+
+async function restoreSingleMessage(msgId) {
+    try {
+        const resp = await fetch('/api/chat/messages/' + msgId + '/restore', { method: 'POST' });
+        const data = await resp.json();
+        if (!resp.ok || data.error) {
+            alert('恢复失败: ' + (data.error || 'HTTP ' + resp.status));
+            return;
+        }
+        await loadConvMessages(convDetailSessionId, false, true);
+        await loadConversationList(convCurrentPage, true);
+    } catch(e) {
+        alert('请求失败: ' + e.message);
+    }
+}
+
+async function permanentlyDeleteSingleMessage(msgId) {
+    if (!confirm('确定永久删除这条消息？此操作不可撤销。')) return;
+    try {
+        const resp = await fetch('/api/chat/messages/' + msgId + '/permanent', { method: 'DELETE' });
+        const data = await resp.json();
+        if (!resp.ok || data.error) {
+            alert('永久删除失败: ' + (data.error || 'HTTP ' + resp.status));
+            return;
+        }
+        await loadConvMessages(convDetailSessionId, false, true);
+        await loadConversationList(convCurrentPage, true);
     } catch(e) {
         alert('请求失败: ' + e.message);
     }
@@ -1919,6 +1970,37 @@ async function deleteConversation(sessionId) {
     }
 }
 
+async function restoreConversation(sessionId) {
+    try {
+        const resp = await fetch(`/api/conversations/${encodeURIComponent(sessionId)}/restore`, { method: 'POST' });
+        const data = await resp.json();
+        if (!resp.ok || data.error) {
+            alert('恢复失败: ' + (data.error || 'HTTP ' + resp.status));
+            return;
+        }
+        closeConvDetail();
+        loadConversationList(convCurrentPage, true);
+    } catch(e) {
+        alert('请求失败: ' + e.message);
+    }
+}
+
+async function permanentlyDeleteConversation(sessionId) {
+    if (!confirm('确定永久删除这个对话在回收站中的全部内容？此操作不可撤销。')) return;
+    try {
+        const resp = await fetch(`/api/conversations/${encodeURIComponent(sessionId)}/permanent`, { method: 'DELETE' });
+        const data = await resp.json();
+        if (!resp.ok || data.error) {
+            alert('永久删除失败: ' + (data.error || 'HTTP ' + resp.status));
+            return;
+        }
+        closeConvDetail();
+        loadConversationList(convCurrentPage, true);
+    } catch(e) {
+        alert('请求失败: ' + e.message);
+    }
+}
+
 // 多选功能
 function toggleConvSelectAll(checked) {
     document.querySelectorAll('.conv-checkbox').forEach(cb => { cb.checked = checked; });
@@ -1928,20 +2010,17 @@ function toggleConvSelectAll(checked) {
 function updateConvSelectionCount() {
     const checked = document.querySelectorAll('.conv-checkbox:checked');
     const countEl = document.getElementById('conv-selected-count');
-    const btnEl = document.getElementById('conv-batch-delete-btn');
-    const mergeBtn = document.getElementById('conv-batch-merge-btn');
+    const actionButtons = document.querySelectorAll('.conv-batch-action');
     const allCb = document.getElementById('conv-select-all');
     const allCheckboxes = document.querySelectorAll('.conv-checkbox');
     
     if (checked.length > 0) {
         countEl.style.display = '';
         countEl.textContent = `已选 ${checked.length} 个`;
-        btnEl.style.display = '';
-        if (mergeBtn) mergeBtn.style.display = '';
+        actionButtons.forEach(button => { button.style.display = ''; });
     } else {
         countEl.style.display = 'none';
-        btnEl.style.display = 'none';
-        if (mergeBtn) mergeBtn.style.display = 'none';
+        actionButtons.forEach(button => { button.style.display = 'none'; });
     }
     
     if (allCb) {
@@ -1974,6 +2053,57 @@ async function batchDeleteConversations() {
         } else {
             loadConversationList(convCurrentPage);
         }
+    } catch(e) {
+        alert('请求失败: ' + e.message);
+    }
+}
+
+async function batchRestoreConversations() {
+    const checked = document.querySelectorAll('.conv-checkbox:checked');
+    if (checked.length === 0) return;
+    const sessionIds = Array.from(checked).map(cb => cb.value);
+    try {
+        const resp = await fetch('/api/conversations/batch-restore', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_ids: sessionIds })
+        });
+        const data = await resp.json();
+        if (!resp.ok || data.error) {
+            alert('批量恢复失败: ' + (data.error || 'HTTP ' + resp.status));
+            return;
+        }
+        if (!data.restored) {
+            alert('所选内容里没有整段删除的对话，请打开详情恢复单条消息。');
+            return;
+        }
+        loadConversationList(convCurrentPage, true);
+    } catch(e) {
+        alert('请求失败: ' + e.message);
+    }
+}
+
+async function batchPermanentlyDeleteConversations() {
+    const checked = document.querySelectorAll('.conv-checkbox:checked');
+    if (checked.length === 0) return;
+    if (!confirm(`确定永久删除选中的 ${checked.length} 个回收站对话？此操作不可撤销。`)) return;
+    const sessionIds = Array.from(checked).map(cb => cb.value);
+    try {
+        const resp = await fetch('/api/conversations/batch-permanent-delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_ids: sessionIds })
+        });
+        const data = await resp.json();
+        if (!resp.ok || data.error) {
+            alert('批量永久删除失败: ' + (data.error || 'HTTP ' + resp.status));
+            return;
+        }
+        if (!data.deleted) {
+            alert('所选内容已经不在回收站。');
+            return;
+        }
+        loadConversationList(convCurrentPage, true);
     } catch(e) {
         alert('请求失败: ' + e.message);
     }

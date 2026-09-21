@@ -1,6 +1,6 @@
 # 🐾 Pawwake · 爪迹
 
-**4.1.3 · Madeleine**
+**4.1.4 · Madeleine**
 
 *Follow the pawprints back.*
 
@@ -253,10 +253,17 @@ pawwake/
 | `/api/memories/{id}/promote` | POST | 升级为核心记忆 |
 | `/api/memories/{id}/restore` | POST | 恢复已归档的记忆 |
 | `/api/memories/{id}/revert-merge` | POST | 撤回合并，恢复原始碎片 |
-| `/api/conversations` | GET | 分页获取对话列表（含 token 统计） |
-| `/api/conversations/{id}/messages` | GET | 获取指定对话的消息列表 |
-| `/api/conversations/{id}` | DELETE | 删除指定对话 |
-| `/api/conversations/batch-delete` | POST | 批量删除对话 |
+| `/api/conversations` | GET | 分页获取对话列表；`deleted=true` 查看回收站 |
+| `/api/conversations/{id}/messages` | GET | 获取指定对话的消息列表；`deleted=true` 查看已删除消息 |
+| `/api/conversations/{id}` | DELETE | 将指定对话移入回收站 |
+| `/api/conversations/batch-delete` | POST | 批量将对话移入回收站 |
+| `/api/conversations/{id}/restore` | POST | 恢复整段删除的对话消息 |
+| `/api/conversations/batch-restore` | POST | 批量恢复整段删除的对话消息 |
+| `/api/conversations/{id}/permanent` | DELETE | 永久删除该对话的回收站内容 |
+| `/api/conversations/batch-permanent-delete` | POST | 批量永久删除回收站内容 |
+| `/api/chat/messages/{id}` | DELETE | 将单条消息移入回收站 |
+| `/api/chat/messages/{id}/restore` | POST | 恢复单条已删除消息 |
+| `/api/chat/messages/{id}/permanent` | DELETE | 永久删除单条回收站消息 |
 | `/api/chat/search-fragments` | GET/POST | 无状态检索历史对话片段；POST 支持数组形式的排除参数 |
 | `/api/admin/merge-sessions` | POST | 合并多个 session 到目标 session |
 | `/api/admin/rebuild-conversation-search` | POST | 补齐对话 TSV 并唤醒向量补算 |
@@ -322,14 +329,14 @@ pawwake/
 | 环境变量 | 说明 | 默认值 |
 |---------|------|--------|
 | `CONVERSATION_RECALL_ENABLED` | 对话召回总开关；关闭时不写索引、不补算、不检索 | `false` |
-| `MAX_CONVERSATIONS_INJECT` | 分区模式每轮最多自动注入的历史对话片段数；`0` 关闭自动注入 | `3` |
+| `MAX_CONVERSATIONS_INJECT` | 分区模式每轮最多自动注入的历史对话片段总数；优先每条线各取一个，再轮流补足，每条线最多 5 个；`0` 关闭自动注入 | `3` |
 | `CONVERSATION_SEEN_TTL_HOURS` | 分区模式按 `fragment_id` 去重的小时数；过期后允许再次召回，`0` 关闭 seen 去重 | `6` |
 | `CONVERSATION_MIN_SCORE_THRESHOLD` | 对话语义候选的最低原始余弦相似度，与记忆阈值分开 | `0.7` |
 | `CONVERSATION_HW_KEYWORD` | 对话混合搜索：关键词权重 | `0.45` |
 | `CONVERSATION_HW_SEMANTIC` | 对话混合搜索：语义相似度权重 | `0.35` |
 | `CONVERSATION_HW_RECENCY` | 对话混合搜索：时间衰减权重 | `0.2` |
 
-分区模式会排除当前 session，并按 `CONVERSATION_SEEN_TTL_HOURS` 保存每个成功注入的稳定 `fragment_id` 及其独立时间戳。TTL 内不会重复注入同一片段，过期后会自动放行；`0` 关闭 seen 去重。普通非流式请求仅在上游返回 200 后标记；流式请求仅在 200 响应自然结束后标记，客户端取消或上游失败不会吞掉片段。非分区模式不会自动注入。
+分区模式只允许召回当前 session 中已经滑出原文上下文的旧前缀；仍在 A/B 区的消息继续排除，避免重复注入。其他 session 照常参与检索，并按 `CONVERSATION_SEEN_TTL_HOURS` 保存每个成功注入的稳定 `fragment_id` 及其独立时间戳。TTL 内不会重复注入同一片段，过期后会自动放行；`0` 关闭 seen 去重。普通非流式请求仅在上游返回 200 后标记；流式请求仅在 200 响应自然结束后标记，客户端取消或上游失败不会吞掉片段。非分区模式不会自动注入。
 
 raw API 不保存 seen 状态。调用方需要把上次返回的 `fragment_ids` 作为下次的 `exclude_fragment_ids` 传回，也可以用 `exclude_session_ids` 排除整条对话线。POST 示例：
 
@@ -372,6 +379,12 @@ A: 打开 `https://你的网关地址/dashboard`，在「导出备份」页面�
 A: 能。这个项目的第一个部署者就是不会写代码的——代码是 AI 写的，部署是她自己看文档搞定的。
 
 ## 📋 更新日志
+
+### v4.1.4 · Madeleine（2026-09-21）
+
+- **对话回收站** — 删除整段、批量删除与删除单条消息均改为可恢复软删除；整段恢复同时带回删除前的摘要状态，删后新增的对话按原顺序继续摘要，旧段被改动时自动安全重建。搜索、召回、摘要历史读取与导出只使用活跃记录。升级时自动迁移表结构，回收站不自动清理，永久删除需在 Dashboard 手动确认。
+- **补全当前线原文召回** — 分区指针之前、已经滑出原文上下文的当前线旧消息可以重新召回；仍在 A/B 区的内容继续排除，避免重复注入。
+- **让最大注入数按片段生效** — 自动召回先为每条命中对话线保留一个片段，再轮流补足全局上限；单线用户也能按设置注入多个旧片段，每条线最多 5 个。
 
 ### v4.1.3 · Madeleine（2026-09-13）
 

@@ -90,7 +90,9 @@ async def init_tables():
                 content         TEXT,
                 model           TEXT,
                 created_at      TIMESTAMPTZ DEFAULT NOW(),
-                metadata        TEXT
+                metadata        TEXT,
+                deleted_at      TIMESTAMPTZ DEFAULT NULL,
+                deletion_scope  TEXT DEFAULT NULL
             );
         """)
 
@@ -121,6 +123,19 @@ async def init_tables():
             ALTER TABLE conversations ADD COLUMN IF NOT EXISTS metadata TEXT;
         """)
 
+        # 对话回收站：整段与批量删除只标记 deleted_at，老库自动补列。
+        await conn.execute("""
+            ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+        """)
+        await conn.execute("""
+            ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deletion_scope TEXT;
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_conversations_deleted_at
+            ON conversations (deleted_at)
+            WHERE deleted_at IS NOT NULL;
+        """)
+
         # content 允许 NULL（工具调用时 assistant 的 content 可能为空）
         await conn.execute("""
             ALTER TABLE conversations ALTER COLUMN content DROP NOT NULL;
@@ -149,6 +164,9 @@ async def init_tables():
                 session_id      TEXT PRIMARY KEY,
                 summary         TEXT DEFAULT '',
                 a_start_round   INTEGER DEFAULT 0,
+                deleted_summary TEXT,
+                deleted_a_start_round INTEGER,
+                deleted_cache_valid BOOLEAN,
                 seen_fragment_ids TEXT[] DEFAULT '{}',
                 seen_fragment_times JSONB DEFAULT '{}'::jsonb,
                 seen_memory_times JSONB DEFAULT '{}'::jsonb,
@@ -166,6 +184,19 @@ async def init_tables():
         await conn.execute("""
             ALTER TABLE session_cache_state
             ADD COLUMN IF NOT EXISTS seen_memory_times JSONB DEFAULT '{}'::jsonb;
+        """)
+        # deleted_cache_valid: NULL=没有寄存，TRUE=可原样恢复，FALSE=旧段已变更需重算。
+        await conn.execute("""
+            ALTER TABLE session_cache_state
+            ADD COLUMN IF NOT EXISTS deleted_summary TEXT;
+        """)
+        await conn.execute("""
+            ALTER TABLE session_cache_state
+            ADD COLUMN IF NOT EXISTS deleted_a_start_round INTEGER;
+        """)
+        await conn.execute("""
+            ALTER TABLE session_cache_state
+            ADD COLUMN IF NOT EXISTS deleted_cache_valid BOOLEAN;
         """)
         await conn.execute("""
             UPDATE session_cache_state AS scs
