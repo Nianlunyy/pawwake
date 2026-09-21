@@ -512,6 +512,14 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
     if debug_keys:
         print(f"📡 推理字段: {debug_keys}", flush=True)
 
+    # ---------- 工具返回缓冲防 429（仅 Gemini/Vertex + 末尾 role=tool） ----------
+    _final_msgs = body.get("messages", [])
+    if (shared.is_vertex_endpoint()
+            and _final_msgs
+            and _final_msgs[-1].get("role") == "tool"):
+        print("⏳ Gemini/Vertex tool 返回缓冲: sleep 1.5s 防 429")
+        await asyncio.sleep(1.5)
+
     if is_stream:
         stream = stream_and_capture(
             headers,
@@ -764,6 +772,41 @@ async def _stream_and_capture_inner(
     assistant_msg = "".join(full_response)
     assistant_reasoning = "".join(full_reasoning) if full_reasoning else None
     assistant_tool_calls = list(accumulated_tool_calls.values()) if accumulated_tool_calls else None
+
+    # ---------- 空正文无感补刀兜底 ----------
+    # 有 reasoning 但正文和工具调用均为空 → Gemini 偶发只返回思考不返回正文
+    if assistant_reasoning and not assistant_msg and not assistant_tool_calls:
+        try:
+            print("🩹 空正文兜底: 有 reasoning 无 content/tool_calls，尝试非流式补发")
+            await asyncio.sleep(1.0)
+            retry_body = dict(body)
+            retry_body["stream"] = False
+            async with httpx.AsyncClient(timeout=120) as retry_client:
+                retry_resp = await shared.post_chat_completion(
+                    retry_client, shared.API_BASE_URL, shared.API_KEY, retry_body,
+                )
+                if retry_resp.status_code == 200:
+                    retry_data = retry_resp.json()
+                    retry_content = ""
+                    try:
+                        retry_content = retry_data["choices"][0]["message"].get("content") or ""
+                    except (KeyError, IndexError):
+                        pass
+                    if retry_content:
+                        print(f"🩹 空正文兜底成功: 补发 {len(retry_content)} 字符")
+                        sse_payload = json.dumps(
+                            {"choices": [{"delta": {"content": retry_content}}]},
+                            ensure_ascii=False,
+                        )
+                        yield f"data: {sse_payload}\n\n".encode("utf-8")
+                        assistant_msg = retry_content
+                        full_response.append(retry_content)
+                    else:
+                        print("🩹 空正文兜底: 补发响应仍无 content，放弃")
+                else:
+                    logger.warning("空正文兜底补发失败: status=%s", retry_resp.status_code)
+        except Exception:
+            logger.warning("空正文兜底补发异常，跳过", exc_info=True)
 
     if assistant_reasoning:
         print(f"🧠 Stream response 包含 reasoning_content ({len(assistant_reasoning)}字符)")
