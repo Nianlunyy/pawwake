@@ -512,13 +512,20 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
     if debug_keys:
         print(f"📡 推理字段: {debug_keys}", flush=True)
 
-    # ---------- 工具返回缓冲防 429（仅 Gemini/Vertex + 末尾 role=tool） ----------
+    # =========================================================================
+    # [Gemini/Vertex AI 专用] 工具返回缓冲防 429 START
+    # 仅在上游是 Gemini/Vertex 且发送的 messages 末尾角色为 tool 时生效；
+    # 普通用户对白（user）严格不加任何延迟。（若无此问题可整段剥离）
+    # =========================================================================
     _final_msgs = body.get("messages", [])
     if (shared.is_vertex_endpoint()
             and _final_msgs
             and _final_msgs[-1].get("role") == "tool"):
         print("⏳ Gemini/Vertex tool 返回缓冲: sleep 1.5s 防 429")
         await asyncio.sleep(1.5)
+    # =========================================================================
+    # [Gemini/Vertex AI 专用] 工具返回缓冲防 429 END
+    # =========================================================================
 
     if is_stream:
         stream = stream_and_capture(
@@ -784,55 +791,133 @@ async def _stream_and_capture_inner(
     assistant_reasoning = "".join(full_reasoning) if full_reasoning else None
     assistant_tool_calls = list(accumulated_tool_calls.values()) if accumulated_tool_calls else None
 
-    # ---------- 空正文 / malformed_function_call 无感补刀兜底 ----------
+    # =========================================================================
+    # [Gemini/Vertex AI 专用] 工具调用异常挽救与空回复无感兜底 START
+    # -------------------------------------------------------------------------
+    # 【设计背景与原理】
+    # 1. 在 Vertex AI 上使用 Gemini 3.1 Pro / Gemini 2.5 开启 high 深度思考时，
+    #    模型在调用工具前由于思考链过长或边界转场偶发语法微瑕，极易触发
+    #    finish_reason: "malformed_function_call" 导致正文与工具双空回。
+    # 2. 挽救逻辑（阶段一）：优先保留原请求中的 tools，将思考等级降为 low 进行
+    #    轻量级非流式重试。此时模型不会发生思维溢出，能高概率成功产出合法的 tool_calls
+    #    并以标准 OpenAI SSE 格式推送给客户端执行，彻底保住工具调用能力。
+    # 3. 自然降级（阶段二）：若二次重试依然无工具，静默剥离 tools 重新生成自然回复。
+    #    【关键规范】：绝对不向 messages 插入任何系统或用户伪指令（避免破坏角色扮演人设）。
+    #
+    # 【未来剥离指引】
+    # 若未来切换到 Claude / OpenAI 等原生 Function Calling 成熟稳定的模型：
+    # 直接将本 START 至 END 区块（包含下方的 held_done_bytes 放行）整段安全删除即可。
+    # =========================================================================
     is_malformed = (captured_finish_reason == "malformed_function_call")
     is_empty_reply = (not assistant_msg and not assistant_tool_calls)
 
     if is_malformed or is_empty_reply:
         _reason = "malformed_function_call" if is_malformed else "空正文且无 tool_calls"
         try:
-            print(f"🩹 兜底触发 ({_reason}): 剥离 tools 后非流式补发")
-            retry_body = dict(body)
-            retry_body["stream"] = False
-            retry_body.pop("tools", None)  # 剥离工具定义，强制模型直接用纯文本正文作答
-            retry_body.pop("tool_choice", None)
-            # 在 messages 末尾附上引导提示，让模型直接输出文本回复
-            retry_msgs = list(retry_body.get("messages", []))
-            retry_msgs.append({
-                "role": "user",
-                "content": "请直接用纯文本回答上述问题，不要调用任何工具。",
-            })
-            retry_body["messages"] = retry_msgs
-            async with httpx.AsyncClient(timeout=120) as retry_client:
-                retry_resp = await shared.post_chat_completion(
-                    retry_client, shared.API_BASE_URL, shared.API_KEY, retry_body,
-                )
-                if retry_resp.status_code == 200:
-                    retry_data = retry_resp.json()
-                    retry_content = ""
-                    try:
-                        retry_content = retry_data["choices"][0]["message"].get("content") or ""
-                    except (KeyError, IndexError):
-                        pass
-                    if retry_content:
-                        print(f"🩹 兜底成功: 补发 {len(retry_content)} 字符")
-                        sse_payload = json.dumps(
-                            {"choices": [{"delta": {"content": retry_content}}]},
-                            ensure_ascii=False,
-                        )
-                        yield f"data: {sse_payload}\n\n".encode("utf-8")
-                        assistant_msg = retry_content
-                        full_response.append(retry_content)
+            print(f"🩹 兜底触发 ({_reason}): 启动工具挽救与平稳恢复流程")
+            await asyncio.sleep(0.8)  # 缓冲防 Vertex 429 频控
+
+            has_tools = bool(body.get("tools"))
+            rescued_ok = False
+
+            # --- 阶段一：若原请求带 tools，优先尝试低思考等级重试，挽救工具调用 ---
+            if has_tools:
+                retry_body = dict(body)
+                retry_body["stream"] = False
+                # 针对 Vertex Gemini：将思考等级降为 low，避免思维溢出破坏工具协议
+                if "google" in retry_body and "thinking_config" in retry_body.get("google", {}):
+                    retry_body["google"] = {
+                        "thinking_config": {
+                            "thinking_level": "low",
+                            "include_thoughts": True,
+                        }
+                    }
+                async with httpx.AsyncClient(timeout=120) as retry_client:
+                    retry_resp = await shared.post_chat_completion(
+                        retry_client, shared.API_BASE_URL, shared.API_KEY, retry_body,
+                    )
+                    if retry_resp.status_code == 200:
+                        retry_data = retry_resp.json()
+                        first_c = retry_data.get("choices", [{}])[0]
+                        r_msg = first_c.get("message", {})
+                        r_tool_calls = r_msg.get("tool_calls")
+                        r_content = r_msg.get("content") or ""
+                        r_finish = first_c.get("finish_reason")
+
+                        # 成功挽救真实的工具调用！推送给客户端执行工具
+                        if r_tool_calls:
+                            print(f"🩹 兜底成功 (工具调用挽救): 捕获 {len(r_tool_calls)} 个工具调用")
+                            tc_payload = json.dumps(
+                                {"choices": [{"index": 0, "delta": {"tool_calls": r_tool_calls}}]},
+                                ensure_ascii=False,
+                            )
+                            yield f"data: {tc_payload}\n\n".encode("utf-8")
+                            fr_payload = json.dumps(
+                                {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+                                ensure_ascii=False,
+                            )
+                            yield f"data: {fr_payload}\n\n".encode("utf-8")
+                            assistant_tool_calls = r_tool_calls
+                            for idx, tc in enumerate(r_tool_calls):
+                                accumulated_tool_calls[idx] = tc
+                            rescued_ok = True
+
+                        # 挽救得到正常的文本正文
+                        elif r_content:
+                            print(f"🩹 兜底成功 (直接输出正文): 补发 {len(r_content)} 字符")
+                            c_payload = json.dumps(
+                                {"choices": [{"index": 0, "delta": {"content": r_content}}]},
+                                ensure_ascii=False,
+                            )
+                            yield f"data: {c_payload}\n\n".encode("utf-8")
+                            fr_payload = json.dumps(
+                                {"choices": [{"index": 0, "delta": {}, "finish_reason": r_finish or "stop"}]},
+                                ensure_ascii=False,
+                            )
+                            yield f"data: {fr_payload}\n\n".encode("utf-8")
+                            assistant_msg = r_content
+                            full_response.append(r_content)
+                            rescued_ok = True
                     else:
-                        print("🩹 兜底: 补发响应仍无 content，放弃")
-                else:
-                    logger.warning("兜底补发失败: status=%s", retry_resp.status_code)
+                        logger.warning("工具挽救重试失败: status=%s", retry_resp.status_code)
+
+            # --- 阶段二：若无 tools 或工具挽救失败，无感剥离 tools 生成纯文本 ---
+            # 注意：绝不向 messages 追加提示，仅底层取消 tools 定义，模型自然输出文本且不破人设
+            if not rescued_ok:
+                print("🩹 工具挽救未果，平稳退化为无工具自然作答")
+                text_body = dict(body)
+                text_body["stream"] = False
+                text_body.pop("tools", None)
+                text_body.pop("tool_choice", None)
+                async with httpx.AsyncClient(timeout=120) as retry_client:
+                    text_resp = await shared.post_chat_completion(
+                        retry_client, shared.API_BASE_URL, shared.API_KEY, text_body,
+                    )
+                    if text_resp.status_code == 200:
+                        text_data = text_resp.json()
+                        text_c = text_data.get("choices", [{}])[0]
+                        text_content = text_c.get("message", {}).get("content") or ""
+                        if text_content:
+                            print(f"🩹 降级纯文本成功: 补发 {len(text_content)} 字符")
+                            c_payload = json.dumps(
+                                {"choices": [{"delta": {"content": text_content}}]},
+                                ensure_ascii=False,
+                            )
+                            yield f"data: {c_payload}\n\n".encode("utf-8")
+                            assistant_msg = text_content
+                            full_response.append(text_content)
+                    else:
+                        logger.warning("降级纯文本请求失败: status=%s", text_resp.status_code)
+
         except Exception:
-            logger.warning("兜底补发异常，跳过", exc_info=True)
+            logger.warning("兜底流程异常，跳过", exc_info=True)
 
     # 放行被拦截的 [DONE]，让客户端正常关闭连接
     if held_done_bytes is not None:
         yield held_done_bytes
+    # =========================================================================
+    # [Gemini/Vertex AI 专用] 工具调用异常挽救与空回复无感兜底 END
+    # =========================================================================
 
     if assistant_reasoning:
         print(f"🧠 Stream response 包含 reasoning_content ({len(assistant_reasoning)}字符)")
