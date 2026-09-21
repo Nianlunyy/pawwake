@@ -649,6 +649,7 @@ async def _stream_and_capture_inner(
     stream_succeeded = False
     saw_terminal = False  # 见到 data: [DONE] 或 finish_reason 才算 SSE 完整结束
     captured_finish_reason = None  # 保留最终 finish_reason 供兜底逻辑判断
+    held_done_bytes = None  # malformed 时拦截 [DONE]，等兜底完成后再放行
 
     def _mark_terminal():
         nonlocal saw_terminal
@@ -696,7 +697,11 @@ async def _stream_and_capture_inner(
                     stripped_line = line.strip()
                     if stripped_line == "data: [DONE]":
                         _mark_terminal()
-                        yield (line + "\n").encode("utf-8")
+                        if captured_finish_reason == "malformed_function_call":
+                            held_done_bytes = (line + "\n").encode("utf-8")
+                            print("🛡️ malformed_function_call 已拦截 [DONE]，等兜底完成后放行")
+                        else:
+                            yield (line + "\n").encode("utf-8")
                         continue
                     if stripped_line.startswith("data: "):
                         try:
@@ -712,6 +717,10 @@ async def _stream_and_capture_inner(
                                 print(f"🏁 finish_reason: {finish_reason}")
                                 captured_finish_reason = finish_reason
                                 _mark_terminal()
+                                # malformed_function_call: 拦截这个 finish 信号，不透传给客户端
+                                if finish_reason == "malformed_function_call":
+                                    print("🛡️ 拦截 malformed_function_call finish 信号，客户端保持连接")
+                                    continue
                             delta = first_choice.get("delta", {})
                             content = delta.get("content", "")
                             is_thinking_chunk = "extra_content" in delta and content
@@ -780,10 +789,9 @@ async def _stream_and_capture_inner(
     is_empty_reply = (not assistant_msg and not assistant_tool_calls)
 
     if is_malformed or is_empty_reply:
-        _reason = f"malformed_function_call" if is_malformed else "空正文且无 tool_calls"
+        _reason = "malformed_function_call" if is_malformed else "空正文且无 tool_calls"
         try:
             print(f"🩹 兜底触发 ({_reason}): 剥离 tools 后非流式补发")
-            await asyncio.sleep(1.0)
             retry_body = dict(body)
             retry_body["stream"] = False
             retry_body.pop("tools", None)  # 剥离工具定义，强制模型直接用纯文本正文作答
@@ -821,6 +829,10 @@ async def _stream_and_capture_inner(
                     logger.warning("兜底补发失败: status=%s", retry_resp.status_code)
         except Exception:
             logger.warning("兜底补发异常，跳过", exc_info=True)
+
+    # 放行被拦截的 [DONE]，让客户端正常关闭连接
+    if held_done_bytes is not None:
+        yield held_done_bytes
 
     if assistant_reasoning:
         print(f"🧠 Stream response 包含 reasoning_content ({len(assistant_reasoning)}字符)")
