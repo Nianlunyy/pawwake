@@ -708,7 +708,7 @@ async def _stream_and_capture_inner(
 
                             # === 监工排查专用日志 ===
                             if content and not is_thinking_chunk:
-                                logger.info(f"🟢 [排查] 收到正文块: {content[:30]!r}")
+                                print(f"🟢 [排查] 收到正文块: {content[:30]!r}")
                             # =======================
 
                             if is_thinking_chunk:
