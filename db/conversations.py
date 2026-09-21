@@ -7,6 +7,82 @@ import shared
 from db import core as db_core
 from db import search as db_search
 
+
+async def _park_session_cache_states(conn, session_ids: list):
+    """寄存第一次整段删除前的缓存；后续删除不得覆盖最早快照。"""
+    if not session_ids:
+        return
+    await conn.execute(
+        """INSERT INTO session_cache_state AS scs (
+               session_id, summary, a_start_round,
+               deleted_summary, deleted_a_start_round, deleted_cache_valid,
+               updated_at
+           )
+           SELECT sid, '', 0, '', 0, TRUE, NOW()
+           FROM unnest($1::text[]) AS ids(sid)
+           ON CONFLICT (session_id) DO UPDATE
+           SET deleted_summary = CASE
+                   WHEN scs.deleted_cache_valid IS NULL THEN COALESCE(scs.summary, '')
+                   ELSE scs.deleted_summary
+               END,
+               deleted_a_start_round = CASE
+                   WHEN scs.deleted_cache_valid IS NULL THEN COALESCE(scs.a_start_round, 0)
+                   ELSE scs.deleted_a_start_round
+               END,
+               deleted_cache_valid = COALESCE(scs.deleted_cache_valid, TRUE),
+               summary = '',
+               a_start_round = 0,
+               updated_at = NOW()""",
+        session_ids,
+    )
+
+
+async def _restore_session_cache_states(conn, session_ids: list):
+    """有效快照覆盖删后缓存；失效快照安全降级为整段重算。"""
+    if not session_ids:
+        return
+    await conn.execute(
+        """UPDATE session_cache_state
+           SET summary = CASE
+                   WHEN deleted_cache_valid IS TRUE THEN COALESCE(deleted_summary, '')
+                   ELSE ''
+               END,
+               a_start_round = CASE
+                   WHEN deleted_cache_valid IS TRUE THEN COALESCE(deleted_a_start_round, 0)
+                   ELSE 0
+               END,
+               deleted_summary = NULL,
+               deleted_a_start_round = NULL,
+               deleted_cache_valid = NULL,
+               updated_at = NOW()
+           WHERE session_id = ANY($1)""",
+        session_ids,
+    )
+
+
+async def _invalidate_deleted_cache_states(conn, session_ids: list, clear_active: bool = False):
+    """旧段被改动时让寄存失效；旧段清空后允许下一次重新寄存。"""
+    if not session_ids:
+        return
+    await conn.execute(
+        """UPDATE session_cache_state AS scs
+           SET summary = CASE WHEN $2::boolean THEN '' ELSE scs.summary END,
+               a_start_round = CASE WHEN $2::boolean THEN 0 ELSE scs.a_start_round END,
+               deleted_summary = NULL,
+               deleted_a_start_round = NULL,
+               deleted_cache_valid = CASE WHEN EXISTS (
+                   SELECT 1 FROM conversations c
+                   WHERE c.session_id = scs.session_id
+                     AND c.deletion_scope = 'conversation'
+               ) THEN FALSE ELSE NULL END,
+               updated_at = NOW()
+           WHERE scs.session_id = ANY($1)
+             AND scs.deleted_cache_valid IS NOT NULL""",
+        session_ids,
+        clear_active,
+    )
+
+
 # ============================================================
 # 对话记录操作
 # ============================================================
@@ -47,7 +123,7 @@ async def get_last_user_content(session_id: str) -> str:
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
             SELECT content FROM conversations
-            WHERE session_id = $1 AND role = 'user'
+            WHERE session_id = $1 AND role = 'user' AND deleted_at IS NULL
             ORDER BY created_at DESC
             LIMIT 1
         """, session_id)
@@ -60,7 +136,7 @@ async def update_last_assistant_message(session_id: str, new_content: str, model
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
             SELECT id FROM conversations
-            WHERE session_id = $1 AND role = 'assistant'
+            WHERE session_id = $1 AND role = 'assistant' AND deleted_at IS NULL
             ORDER BY created_at DESC
             LIMIT 1
         """, session_id)
@@ -77,7 +153,7 @@ async def update_last_assistant_message(session_id: str, new_content: str, model
                        model = $2,
                        content_tsv = array_to_tsvector(string_to_array($3, ' ')),
                        {embedding_column} = NULL
-                   WHERE id = $4""",
+                   WHERE id = $4 AND deleted_at IS NULL""",
                 new_content, model, tsv_text, row['id']
             )
             if (
@@ -109,7 +185,7 @@ async def search_conversations(query: str, limit: int = 20, offset: int = 0):
         count_sql = f"""
             SELECT COUNT(DISTINCT c.session_id) as total
             FROM conversations c
-            WHERE {where_clause}
+            WHERE c.deleted_at IS NULL AND ({where_clause})
         """
         total_row = await conn.fetchrow(count_sql, *params)
         total = total_row['total'] if total_row else 0
@@ -125,7 +201,7 @@ async def search_conversations(query: str, limit: int = 20, offset: int = 0):
             WITH matched_sessions AS (
                 SELECT DISTINCT c.session_id
                 FROM conversations c
-                WHERE {where_clause}
+                WHERE c.deleted_at IS NULL AND ({where_clause})
             ),
             session_info AS (
                 SELECT
@@ -135,6 +211,7 @@ async def search_conversations(query: str, limit: int = 20, offset: int = 0):
                     COUNT(*) as message_count
                 FROM matched_sessions ms
                 JOIN conversations c ON c.session_id = ms.session_id
+                                    AND c.deleted_at IS NULL
                 GROUP BY ms.session_id
             )
             SELECT
@@ -175,7 +252,7 @@ async def update_message_content(message_id: int, new_content: str):
                SET content = $1,
                    content_tsv = array_to_tsvector(string_to_array($2, ' ')),
                    {embedding_column} = NULL
-               WHERE id = $3""",
+               WHERE id = $3 AND deleted_at IS NULL""",
             new_content, tsv_text, message_id,
         )
     updated = int(result.split()[-1]) if result else 0
@@ -191,14 +268,59 @@ async def update_message_content(message_id: int, new_content: str):
 
 
 async def delete_single_message(message_id: int):
-    """删除单条对话消息（硬删除）"""
+    """软删除单条对话消息。"""
     pool = await db_core.get_pool()
     async with pool.acquire() as conn:
-        result = await conn.execute(
-            "DELETE FROM conversations WHERE id = $1",
-            message_id,
-        )
-        return int(result.split()[-1]) if result else 0
+        async with conn.transaction():
+            session_id = await conn.fetchval(
+                """UPDATE conversations
+                   SET deleted_at = NOW(), deletion_scope = 'message'
+                   WHERE id = $1 AND deleted_at IS NULL
+                   RETURNING session_id""",
+                message_id,
+            )
+            return int(bool(session_id))
+
+
+async def restore_single_message(message_id: int):
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            session_id = await conn.fetchval(
+                """UPDATE conversations SET deleted_at = NULL, deletion_scope = NULL
+                   WHERE id = $1 AND deleted_at IS NOT NULL
+                   RETURNING session_id""",
+                message_id,
+            )
+            if session_id:
+                await _invalidate_deleted_cache_states(conn, [session_id], clear_active=True)
+            return int(bool(session_id))
+
+
+async def permanently_delete_single_message(message_id: int):
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """DELETE FROM conversations
+                   WHERE id = $1 AND deleted_at IS NOT NULL
+                   RETURNING session_id, deletion_scope""",
+                message_id,
+            )
+            if row:
+                session_id = row['session_id']
+                if row['deletion_scope'] == 'conversation':
+                    await _invalidate_deleted_cache_states(conn, [session_id])
+                await conn.execute(
+                    """DELETE FROM session_cache_state scs
+                       WHERE scs.session_id = $1
+                         AND NOT EXISTS (
+                             SELECT 1 FROM conversations c
+                             WHERE c.session_id = scs.session_id
+                         )""",
+                    session_id,
+                )
+            return int(bool(row))
 
 
 # ============================================================
@@ -210,10 +332,10 @@ async def get_conversation_messages(session_id: str, limit: int = 100):
     pool = await db_core.get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT role, content, metadata, created_at
+            SELECT id, role, content, metadata, created_at
             FROM conversations
-            WHERE session_id = $1
-            ORDER BY created_at ASC
+            WHERE session_id = $1 AND deleted_at IS NULL
+            ORDER BY created_at ASC, id ASC
             LIMIT $2
         """, session_id, limit)
         return [dict(r) for r in rows]
@@ -452,19 +574,25 @@ async def save_token_usage(session_id: str, model: str, prompt_tokens: int, comp
 # 对话记录管理
 # ============================================================
 
-async def get_conversations_paginated(page: int = 1, per_page: int = 20):
+async def get_conversations_paginated(page: int = 1, per_page: int = 20, deleted: bool = False):
     offset = (page - 1) * per_page
+    state_filter = "deleted_at IS NOT NULL" if deleted else "deleted_at IS NULL"
     pool = await db_core.get_pool()
     async with pool.acquire() as conn:
         total_row = await conn.fetchrow(
-            "SELECT COUNT(DISTINCT session_id) as total FROM conversations"
+            f"SELECT COUNT(DISTINCT session_id) as total FROM conversations WHERE {state_filter}"
         )
         total = total_row['total'] if total_row else 0
 
-        rows = await conn.fetch("""
+        rows = await conn.fetch(f"""
             WITH session_info AS (
-                SELECT session_id, MIN(created_at) as first_time, MAX(created_at) as last_time, COUNT(*) as message_count
-                FROM conversations GROUP BY session_id ORDER BY last_time DESC LIMIT $1 OFFSET $2
+                SELECT session_id, MIN(created_at) as first_time, MAX(created_at) as last_time,
+                       MAX(deleted_at) as deleted_at, COUNT(*) as message_count
+                FROM conversations
+                WHERE {state_filter}
+                GROUP BY session_id
+                ORDER BY {"deleted_at" if deleted else "last_time"} DESC
+                LIMIT $1 OFFSET $2
             )
             SELECT si.*,
                    COALESCE(tu.total_all, 0) as total_tokens
@@ -478,7 +606,9 @@ async def get_conversations_paginated(page: int = 1, per_page: int = 20):
         results = []
         for r in rows:
             preview_row = await conn.fetchrow(
-                "SELECT content FROM conversations WHERE session_id = $1 AND role = 'user' ORDER BY created_at LIMIT 1",
+                f"""SELECT content FROM conversations
+                    WHERE session_id = $1 AND role = 'user' AND {state_filter}
+                    ORDER BY created_at LIMIT 1""",
                 r['session_id']
             )
             preview = preview_row['content'][:80] if preview_row else ''
@@ -491,6 +621,7 @@ async def get_conversations_paginated(page: int = 1, per_page: int = 20):
                 'message_count': r['message_count'],
                 'preview': preview,
                 'total_tokens': r['total_tokens'],
+                'deleted_at': r['deleted_at'].isoformat() if r['deleted_at'] else None,
             })
         return results, total
 
@@ -498,15 +629,111 @@ async def get_conversations_paginated(page: int = 1, per_page: int = 20):
 async def delete_conversation(session_id: str):
     pool = await db_core.get_pool()
     async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM conversations WHERE session_id = $1", session_id)
-        await conn.execute("DELETE FROM session_cache_state WHERE session_id = $1", session_id)
+        async with conn.transaction():
+            result = await conn.execute(
+                """UPDATE conversations
+                   SET deleted_at = NOW(), deletion_scope = 'conversation'
+                   WHERE session_id = $1 AND deleted_at IS NULL""",
+                session_id,
+            )
+            deleted = int(result.split()[-1]) if result else 0
+            if deleted:
+                await _park_session_cache_states(conn, [session_id])
+            return deleted
 
 
 async def batch_delete_conversations(session_ids: list):
     pool = await db_core.get_pool()
     async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM conversations WHERE session_id = ANY($1)", session_ids)
-        await conn.execute("DELETE FROM session_cache_state WHERE session_id = ANY($1)", session_ids)
+        async with conn.transaction():
+            rows = await conn.fetch(
+                """UPDATE conversations
+                   SET deleted_at = NOW(), deletion_scope = 'conversation'
+                   WHERE session_id = ANY($1) AND deleted_at IS NULL
+                   RETURNING session_id""",
+                session_ids,
+            )
+            deleted_ids = sorted({row['session_id'] for row in rows})
+            await _park_session_cache_states(conn, deleted_ids)
+            return len(deleted_ids)
+
+
+async def restore_conversation(session_id: str):
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await conn.execute(
+                """UPDATE conversations SET deleted_at = NULL, deletion_scope = NULL
+                   WHERE session_id = $1 AND deletion_scope = 'conversation'""",
+                session_id,
+            )
+            restored = int(result.split()[-1]) if result else 0
+            if restored:
+                await _restore_session_cache_states(conn, [session_id])
+            return restored
+
+
+async def batch_restore_conversations(session_ids: list):
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            rows = await conn.fetch(
+                """UPDATE conversations SET deleted_at = NULL, deletion_scope = NULL
+                   WHERE session_id = ANY($1) AND deletion_scope = 'conversation'
+                   RETURNING session_id""",
+                session_ids,
+            )
+            restored_ids = sorted({row['session_id'] for row in rows})
+            await _restore_session_cache_states(conn, restored_ids)
+            return len(restored_ids)
+
+
+async def permanently_delete_conversation(session_id: str):
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await conn.execute(
+                "DELETE FROM conversations WHERE session_id = $1 AND deleted_at IS NOT NULL",
+                session_id,
+            )
+            deleted = int(result.split()[-1]) if result else 0
+            if deleted:
+                await _invalidate_deleted_cache_states(conn, [session_id])
+                await conn.execute(
+                    """DELETE FROM session_cache_state scs
+                       WHERE scs.session_id = $1
+                         AND NOT EXISTS (
+                             SELECT 1 FROM conversations c
+                             WHERE c.session_id = scs.session_id
+                         )""",
+                    session_id,
+                )
+            return deleted
+
+
+async def batch_permanently_delete_conversations(session_ids: list):
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            rows = await conn.fetch(
+                """DELETE FROM conversations
+                   WHERE session_id = ANY($1) AND deleted_at IS NOT NULL
+                   RETURNING session_id""",
+                session_ids,
+            )
+            deleted_ids = sorted({row['session_id'] for row in rows})
+            if deleted_ids:
+                await _invalidate_deleted_cache_states(conn, deleted_ids)
+                await conn.execute(
+                    """DELETE FROM session_cache_state scs
+                       WHERE scs.session_id = ANY($1)
+                         AND NOT EXISTS (
+                             SELECT 1 FROM conversations c
+                             WHERE c.session_id = scs.session_id
+                         )""",
+                    deleted_ids,
+                )
+            return len(deleted_ids)
 
 
 async def merge_sessions_to_target(source_ids: list, target_id: str) -> dict:
@@ -514,12 +741,88 @@ async def merge_sessions_to_target(source_ids: list, target_id: str) -> dict:
         return {'merged_sessions': 0, 'merged_messages': 0, 'merged_token_records': 0}
     pool = await db_core.get_pool()
     async with pool.acquire() as conn:
-        msg_count = await conn.fetchval("SELECT COUNT(*) FROM conversations WHERE session_id = ANY($1)", source_ids)
-        await conn.execute("UPDATE conversations SET session_id = $1 WHERE session_id = ANY($2)", target_id, source_ids)
-        token_count = await conn.fetchval("SELECT COUNT(*) FROM token_usage WHERE session_id = ANY($1)", source_ids)
-        await conn.execute("UPDATE token_usage SET session_id = $1 WHERE session_id = ANY($2)", target_id, source_ids)
-        await conn.execute("DELETE FROM session_cache_state WHERE session_id = ANY($1)", source_ids)
-        return {'merged_sessions': len(source_ids), 'merged_messages': msg_count or 0, 'merged_token_records': token_count or 0}
+        async with conn.transaction():
+            merge_shape = await conn.fetchrow(
+                """SELECT
+                       (SELECT MIN(created_at) FROM conversations
+                        WHERE session_id = ANY($1) AND deleted_at IS NULL)
+                       >
+                       (SELECT MAX(created_at) FROM conversations
+                        WHERE session_id = $2 AND deleted_at IS NULL)
+                           AS preserve_active_cache,
+                       EXISTS (
+                           SELECT 1 FROM conversations
+                           WHERE session_id = ANY($1)
+                             AND deletion_scope = 'conversation'
+                       ) AS source_has_deleted_history""",
+                source_ids,
+                target_id,
+            )
+            preserve_active_cache = bool(merge_shape['preserve_active_cache'])
+            source_has_deleted_history = merge_shape['source_has_deleted_history']
+            msg_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM conversations WHERE session_id = ANY($1) AND deleted_at IS NULL",
+                source_ids,
+            )
+            await conn.execute(
+                "UPDATE conversations SET session_id = $1 WHERE session_id = ANY($2)",
+                target_id,
+                source_ids,
+            )
+            token_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM token_usage WHERE session_id = ANY($1)",
+                source_ids,
+            )
+            await conn.execute(
+                "UPDATE token_usage SET session_id = $1 WHERE session_id = ANY($2)",
+                target_id,
+                source_ids,
+            )
+            has_deleted_history = await conn.fetchval(
+                """SELECT EXISTS (
+                       SELECT 1 FROM conversations
+                       WHERE session_id = $1 AND deletion_scope = 'conversation'
+                   )""",
+                target_id,
+            )
+            invalidate_deleted_cache = bool(
+                has_deleted_history
+                and (not preserve_active_cache or source_has_deleted_history)
+            )
+            await conn.execute(
+                """INSERT INTO session_cache_state AS scs (
+                       session_id, summary, a_start_round, deleted_cache_valid, updated_at
+                   ) VALUES ($1, '', 0, CASE WHEN $2::boolean THEN FALSE ELSE NULL END, NOW())
+                   ON CONFLICT (session_id) DO UPDATE
+                   SET summary = CASE WHEN $3::boolean THEN scs.summary ELSE '' END,
+                       a_start_round = CASE WHEN $3::boolean THEN scs.a_start_round ELSE 0 END,
+                       deleted_summary = CASE
+                           WHEN $3::boolean AND NOT $2::boolean THEN scs.deleted_summary
+                           ELSE NULL
+                       END,
+                       deleted_a_start_round = CASE
+                           WHEN $3::boolean AND NOT $2::boolean THEN scs.deleted_a_start_round
+                           ELSE NULL
+                       END,
+                       deleted_cache_valid = CASE
+                           WHEN $2::boolean THEN FALSE
+                           WHEN $3::boolean THEN scs.deleted_cache_valid
+                           ELSE NULL
+                       END,
+                       updated_at = NOW()""",
+                target_id,
+                invalidate_deleted_cache,
+                preserve_active_cache,
+            )
+            await conn.execute(
+                "DELETE FROM session_cache_state WHERE session_id = ANY($1)",
+                source_ids,
+            )
+            return {
+                'merged_sessions': len(source_ids),
+                'merged_messages': msg_count or 0,
+                'merged_token_records': token_count or 0,
+            }
 
 
 async def list_all_session_cache_states() -> list:
@@ -530,8 +833,12 @@ async def list_all_session_cache_states() -> list:
                    COALESCE(c.message_count, 0) as message_count,
                    COALESCE(tu.chat_tokens, 0) as chat_tokens
             FROM session_cache_state scs
-            LEFT JOIN (SELECT session_id, COUNT(*) as message_count FROM conversations GROUP BY session_id) c ON scs.session_id = c.session_id
+            LEFT JOIN (
+                SELECT session_id, COUNT(*) as message_count
+                FROM conversations WHERE deleted_at IS NULL GROUP BY session_id
+            ) c ON scs.session_id = c.session_id
             LEFT JOIN (SELECT session_id, SUM(total_tokens) as chat_tokens FROM token_usage WHERE usage_type = 'chat' GROUP BY session_id) tu ON scs.session_id = tu.session_id
+            WHERE scs.deleted_cache_valid IS NULL OR c.message_count IS NOT NULL
             ORDER BY scs.updated_at DESC
         """)
         results = []
@@ -636,6 +943,7 @@ async def export_all_conversations():
         rows = await conn.fetch("""
             SELECT session_id, role, content, model, created_at
             FROM conversations
+            WHERE deleted_at IS NULL
             ORDER BY session_id, created_at
         """)
         return [
@@ -665,6 +973,7 @@ async def import_conversations(records: list):
     async with pool.acquire() as conn:
         imported = 0
         skipped = 0
+        changed_sessions = set()
         for r in records:
             session_id = r.get('session_id')
             role = r.get('role')
@@ -691,13 +1000,23 @@ async def import_conversations(records: list):
             # 去重检查
             if created_at:
                 existing = await conn.fetchrow("""
-                    SELECT id FROM conversations
+                    SELECT id, deleted_at FROM conversations
                     WHERE session_id = $1 AND role = $2 AND created_at = $3
                     LIMIT 1
                 """, session_id, role, created_at)
 
                 if existing:
-                    skipped += 1
+                    if existing['deleted_at']:
+                        await conn.execute(
+                            """UPDATE conversations
+                               SET deleted_at = NULL, deletion_scope = NULL
+                               WHERE id = $1""",
+                            existing['id'],
+                        )
+                        imported += 1
+                        changed_sessions.add(session_id)
+                    else:
+                        skipped += 1
                     continue
 
                 await conn.execute("""
@@ -719,6 +1038,13 @@ async def import_conversations(records: list):
                 """, session_id, role, content, model, tsv_text)
 
             imported += 1
+            changed_sessions.add(session_id)
+
+        await _invalidate_deleted_cache_states(
+            conn,
+            sorted(changed_sessions),
+            clear_active=True,
+        )
 
         if skipped:
             print(f"📥 导入对话: {imported} 条新增, {skipped} 条已存在跳过")

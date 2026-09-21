@@ -226,7 +226,28 @@ def _format_recall_timestamp(raw_ts) -> str:
         return str(raw_ts)[:10]
 
 
-async def build_conversation_recall_text(user_message: str, session_id: str):
+def _out_of_context_prefix_cutoff(history: list, a_start_round: int):
+    """返回已经滑出上下文的最后一条消息位置。"""
+    if a_start_round <= 0:
+        return None
+    cleaned = partition_engine._clean_orphan_tool_messages(history)
+    rounds = partition_engine.group_by_rounds(cleaned)
+    if a_start_round > len(rounds):
+        return None
+    prefix = rounds[:a_start_round]
+    if not prefix:
+        return None
+    last = prefix[-1][-1]
+    if last.get("id") is None or last.get("created_at") is None:
+        return None
+    return last["created_at"], last["id"]
+
+
+async def build_conversation_recall_text(
+    user_message: str,
+    session_id: str,
+    history: list | None = None,
+):
     """为分区模式检索未注入过的对话片段，并返回待确认的 fragment_id。"""
     if (
         not shared.CONVERSATION_RECALL_ENABLED
@@ -239,14 +260,20 @@ async def build_conversation_recall_text(user_message: str, session_id: str):
             session_id,
             shared.CONVERSATION_SEEN_TTL_HOURS,
         )
+        cutoff = _out_of_context_prefix_cutoff(
+            history or [],
+            state.get("a_start_round", 0),
+        )
         results, _ = await db_search.search_chat_fragments(
             user_message,
             max_sessions=shared.MAX_CONVERSATIONS_INJECT,
-            max_matches_per_session=1,
+            max_matches_per_session=shared.MAX_CONVERSATIONS_INJECT,
             context=1,
             mode="hybrid",
             exclude_session_ids=[session_id],
             exclude_fragment_ids=state.get("seen_fragment_ids", []),
+            include_session_before=(session_id, *cutoff) if cutoff else None,
+            disjoint_fragments=True,
         )
         if not results:
             return "", []
@@ -254,11 +281,15 @@ async def build_conversation_recall_text(user_message: str, session_id: str):
         blocks = []
         fragment_ids = []
         role_labels = {"user": "用户", "assistant": "AI", "tool": "工具"}
-        for result in results:
-            for fragment, fragment_id in zip(
-                result.get("fragments", []),
-                result.get("fragment_ids", []),
-            ):
+        per_session = [
+            list(zip(result.get("fragments", []), result.get("fragment_ids", [])))
+            for result in results
+        ]
+        for match_index in range(max((len(items) for items in per_session), default=0)):
+            for items in per_session:
+                if match_index >= len(items):
+                    continue
+                fragment, fragment_id = items[match_index]
                 lines = []
                 for message in fragment:
                     date_prefix = ""
@@ -269,6 +300,10 @@ async def build_conversation_recall_text(user_message: str, session_id: str):
                 if lines and fragment_id:
                     blocks.append("\n".join(lines))
                     fragment_ids.append(fragment_id)
+                if len(blocks) >= shared.MAX_CONVERSATIONS_INJECT:
+                    break
+            if len(blocks) >= shared.MAX_CONVERSATIONS_INJECT:
+                break
 
         if not blocks:
             return "", []

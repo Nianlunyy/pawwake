@@ -15,11 +15,11 @@ router = APIRouter()
 # ============================================================
 
 @router.get("/api/conversations")
-async def api_conversations(page: int = 1, per_page: int = 20):
+async def api_conversations(page: int = 1, per_page: int = 20, deleted: bool = False):
     if not shared.conversation_persistence_enabled():
         return {"error": "对话持久化未启用"}
     try:
-        results, total = await db_conversations.get_conversations_paginated(page, per_page)
+        results, total = await db_conversations.get_conversations_paginated(page, per_page, deleted)
         total_pages = max(1, -(-total // per_page))  # 向上取整
         return {"conversations": results, "total": total, "page": page, "per_page": per_page, "total_pages": total_pages}
     except Exception:
@@ -27,18 +27,26 @@ async def api_conversations(page: int = 1, per_page: int = 20):
 
 
 @router.get("/api/conversations/{session_id}/messages")
-async def api_conversation_messages(session_id: str, limit: int = 50, offset: int = 0):
+async def api_conversation_messages(
+    session_id: str,
+    limit: int = 50,
+    offset: int = 0,
+    deleted: bool = False,
+):
     if not shared.conversation_persistence_enabled():
         return {"error": "对话持久化未启用"}
     try:
         pool = await db_core.get_pool()
+        state_filter = "deleted_at IS NOT NULL" if deleted else "deleted_at IS NULL"
         async with pool.acquire() as conn:
             total = await conn.fetchval(
-                "SELECT COUNT(*) FROM conversations WHERE session_id = $1", session_id
+                f"""SELECT COUNT(*) FROM conversations
+                    WHERE session_id = $1 AND {state_filter}""",
+                session_id,
             )
-            rows = await conn.fetch("""
+            rows = await conn.fetch(f"""
                 SELECT id, role, content, created_at
-                FROM conversations WHERE session_id = $1
+                FROM conversations WHERE session_id = $1 AND {state_filter}
                 ORDER BY created_at DESC
                 LIMIT $2 OFFSET $3
             """, session_id, limit, offset)
@@ -66,12 +74,81 @@ async def api_batch_delete_conversations(request: Request):
         return {"error": "对话持久化未启用"}
     try:
         body = await request.json()
+        if not isinstance(body, dict):
+            return {"error": "请求体必须是 JSON 对象"}
         ids = body.get("session_ids", [])
-        if ids:
-            await db_conversations.batch_delete_conversations(ids)
-        return {"status": "ok", "deleted": len(ids)}
+        if not isinstance(ids, list):
+            return {"error": "session_ids 必须是数组"}
+        ids = list(dict.fromkeys(value for value in ids if isinstance(value, str) and value))
+        deleted = await db_conversations.batch_delete_conversations(ids) if ids else 0
+        return {"status": "ok", "deleted": deleted}
     except Exception:
         return shared._api_failure("批量删除对话失败")
+
+
+@router.post("/api/conversations/{session_id}/restore")
+async def api_restore_conversation(session_id: str):
+    if not shared.conversation_persistence_enabled():
+        return {"error": "对话持久化未启用"}
+    try:
+        restored = await db_conversations.restore_conversation(session_id)
+        if restored == 0:
+            return {"error": "没有可整段恢复的消息，请在详情中恢复单独删除的消息"}
+        return {"status": "ok"}
+    except Exception:
+        return shared._api_failure("恢复对话失败")
+
+
+@router.post("/api/conversations/batch-restore")
+async def api_batch_restore_conversations(request: Request):
+    if not shared.conversation_persistence_enabled():
+        return {"error": "对话持久化未启用"}
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            return {"error": "请求体必须是 JSON 对象"}
+        ids = body.get("session_ids", [])
+        if not isinstance(ids, list):
+            return {"error": "session_ids 必须是数组"}
+        ids = list(dict.fromkeys(value for value in ids if isinstance(value, str) and value))
+        restored = await db_conversations.batch_restore_conversations(ids) if ids else 0
+        return {"status": "ok", "restored": restored}
+    except Exception:
+        return shared._api_failure("批量恢复对话失败")
+
+
+@router.delete("/api/conversations/{session_id}/permanent")
+async def api_permanently_delete_conversation(session_id: str):
+    if not shared.conversation_persistence_enabled():
+        return {"error": "对话持久化未启用"}
+    try:
+        deleted = await db_conversations.permanently_delete_conversation(session_id)
+        if deleted == 0:
+            return {"error": "回收站中没有这个对话"}
+        return {"status": "ok"}
+    except Exception:
+        return shared._api_failure("永久删除对话失败")
+
+
+@router.post("/api/conversations/batch-permanent-delete")
+async def api_batch_permanently_delete_conversations(request: Request):
+    if not shared.conversation_persistence_enabled():
+        return {"error": "对话持久化未启用"}
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            return {"error": "请求体必须是 JSON 对象"}
+        ids = body.get("session_ids", [])
+        if not isinstance(ids, list):
+            return {"error": "session_ids 必须是数组"}
+        ids = list(dict.fromkeys(value for value in ids if isinstance(value, str) and value))
+        deleted = (
+            await db_conversations.batch_permanently_delete_conversations(ids)
+            if ids else 0
+        )
+        return {"status": "ok", "deleted": deleted}
+    except Exception:
+        return shared._api_failure("批量永久删除对话失败")
 
 
 @router.post("/api/admin/merge-sessions")
@@ -250,7 +327,7 @@ async def api_update_message(message_id: int, request: Request):
 
 @router.delete("/api/chat/messages/{message_id}")
 async def api_delete_message(message_id: int):
-    """删除单条消息"""
+    """软删除单条消息。"""
     if not shared.conversation_persistence_enabled():
         return {"error": "对话持久化未启用"}
     try:
@@ -260,6 +337,32 @@ async def api_delete_message(message_id: int):
         return {"status": "ok"}
     except Exception:
         return shared._api_failure("删除消息失败")
+
+
+@router.post("/api/chat/messages/{message_id}/restore")
+async def api_restore_message(message_id: int):
+    if not shared.conversation_persistence_enabled():
+        return {"error": "对话持久化未启用"}
+    try:
+        restored = await db_conversations.restore_single_message(message_id)
+        if restored == 0:
+            return {"error": "回收站中没有这条消息"}
+        return {"status": "ok"}
+    except Exception:
+        return shared._api_failure("恢复消息失败")
+
+
+@router.delete("/api/chat/messages/{message_id}/permanent")
+async def api_permanently_delete_message(message_id: int):
+    if not shared.conversation_persistence_enabled():
+        return {"error": "对话持久化未启用"}
+    try:
+        deleted = await db_conversations.permanently_delete_single_message(message_id)
+        if deleted == 0:
+            return {"error": "回收站中没有这条消息"}
+        return {"status": "ok"}
+    except Exception:
+        return shared._api_failure("永久删除消息失败")
 
 
 @router.get("/api/conversations/export")

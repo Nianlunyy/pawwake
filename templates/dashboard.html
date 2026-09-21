@@ -335,7 +335,7 @@
                 </div>
 
                 <!-- 搜索栏 -->
-                <div class="card" style="margin-bottom: 16px;">
+                <div class="card" id="conv-search-card" style="margin-bottom: 16px;">
                     <div style="display: flex; gap: 8px;">
                         <input type="text" id="conv-search-input" class="input" 
                             placeholder="搜索对话内容..." 
@@ -351,7 +351,10 @@
                 <div class="card">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
                         <h4 id="conv-list-title">对话列表</h4>
-                        <span id="conv-list-count" style="color: var(--text-muted); font-size: 13px;"></span>
+                        <div style="display: flex; align-items: center; gap: 8px;">
+                            <span id="conv-list-count" style="color: var(--text-muted); font-size: 13px;"></span>
+                            <button class="btn btn-sm" id="conv-trash-toggle" onclick="toggleConversationTrash()">回收站</button>
+                        </div>
                     </div>
                     <div id="conv-list-container" style="min-height: 100px;">
                         <div style="text-align: center; color: var(--text-muted); padding: 40px 0;">加载中...</div>
@@ -532,9 +535,9 @@
                         <label class="toggle"><input type="checkbox" id="set-CONVERSATION_RECALL_ENABLED"><span class="toggle-slider"></span></label>
                     </div>
                     <div class="settings-field">
-                        <label>最大注入对话数 (MAX_CONVERSATIONS_INJECT)</label>
+                        <label>最大注入对话片段数 (MAX_CONVERSATIONS_INJECT)</label>
                         <input type="number" id="set-MAX_CONVERSATIONS_INJECT" class="input" min="0" max="50">
-                        <small class="form-hint">分区模式的服务端默认值；0 关闭自动注入，raw API 可逐请求覆盖</small>
+                        <small class="form-hint">分区模式每轮的片段总上限；每条线最多 5 个，0 关闭自动注入，raw API 可逐请求覆盖</small>
                     </div>
                     <div class="settings-field">
                         <label>片段去重时长（小时） (CONVERSATION_SEEN_TTL_HOURS)</label>
@@ -694,6 +697,6 @@
         </main>
     </div>
 
-    <script src="/static/js/dashboard.js?v=4.1.3-1"></script>
+    <script src="/static/js/dashboard.js?v=4.1.4"></script>
 </body>
 </html>
