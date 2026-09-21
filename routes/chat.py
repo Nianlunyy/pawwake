@@ -648,6 +648,7 @@ async def _stream_and_capture_inner(
     accumulated_tool_calls = {}  # index -> OpenAI-compatible tool call
     stream_succeeded = False
     saw_terminal = False  # 见到 data: [DONE] 或 finish_reason 才算 SSE 完整结束
+    captured_finish_reason = None  # 保留最终 finish_reason 供兜底逻辑判断
 
     def _mark_terminal():
         nonlocal saw_terminal
@@ -709,6 +710,7 @@ async def _stream_and_capture_inner(
                             finish_reason = first_choice.get("finish_reason")
                             if finish_reason:
                                 print(f"🏁 finish_reason: {finish_reason}")
+                                captured_finish_reason = finish_reason
                                 _mark_terminal()
                             delta = first_choice.get("delta", {})
                             content = delta.get("content", "")
@@ -773,14 +775,26 @@ async def _stream_and_capture_inner(
     assistant_reasoning = "".join(full_reasoning) if full_reasoning else None
     assistant_tool_calls = list(accumulated_tool_calls.values()) if accumulated_tool_calls else None
 
-    # ---------- 空正文无感补刀兜底 ----------
-    # 有 reasoning 但正文和工具调用均为空 → Gemini 偶发只返回思考不返回正文
-    if assistant_reasoning and not assistant_msg and not assistant_tool_calls:
+    # ---------- 空正文 / malformed_function_call 无感补刀兜底 ----------
+    is_malformed = (captured_finish_reason == "malformed_function_call")
+    is_empty_reply = (not assistant_msg and not assistant_tool_calls)
+
+    if is_malformed or is_empty_reply:
+        _reason = f"malformed_function_call" if is_malformed else "空正文且无 tool_calls"
         try:
-            print("🩹 空正文兜底: 有 reasoning 无 content/tool_calls，尝试非流式补发")
+            print(f"🩹 兜底触发 ({_reason}): 剥离 tools 后非流式补发")
             await asyncio.sleep(1.0)
             retry_body = dict(body)
             retry_body["stream"] = False
+            retry_body.pop("tools", None)  # 剥离工具定义，强制模型直接用纯文本正文作答
+            retry_body.pop("tool_choice", None)
+            # 在 messages 末尾附上引导提示，让模型直接输出文本回复
+            retry_msgs = list(retry_body.get("messages", []))
+            retry_msgs.append({
+                "role": "user",
+                "content": "请直接用纯文本回答上述问题，不要调用任何工具。",
+            })
+            retry_body["messages"] = retry_msgs
             async with httpx.AsyncClient(timeout=120) as retry_client:
                 retry_resp = await shared.post_chat_completion(
                     retry_client, shared.API_BASE_URL, shared.API_KEY, retry_body,
@@ -793,7 +807,7 @@ async def _stream_and_capture_inner(
                     except (KeyError, IndexError):
                         pass
                     if retry_content:
-                        print(f"🩹 空正文兜底成功: 补发 {len(retry_content)} 字符")
+                        print(f"🩹 兜底成功: 补发 {len(retry_content)} 字符")
                         sse_payload = json.dumps(
                             {"choices": [{"delta": {"content": retry_content}}]},
                             ensure_ascii=False,
@@ -802,11 +816,11 @@ async def _stream_and_capture_inner(
                         assistant_msg = retry_content
                         full_response.append(retry_content)
                     else:
-                        print("🩹 空正文兜底: 补发响应仍无 content，放弃")
+                        print("🩹 兜底: 补发响应仍无 content，放弃")
                 else:
-                    logger.warning("空正文兜底补发失败: status=%s", retry_resp.status_code)
+                    logger.warning("兜底补发失败: status=%s", retry_resp.status_code)
         except Exception:
-            logger.warning("空正文兜底补发异常，跳过", exc_info=True)
+            logger.warning("兜底补发异常，跳过", exc_info=True)
 
     if assistant_reasoning:
         print(f"🧠 Stream response 包含 reasoning_content ({len(assistant_reasoning)}字符)")
