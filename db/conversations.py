@@ -163,8 +163,8 @@ async def update_last_assistant_message(session_id: str, new_content: str, model
                 and new_content.strip()
             ):
                 db_search.kick_embedding_backfill()
-            return True
-        return False
+            return int(row["id"])
+        return None
 
 
 async def search_conversations(query: str, limit: int = 20, offset: int = 0):

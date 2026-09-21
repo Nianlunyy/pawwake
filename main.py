@@ -119,7 +119,7 @@ async def lifespan(app: FastAPI):
 
 
 
-app = FastAPI(title="Pawwake", version="4.1.4", lifespan=lifespan)
+app = FastAPI(title="Pawwake", version="4.1.5", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 app.middleware("http")(auth.gateway_auth_middleware)
 

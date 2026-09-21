@@ -50,6 +50,7 @@ async def export_memories():
 
     try:
         memories = await db_memories.get_all_memories()
+        database_instance_id = await db_core.get_gateway_config("database_instance_id")
         # 库内 id 在备份里叫 backup_id：只是恢复时重建 merged_from 关系的映射键，
         # 不承诺导入后保持同一 id；日期转成字符串
         for mem in memories:
@@ -63,7 +64,8 @@ async def export_memories():
                     mem[key] = str(mem[key])
 
         return {
-            "schema_version": 4,
+            "schema_version": 5,
+            "source_database_id": database_instance_id,
             "total": len(memories),
             "exported_at": str(datetime.now()),
             "memories": memories,
@@ -728,13 +730,23 @@ async def import_memories(request: Request):
         if not memories:
             return {"error": "没有找到记忆数据，请确认 JSON 格式正确"}
 
-        # v2/v3/v4 版本化备份：v3 额外恢复自动取代版本链，v4 额外恢复提醒与送达账
+        # v2+ 版本化备份；跨库导入不能沿用本地 conversations.id 来源。
         schema_version = data.get("schema_version")
-        if schema_version in (2, 3, 4):
+        if schema_version in (2, 3, 4, 5):
             try:
+                database_instance_id = (
+                    await db_core.get_gateway_config("database_instance_id")
+                    if schema_version >= 5
+                    else None
+                )
                 return await db_memories.import_memories_v2(
                     memories,
                     schema_version=schema_version,
+                    preserve_source_message_ids=(
+                        schema_version >= 5
+                        and bool(database_instance_id)
+                        and data.get("source_database_id") == database_instance_id
+                    ),
                 )
             except ValueError as e:
                 return {"error": f"备份校验失败：{e}"}

@@ -565,6 +565,7 @@ async def search_chat_fragments(
     exclude_fragment_ids: list | None = None,
     include_session_before: tuple | None = None,
     disjoint_fragments: bool = False,
+    include_message_ids: bool = False,
 ):
     """检索历史对话。raw API 无状态，排除集合完全由调用方传入。"""
     from datetime import datetime, timezone
@@ -744,13 +745,17 @@ async def search_chat_fragments(
                 fragment_id = fragment_ids[0] if fragment_ids else None
                 if not fragment_id or fragment_id in excluded_fragments:
                     continue
-                kept.append((fragments[0], fragment_id))
+                kept.append((
+                    fragments[0],
+                    fragment_id,
+                    [marked[index]["id"] for index in sorted(context_indices)],
+                ))
                 used_context_indices.update(context_indices)
                 if len(kept) >= max_matches_per_session:
                     break
             if not kept:
                 continue
-            results.append({
+            result = {
                 "session_id": session_id,
                 "title": session_id,
                 "total_messages": len(marked),
@@ -766,7 +771,10 @@ async def search_chat_fragments(
                     "rec": round(recency_normalized.get(session_id, 0.0), 3),
                     "final": round(final_score, 3),
                 },
-            })
+            }
+            if include_message_ids:
+                result["fragment_message_ids"] = [item[2] for item in kept]
+            results.append(result)
 
     return results, len(results)
 

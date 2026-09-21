@@ -350,6 +350,7 @@ def _build_memory_extraction_messages(
     context_messages: list,
     assistant_msg: str,
     interval: int,
+    assistant_source_id: int = None,
 ) -> tuple[list, int]:
     """按逻辑轮截取近期上下文，并附上本轮最终 assistant 回复。"""
     non_system = [
@@ -357,13 +358,20 @@ def _build_memory_extraction_messages(
         if msg.get("role") != "system"
     ]
     recent_rounds = group_by_rounds(non_system)[-max(1, interval):]
-    messages = [
-        {"role": msg.get("role"), "content": msg.get("content", "")}
-        for round_messages in recent_rounds
-        for msg in round_messages
-        if msg.get("role") in {"user", "assistant"}
-    ]
-    messages.append({"role": "assistant", "content": assistant_msg})
+    messages = []
+    for round_messages in recent_rounds:
+        for msg in round_messages:
+            if msg.get("role") not in {"user", "assistant"}:
+                continue
+            item = {"role": msg.get("role"), "content": msg.get("content", "")}
+            source_id = msg.get("_source_message_id")
+            if isinstance(source_id, int) and not isinstance(source_id, bool):
+                item["_source_message_id"] = source_id
+            messages.append(item)
+    assistant = {"role": "assistant", "content": assistant_msg}
+    if isinstance(assistant_source_id, int) and not isinstance(assistant_source_id, bool):
+        assistant["_source_message_id"] = assistant_source_id
+    messages.append(assistant)
     return messages, len(recent_rounds)
 
 
