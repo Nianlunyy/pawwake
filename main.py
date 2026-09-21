@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 
 import auth
 import shared
@@ -122,6 +123,15 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Pawwake", version="4.1.4", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 app.middleware("http")(auth.gateway_auth_middleware)
+
+# CORS：为网页前端放行跨域请求
+# ⚠️ allow_origins 目前是占位符，Cloudflare Pages 部署拿到正式域名后需回来替换
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://placeholder.pages.dev"],
+    allow_headers=["*"],
+    allow_methods=["*"],
+)
 
 # Centralized router registration. Preserve this order in route snapshots.
 app.include_router(chat_router)
