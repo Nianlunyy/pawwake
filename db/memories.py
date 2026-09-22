@@ -484,6 +484,7 @@ async def search_memories_hybrid(
 
         # ---- 向量路 ----
         if query_embedding:
+            keyword_candidate_ids = list(candidates)
             if db_core.HAS_PGVECTOR:
                 vec_str = '[' + ','.join(str(f) for f in query_embedding) + ']'
                 sem_rows = await conn.fetch("""
@@ -495,6 +496,16 @@ async def search_memories_hybrid(
                     ORDER BY embedding <=> $1::vector
                     LIMIT $3
                 """, vec_str, excluded_ids, limit * 3)
+
+                if keyword_candidate_ids:
+                    keyword_sim_rows = await conn.fetch("""
+                        SELECT id, 1 - (embedding <=> $1::vector) as similarity
+                        FROM memories
+                        WHERE embedding IS NOT NULL AND is_active = TRUE
+                          AND id = ANY($2::int[])
+                    """, vec_str, keyword_candidate_ids)
+                    for r in keyword_sim_rows:
+                        candidates[r['id']]['similarity'] = float(r['similarity'])
             else:
                 # Python端计算cosine
                 all_mem = await conn.fetch("""
@@ -512,17 +523,18 @@ async def search_memories_hybrid(
                         scored.append({**dict(row), 'similarity': sim})
                     except Exception:
                         continue
+                for r in scored:
+                    if r['id'] in candidates:
+                        candidates[r['id']]['similarity'] = float(r['similarity'])
                 scored.sort(key=lambda x: -x['similarity'])
                 sem_rows = scored[:limit * 3]
 
             for r in sem_rows:
                 sim = float(r['similarity'])
-                if sim < shared.MEMORY_SEMANTIC_THRESHOLD:
-                    continue
                 mid = r['id']
                 if mid in candidates:
                     candidates[mid]['similarity'] = sim
-                else:
+                elif sim >= shared.MEMORY_SEMANTIC_THRESHOLD:
                     candidates[mid] = {
                         'content': r['content'],
                         'importance': r['importance'],
