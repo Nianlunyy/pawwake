@@ -154,6 +154,7 @@ async def build_memory_text(
     session_id: str = None,
     injected_ids: list = None,
     pending_reminder_claims: list = None,
+    recalled_message_ids: list = None,
 ) -> str:
     """搜索记忆并格式化为注入文本（分区缓存模式用）。"""
     if not shared.memory_injection_enabled():
@@ -172,6 +173,7 @@ async def build_memory_text(
             user_message,
             limit=shared.MAX_MEMORIES_INJECT,
             exclude_ids=excluded_ids,
+            recalled_message_ids=recalled_message_ids,
         ) or []
     except Exception as e:
         print(f"⚠️ 记忆检索失败: {e}")
@@ -254,7 +256,7 @@ async def build_conversation_recall_text(
         or shared.MAX_CONVERSATIONS_INJECT <= 0
         or not user_message.strip()
     ):
-        return "", []
+        return "", [], []
     try:
         state = await db_conversations.get_session_cache_state(
             session_id,
@@ -274,22 +276,28 @@ async def build_conversation_recall_text(
             exclude_fragment_ids=state.get("seen_fragment_ids", []),
             include_session_before=(session_id, *cutoff) if cutoff else None,
             disjoint_fragments=True,
+            include_message_ids=True,
         )
         if not results:
-            return "", []
+            return "", [], []
 
         blocks = []
         fragment_ids = []
+        recalled_message_ids = []
         role_labels = {"user": "用户", "assistant": "AI", "tool": "工具"}
         per_session = [
-            list(zip(result.get("fragments", []), result.get("fragment_ids", [])))
+            list(zip(
+                result.get("fragments", []),
+                result.get("fragment_ids", []),
+                result.get("fragment_message_ids", [[] for _ in result.get("fragments", [])]),
+            ))
             for result in results
         ]
         for match_index in range(max((len(items) for items in per_session), default=0)):
             for items in per_session:
                 if match_index >= len(items):
                     continue
-                fragment, fragment_id = items[match_index]
+                fragment, fragment_id, message_ids = items[match_index]
                 lines = []
                 for message in fragment:
                     date_prefix = ""
@@ -300,23 +308,29 @@ async def build_conversation_recall_text(
                 if lines and fragment_id:
                     blocks.append("\n".join(lines))
                     fragment_ids.append(fragment_id)
+                    recalled_message_ids.extend(
+                        message_id
+                        for message_id in message_ids
+                        if isinstance(message_id, int) and not isinstance(message_id, bool)
+                    )
                 if len(blocks) >= shared.MAX_CONVERSATIONS_INJECT:
                     break
             if len(blocks) >= shared.MAX_CONVERSATIONS_INJECT:
                 break
 
         if not blocks:
-            return "", []
+            return "", [], []
         return (
             "<retrieved_conversations>\n"
             "以下是网关检索的相关历史对话片段，供参考，非用户本次输入：\n"
             + "\n\n".join(blocks)
             + "\n</retrieved_conversations>",
             fragment_ids,
+            sorted(set(recalled_message_ids)),
         )
     except Exception as e:
         print(f"⚠️ 对话召回失败: {e}")
-        return "", []
+        return "", [], []
 
 
 # ============================================================
@@ -375,6 +389,17 @@ async def process_memories_background(
     """
 
     try:
+        user_source_id = None
+        assistant_source_id = None
+
+        def mark_latest_context_source(role, source_id):
+            if not isinstance(source_id, int) or isinstance(source_id, bool):
+                return
+            for message in reversed(context_messages or []):
+                if message.get("role") == role and "_source_message_id" not in message:
+                    message["_source_message_id"] = source_id
+                    return
+
         # Debug: 打印存储分支判断依据
         print(f"💾 process_memories_background: user_msg={bool(user_msg)}, tool_messages={len(tool_messages) if tool_messages else 0}, "
               f"assistant_tool_calls={len(assistant_tool_calls) if assistant_tool_calls else 0}, skip={skip_conversation_log}")
@@ -405,28 +430,54 @@ async def process_memories_background(
                 await db_conversations.save_message(session_id, "tool", tm.get("content", ""), model, metadata=meta)
 
             if assistant_msg or assistant_tool_calls:
-                await db_conversations.save_message(session_id, "assistant", assistant_msg or "", model, metadata=assistant_meta)
+                assistant_source_id = await db_conversations.save_message(
+                    session_id, "assistant", assistant_msg or "", model, metadata=assistant_meta
+                )
                 print(f"🔧 存储: {len(tool_messages)}条tool + 1条assistant" + (" (含tool_calls)" if assistant_tool_calls else "") + (" (含reasoning)" if assistant_reasoning else ""))
         else:
             # 普通对话或首次工具调用
             if assistant_tool_calls:
                 # 首次工具调用：assistant回复包含tool_calls，存user + assistant(tool_calls)
-                await db_conversations.save_message(session_id, "user", user_msg, model)
-                await db_conversations.save_message(session_id, "assistant", assistant_msg or "", model, metadata=assistant_meta)
+                user_source_id = await db_conversations.save_message(session_id, "user", user_msg, model)
+                assistant_source_id = await db_conversations.save_message(
+                    session_id, "assistant", assistant_msg or "", model, metadata=assistant_meta
+                )
                 print(f"🔧 存储: user + assistant (含{len(assistant_tool_calls)}个tool_calls)" + (" (含reasoning)" if assistant_reasoning else ""))
             else:
                 # 纯文字对话：re-roll检测 + 存user + assistant
                 last_user = await db_conversations.get_last_user_content(session_id)
                 if last_user and last_user.strip() == user_msg.strip():
-                    updated = await db_conversations.update_last_assistant_message(session_id, assistant_msg, model)
-                    if updated:
+                    user_source_id = next(
+                        (
+                            message.get("_source_message_id")
+                            for message in reversed(context_messages or [])
+                            if message.get("role") == "user"
+                            and message.get("content") == user_msg
+                            and isinstance(message.get("_source_message_id"), int)
+                        ),
+                        None,
+                    )
+                    assistant_source_id = await db_conversations.update_last_assistant_message(
+                        session_id, assistant_msg, model
+                    )
+                    if assistant_source_id:
                         print(f"🔄 检测到re-roll，已覆盖最后一条assistant回复")
                     else:
-                        await db_conversations.save_message(session_id, "user", user_msg, model)
-                        await db_conversations.save_message(session_id, "assistant", assistant_msg, model, metadata=assistant_meta)
+                        user_source_id = await db_conversations.save_message(
+                            session_id, "user", user_msg, model
+                        )
+                        assistant_source_id = await db_conversations.save_message(
+                            session_id, "assistant", assistant_msg, model, metadata=assistant_meta
+                        )
                 else:
-                    await db_conversations.save_message(session_id, "user", user_msg, model)
-                    await db_conversations.save_message(session_id, "assistant", assistant_msg, model, metadata=assistant_meta)
+                    user_source_id = await db_conversations.save_message(
+                        session_id, "user", user_msg, model
+                    )
+                    assistant_source_id = await db_conversations.save_message(
+                        session_id, "assistant", assistant_msg, model, metadata=assistant_meta
+                    )
+
+        mark_latest_context_source("user", user_source_id)
 
         # 2. 检查是否需要提取记忆
         if not shared.MEMORY_ENABLED:
@@ -474,6 +525,7 @@ async def process_memories_background(
                     context_messages,
                     assistant_msg,
                     shared.MEMORY_EXTRACT_INTERVAL,
+                    assistant_source_id=assistant_source_id,
                 )
             )
             print(
@@ -482,8 +534,16 @@ async def process_memories_background(
             )
         else:
             messages_for_extraction = [
-                {"role": "user", "content": user_msg},
-                {"role": "assistant", "content": assistant_msg},
+                {
+                    "role": "user",
+                    "content": user_msg,
+                    "_source_message_id": user_source_id,
+                },
+                {
+                    "role": "assistant",
+                    "content": assistant_msg,
+                    "_source_message_id": assistant_source_id,
+                },
             ]
 
         # 4. 用同一提取窗口只读检索相关候选与最新活跃记忆。
@@ -536,6 +596,7 @@ async def process_memories_background(
                 content=mem["content"],
                 importance=mem["importance"],
                 source_session=session_id,
+                source_message_ids=mem.get("source_message_ids"),
                 supersede_id=(
                     mem.get("candidate_id")
                     if mem.get("action") == "supersede"

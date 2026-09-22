@@ -55,6 +55,11 @@ MEMORY_SEEN_TTL_HOURS = max(
     float(os.getenv("MEMORY_SEEN_TTL_HOURS", "6")),
 )
 
+# 原文召回完整覆盖提取证据时，是否跳过对应的一层碎片记忆。
+MEMORY_SOURCE_DEDUPE_ENABLED = os.getenv(
+    "MEMORY_SOURCE_DEDUPE_ENABLED", "false"
+).lower() == "true"
+
 # 分区模式自动注入的最大历史对话片段数。raw API 可逐请求覆盖。
 MAX_CONVERSATIONS_INJECT = int(os.getenv("MAX_CONVERSATIONS_INJECT", "3"))
 
@@ -155,6 +160,7 @@ SETTINGS_TYPES = {
     "MEMORY_ENABLED": lambda value: _parse_bool(value),
     "MAX_MEMORIES_INJECT": int,
     "MEMORY_SEEN_TTL_HOURS": lambda value: max(0.0, float(value)),
+    "MEMORY_SOURCE_DEDUPE_ENABLED": lambda value: _parse_bool(value),
     "MAX_CONVERSATIONS_INJECT": int,
     "CONVERSATION_SEEN_TTL_HOURS": lambda value: max(0.0, float(value)),
     "MEMORY_EXTRACT_INTERVAL": int,

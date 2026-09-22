@@ -517,6 +517,13 @@
                         <small class="form-hint">同一条记忆在同一分区 session 内不重复注入；默认 6，0 关闭 seen 去重</small>
                     </div>
                     <div class="settings-field">
+                        <div class="settings-toggle-row">
+                            <label>原文优先去重 (MEMORY_SOURCE_DEDUPE_ENABLED)</label>
+                            <label class="toggle"><input type="checkbox" id="set-MEMORY_SOURCE_DEDUPE_ENABLED"><span class="toggle-slider"></span></label>
+                        </div>
+                        <small class="form-hint">需同时开启分区缓存、记忆注入与原始对话召回；原文完整覆盖的新碎片不再重复注入，默认关闭</small>
+                    </div>
+                    <div class="settings-field">
                         <label>最低分数阈值 (MIN_SCORE_THRESHOLD)</label>
                         <input type="number" id="set-MIN_SCORE_THRESHOLD" class="input" min="0" max="1" step="0.01">
                     </div>
@@ -697,6 +704,6 @@
         </main>
     </div>
 
-    <script src="/static/js/dashboard.js?v=4.1.4"></script>
+    <script src="/static/js/dashboard.js?v=4.1.5"></script>
 </body>
 </html>

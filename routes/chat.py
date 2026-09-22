@@ -174,12 +174,13 @@ async def health_check():
 
     return {
         "status": "running",
-        "gateway": "Pawwake v4.1.4",
+        "gateway": "Pawwake v4.1.5",
         "system_prompt_loaded": len(resolved_system_prompt) > 0,
         "system_prompt_length": len(resolved_system_prompt),
         "database_enabled": shared.DATABASE_ENABLED,
         "conversation_persistence_enabled": shared.conversation_persistence_enabled(),
         "memory_enabled": shared.MEMORY_ENABLED,
+        "memory_source_dedupe_enabled": shared.MEMORY_SOURCE_DEDUPE_ENABLED,
         "cache_partition_enabled": shared.CACHE_PARTITION_ENABLED,
         "conversation_recall_enabled": shared.CONVERSATION_RECALL_ENABLED,
         "memory_count": memory_count,
@@ -261,7 +262,7 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
 
     # ---------- 构建 system prompt ----------
     # 先保存原始对话消息（不含 system prompt），用于记忆提取
-    original_messages = [msg for msg in messages if msg.get("role") != "system"]
+    original_messages = [dict(msg) for msg in messages if msg.get("role") != "system"]
     extraction_context_messages = original_messages
     extraction_round_count = None
     resolved_system_prompt = "" if skip_conversation_log else await shared.get_system_prompt()
@@ -285,11 +286,13 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
             db_history = await db_conversations.get_conversation_messages(session_id, limit=10000)
             db_msgs = []
             recall_history = []
+            db_extraction_msgs = []
             for m in (db_history or []):
                 msg = db_conversations.db_row_to_message(m)
                 msg['created_at'] = m.get('created_at')  # 保留时间戳供分区时间窗口判断
                 db_msgs.append(msg)
                 recall_history.append({**msg, "id": m.get("id")})
+                db_extraction_msgs.append({**msg, "_source_message_id": m.get("id")})
         except Exception as e:
             print(f"❌ 分区缓存不可用：读取对话历史失败: {e}")
             return JSONResponse(
@@ -370,7 +373,7 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
                                     print(f"⚠️ Race防护: 从客户端补充assistant(tool_calls)")
                                     break
         all_msgs = db_msgs + client_new_msgs
-        extraction_context_messages = all_msgs
+        extraction_context_messages = db_extraction_msgs + [dict(m) for m in client_new_msgs]
         extraction_round_count = len(partition_engine.group_by_rounds(all_msgs))
 
         # 同步更新tool_messages，避免process_memories_background存重复的旧tool
@@ -387,13 +390,13 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
         if client_system_text:
             partition_prompt = ((partition_prompt or "") + "\n\n" + client_system_text).strip()
         try:
-            conversation_recall_text, pending_fragment_ids = (
-                await memory_pipeline.build_conversation_recall_text(
-                    user_message,
-                    session_id,
-                    recall_history,
-                )
+            recall_result = await memory_pipeline.build_conversation_recall_text(
+                user_message,
+                session_id,
+                recall_history,
             )
+            conversation_recall_text, pending_fragment_ids = recall_result[:2]
+            recalled_message_ids = recall_result[2] if len(recall_result) > 2 else []
 
             async def build_session_memory_text(message: str):
                 return await memory_pipeline.build_memory_text(
@@ -401,6 +404,7 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
                     session_id,
                     pending_memory_ids,
                     pending_reminder_claims,
+                    recalled_message_ids,
                 )
 
             messages = await partition_engine.build_partitioned_messages(

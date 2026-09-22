@@ -11,6 +11,7 @@ import os
 import re
 import json
 import logging
+import uuid
 from typing import Optional, List
 from datetime import datetime, date, timedelta, timezone as dt_timezone
 
@@ -157,6 +158,12 @@ async def init_tables():
                 value   TEXT DEFAULT ''
             );
         """)
+        await conn.execute(
+            """INSERT INTO gateway_config (key, value)
+               VALUES ('database_instance_id', $1)
+               ON CONFLICT (key) DO NOTHING""",
+            str(uuid.uuid4()),
+        )
 
         # 分区缓存状态表（存储每个session的轮转状态）
         await conn.execute("""
@@ -235,6 +242,14 @@ async def init_tables():
         # event_date: 事件日期（用于按天整理）
         await conn.execute("""
             ALTER TABLE memories ADD COLUMN IF NOT EXISTS event_date DATE DEFAULT NULL;
+        """)
+
+        # 自动提取碎片的逐条对话来源；老记忆与非提取写入保持来源未知。
+        await conn.execute("""
+            ALTER TABLE memories ADD COLUMN IF NOT EXISTS source_message_ids INTEGER[] DEFAULT NULL;
+        """)
+        await conn.execute("""
+            ALTER TABLE memories ADD COLUMN IF NOT EXISTS source_content_intact BOOLEAN DEFAULT FALSE;
         """)
 
         # remind_at: 对话里明确的未来约定，到期后强制注入一次；claimed/delivered 记录处理时间与送达时间
