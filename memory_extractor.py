@@ -172,12 +172,14 @@ EXTRACTION_PROMPT = """你是信息提取专家，负责从对话中识别并提
 # 输出格式
 请用以下 JSON 格式返回（不要包含其他内容）：
 [
-  {{"content": "记忆内容", "importance": 分数, "action": "new", "candidate_id": null, "remind_at": null}},
-  {{"content": "记忆内容", "importance": 分数, "action": "duplicate", "candidate_id": 旧记忆ID, "remind_at": null}},
-  {{"content": "记忆内容", "importance": 分数, "action": "supersede", "candidate_id": 被取代的旧记忆ID, "remind_at": null}},
-  {{"content": "阿狸明天下午三点要交报告，让我到时候提醒", "importance": 分数, "action": "new", "candidate_id": null, "remind_at": "{remind_example}"}}
+  {{"content": "记忆内容", "importance": 分数, "action": "new", "candidate_id": null, "remind_at": null, "source_refs": [1]}},
+  {{"content": "记忆内容", "importance": 分数, "action": "duplicate", "candidate_id": 旧记忆ID, "remind_at": null, "source_refs": [2]}},
+  {{"content": "记忆内容", "importance": 分数, "action": "supersede", "candidate_id": 被取代的旧记忆ID, "remind_at": null, "source_refs": [3]}},
+  {{"content": "阿狸明天下午三点要交报告，让我到时候提醒", "importance": 分数, "action": "new", "candidate_id": null, "remind_at": "{remind_example}", "source_refs": [4]}}
 ]
 
+source_refs 只填写每条记忆直接依据的对话证据编号，必须是对话里出现的 [证据#N]；不要把同一窗口里无关消息的编号带上。
+如果任一必要证据标为 [证据不可用]，或没有可靠证据编号，source_refs 填 null。禁止猜测或编造编号。
 importance 分数 1-10，10 最重要。
 如果没有值得记住的新信息，返回空数组：[]
 """
@@ -203,13 +205,22 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
 
     # 把对话格式化成文本
     conversation_text = ""
+    source_ref_map = {}
+    source_ref_by_id = {}
     for msg in messages:
         role = msg.get("role", "unknown")
         content = msg.get("content", "")
+        source_id = msg.get("_source_message_id")
+        if isinstance(source_id, int) and not isinstance(source_id, bool):
+            source_ref = source_ref_by_id.setdefault(source_id, len(source_ref_by_id) + 1)
+            source_ref_map[source_ref] = source_id
+            source_prefix = f"[证据#{source_ref}] "
+        else:
+            source_prefix = "[证据不可用] "
         if role == "user":
-            conversation_text += f"阿狸: {content}\n"
+            conversation_text += f"{source_prefix}阿狸: {content}\n"
         elif role == "assistant":
-            conversation_text += f"阿澈: {content}\n"
+            conversation_text += f"{source_prefix}阿澈: {content}\n"
 
     if not conversation_text.strip():
         return []
@@ -336,12 +347,26 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
                     candidate_id = mem.get("candidate_id")
                     if isinstance(candidate_id, bool) or not isinstance(candidate_id, int):
                         candidate_id = None
+                    source_refs = mem.get("source_refs")
+                    source_message_ids = None
+                    if (
+                        isinstance(source_refs, list)
+                        and source_refs
+                        and all(
+                            isinstance(ref, int)
+                            and not isinstance(ref, bool)
+                            and ref in source_ref_map
+                            for ref in source_refs
+                        )
+                    ):
+                        source_message_ids = sorted({source_ref_map[ref] for ref in source_refs})
                     valid_memories.append({
                         "content": str(mem["content"]),
                         "importance": int(mem.get("importance", 5)),
                         "action": action,
                         "candidate_id": candidate_id,
                         "remind_at": parse_remind_at(mem.get("remind_at")),
+                        "source_message_ids": source_message_ids,
                     })
 
             print(f"📝 从对话中提取了 {len(valid_memories)} 条新记忆（已对比 {len(existing_memories or [])} 条已有记忆）")

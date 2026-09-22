@@ -50,6 +50,7 @@ async def save_extracted_memory(
     content: str,
     importance: int,
     source_session: str,
+    source_message_ids=None,
     supersede_id=None,
     candidate_ids=None,
     remind_at=None,
@@ -71,14 +72,16 @@ async def save_extracted_memory(
             row = await conn.fetchrow(
                 """
                 INSERT INTO memories
-                    (content, importance, source_session, layer, is_active, remind_at)
-                VALUES ($1, $2, $3, 1, TRUE, $4)
+                    (content, importance, source_session, layer, is_active, remind_at,
+                     source_message_ids, source_content_intact)
+                VALUES ($1, $2, $3, 1, TRUE, $4, $5, $5::integer[] IS NOT NULL)
                 RETURNING id
                 """,
                 content,
                 importance,
                 source_session,
                 remind_at,
+                source_message_ids,
             )
             new_id = int(row["id"])
             retired_id = None
@@ -284,14 +287,44 @@ def _normalize_excluded_ids(exclude_ids) -> list:
     })
 
 
-async def search_memories(query: str, limit: int = 10, exclude_ids=None):
+async def _source_covered_memory_ids(source_message_ids) -> list[int]:
+    message_ids = _normalize_excluded_ids(source_message_ids)
+    if not message_ids:
+        return []
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id FROM memories
+               WHERE is_active = TRUE
+                 AND layer = 1
+                 AND source_content_intact = TRUE
+                 AND cardinality(source_message_ids) > 0
+                 AND source_message_ids <@ $1::integer[]""",
+            message_ids,
+        )
+    return [int(row["id"]) for row in rows]
+
+
+async def search_memories(
+    query: str,
+    limit: int = 10,
+    exclude_ids=None,
+    recalled_message_ids=None,
+):
     """
     搜索相关记忆
 
     MEMORY_VECTOR_ENABLED=true 时走混合搜索（关键词 + 向量）
     否则走纯关键词搜索
     """
-    excluded_ids = _normalize_excluded_ids(exclude_ids)
+    covered_ids = (
+        await _source_covered_memory_ids(recalled_message_ids)
+        if shared.MEMORY_SOURCE_DEDUPE_ENABLED
+        else []
+    )
+    excluded_ids = sorted(set(_normalize_excluded_ids(exclude_ids)) | set(covered_ids))
+    if covered_ids:
+        print(f"🧹 原文已完整覆盖，跳过 {len(covered_ids)} 条碎片记忆")
     if shared.MEMORY_VECTOR_ENABLED:
         return await search_memories_hybrid(query, limit, exclude_ids=excluded_ids)
 
@@ -808,7 +841,8 @@ async def get_all_memories():
         rows = await conn.fetch("""
             SELECT id, content, importance, source_session, created_at,
                    layer, title, is_active, merged_from, event_date, superseded_by,
-                   remind_at, reminder_delivered_at
+                   remind_at, reminder_delivered_at,
+                   source_message_ids, source_content_intact
             FROM memories ORDER BY id
         """)
         memories = [dict(r) for r in rows]
@@ -901,7 +935,11 @@ def _parse_backup_date(value):
         return None
 
 
-async def import_memories_v2(memories: list, schema_version: int = 2):
+async def import_memories_v2(
+    memories: list,
+    schema_version: int = 2,
+    preserve_source_message_ids: bool = False,
+):
     """恢复版本化备份：单事务建映射，再回填合并与版本关系。
 
     - 同内容且库中唯一 → 跳过并映射到已有行（同一份备份重复导入幂等）
@@ -969,11 +1007,33 @@ async def import_memories_v2(memories: list, schema_version: int = 2):
                     })
                     skipped += 1
                     continue
+                source_message_ids = None
+                if schema_version >= 5 and preserve_source_message_ids:
+                    raw_source_ids = mem.get("source_message_ids")
+                    if (
+                        isinstance(raw_source_ids, list)
+                        and raw_source_ids
+                        and all(
+                            isinstance(value, int) and not isinstance(value, bool) and value > 0
+                            for value in raw_source_ids
+                        )
+                    ):
+                        source_message_ids = sorted(set(raw_source_ids))
+                        source_count = await conn.fetchval(
+                            """SELECT COUNT(*) FROM conversations
+                               WHERE id = ANY($1::integer[]) AND session_id = $2""",
+                            source_message_ids,
+                            mem.get("source_session") or "json-import",
+                        )
+                        if source_count != len(source_message_ids):
+                            source_message_ids = None
                 row = await conn.fetchrow("""
                     INSERT INTO memories (content, importance, source_session, created_at,
                                           layer, title, is_active, event_date,
-                                          remind_at, reminder_delivered_at)
-                    VALUES ($1, $2, $3, COALESCE($4, NOW()), $5, $6, $7, $8, $9, $10)
+                                          remind_at, reminder_delivered_at,
+                                          source_message_ids, source_content_intact)
+                    VALUES ($1, $2, $3, COALESCE($4, NOW()), $5, $6, $7, $8,
+                            $9, $10, $11, $12)
                     RETURNING id
                 """,
                     content,
@@ -987,6 +1047,8 @@ async def import_memories_v2(memories: list, schema_version: int = 2):
                     # schema 4 起备份提醒与送达时间；临时处理时间不进备份
                     _parse_backup_datetime(mem.get("remind_at")),
                     _parse_backup_datetime(mem.get("reminder_delivered_at")),
+                    source_message_ids,
+                    bool(source_message_ids and mem.get("source_content_intact") is True),
                 )
                 id_map[bid] = int(row["id"])
                 imported += 1
@@ -1054,6 +1116,7 @@ async def import_memories_v2(memories: list, schema_version: int = 2):
         "skipped": skipped,
         "conflicts": conflicts,
         "degraded": degraded,
+        "source_lineage_preserved": bool(schema_version >= 5 and preserve_source_message_ids),
         "total": total,
     }
     if shared.MEMORY_VECTOR_ENABLED:
@@ -1324,7 +1387,9 @@ async def merge_memories(memory_ids: list, new_title: str, new_content: str,
             # 锁住全部来源行，在同一事务、同一连接里复验、插入、归档：
             # 后台此刻给某条来源写提醒会等在锁上，提交后它看到的是已归档行，set_memory_reminder 落空、按 new 保住提醒
             rows = await conn.fetch("""
-                SELECT id, layer, is_active, remind_at, reminder_delivered_at FROM memories
+                SELECT id, layer, is_active, remind_at, reminder_delivered_at,
+                       source_message_ids
+                FROM memories
                 WHERE id = ANY($1::int[])
                 ORDER BY id
                 FOR UPDATE
@@ -1354,12 +1419,24 @@ async def merge_memories(memory_ids: list, new_title: str, new_content: str,
             """, memory_ids, shared.TIMEZONE_HOURS)
             event_date = date_rows[0]['event_date'] if date_rows else None
 
+            source_message_ids = None
+            if all(row["source_message_ids"] for row in rows):
+                source_message_ids = sorted({
+                    message_id
+                    for row in rows
+                    for message_id in row["source_message_ids"]
+                })
+
             # 创建新记忆
             row = await conn.fetchrow("""
-                INSERT INTO memories (content, importance, layer, title, is_active, merged_from, event_date)
-                VALUES ($1, $2, $3, $4, TRUE, $5, $6)
+                INSERT INTO memories (
+                    content, importance, layer, title, is_active, merged_from, event_date,
+                    source_message_ids, source_content_intact
+                )
+                VALUES ($1, $2, $3, $4, TRUE, $5, $6, $7, FALSE)
                 RETURNING id
-            """, new_content, importance, layer, new_title, memory_ids, event_date)
+            """, new_content, importance, layer, new_title, memory_ids, event_date,
+                source_message_ids)
             new_id = row['id'] if row else None
 
             # 将来源记忆标记为不活跃，与新记忆一起提交
@@ -1469,6 +1546,11 @@ async def update_memory_with_layer(memory_id: int, content: str = None,
     param_idx = 2  # $1 给 memory_id
 
     if content is not None:
+        updates.append(
+            f"source_content_intact = CASE "
+            f"WHEN content IS DISTINCT FROM ${param_idx} THEN FALSE "
+            f"ELSE source_content_intact END"
+        )
         updates.append(f"content = ${param_idx}")
         params.append(content)
         param_idx += 1

@@ -1295,7 +1295,9 @@ async function previewJson() {
         }
         
         pendingJsonData = parsed;
-        const verTag = parsed.schema_version === 3
+        const verTag = parsed.schema_version === 5
+            ? '（v5 完整备份，含来源记录）'
+            : parsed.schema_version === 3
             ? '（v3 完整备份，含层级/日期/合并与版本关系）'
             : parsed.schema_version === 2
             ? '（v2 完整备份，含层级/日期/合并关系）'
@@ -2555,7 +2557,7 @@ const _SETTINGS_FIELDS = {
     int: ['MAX_MEMORIES_INJECT', 'MAX_CONVERSATIONS_INJECT', 'MEMORY_EXTRACT_INTERVAL', 'CACHE_PARTITION_X', 'CACHE_PARTITION_WINDOW', 'CACHE_SUMMARY_BUDGET_CHARS', 'EMBEDDING_DIM'],
     float: ['MIN_SCORE_THRESHOLD', 'CONVERSATION_MIN_SCORE_THRESHOLD',
             'MEMORY_SEEN_TTL_HOURS', 'CONVERSATION_SEEN_TTL_HOURS'],
-    bool: ['MEMORY_ENABLED', 'CONVERSATION_RECALL_ENABLED', 'CACHE_PARTITION_ENABLED', 'MEMORY_VECTOR_ENABLED', 'FORCE_STREAM'],
+    bool: ['MEMORY_ENABLED', 'MEMORY_SOURCE_DEDUPE_ENABLED', 'CONVERSATION_RECALL_ENABLED', 'CACHE_PARTITION_ENABLED', 'MEMORY_VECTOR_ENABLED', 'FORCE_STREAM'],
     range: ['MEMORY_HW_KEYWORD', 'MEMORY_HW_SEMANTIC', 'MEMORY_HW_IMPORTANCE',
             'MEMORY_HW_RECENCY', 'MEMORY_SEMANTIC_THRESHOLD',
             'CONVERSATION_HW_KEYWORD', 'CONVERSATION_HW_SEMANTIC',
