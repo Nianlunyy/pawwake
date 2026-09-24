@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import random
 import re
 import uuid
 
@@ -599,6 +600,43 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
             await _settle_reminder_claims(lease_keeper, pending_reminder_claims, delivered_ok)
 
 
+# =========================================================================
+# [Gemini/Vertex AI 专用] 上游 429 服务端退避重试 START
+# =========================================================================
+def _parse_retry_after(v):
+    if not v:
+        return None
+    try:
+        s = float(v.strip())
+        return s if s >= 0 else None
+    except ValueError:
+        return None  # 日期串等格式：回退默认退避
+
+
+async def _send_stream_with_429_retry(client, url, headers, body, max_retries=2):
+    """仅上游 429 时，在向客户端输出任何字节之前退避重试。
+    返回 (最后一次 response, 已重试次数)，调用方负责 aclose。"""
+    delays = (2.0, 4.0)
+    attempt = 0
+    while True:
+        req = client.build_request("POST", url, headers=headers, json=body)
+        response = await client.send(req, stream=True)
+        if response.status_code != 429 or attempt >= max_retries:
+            return response, attempt
+        try:
+            ra = _parse_retry_after(response.headers.get("retry-after"))
+            await response.aread()
+        finally:
+            await response.aclose()
+        wait = min(ra if ra is not None else delays[attempt] + random.uniform(0, 1), 8.0)
+        attempt += 1
+        print(f"⏳ 上游 429，{wait:.1f}s 后第 {attempt} 次重试")
+        await asyncio.sleep(wait)
+# =========================================================================
+# [Gemini/Vertex AI 专用] 上游 429 服务端退避重试 END
+# =========================================================================
+
+
 async def stream_and_capture(
     headers: dict,
     body: dict,
@@ -680,7 +718,19 @@ async def _stream_and_capture_inner(
             raise HTTPException(status_code=502, detail=f"Vertex AI 认证令牌获取失败: {str(e)}")
 
     async with httpx.AsyncClient(timeout=300) as client:
-        async with client.stream("POST", shared.API_BASE_URL, headers=headers, json=body) as response:
+        # =========================================================================
+        # [Gemini/Vertex AI 专用] 上游 429 重试调用 START
+        # =========================================================================
+        response, retried = await _send_stream_with_429_retry(
+            client, shared.API_BASE_URL, headers, body,
+            max_retries=2 if shared.is_vertex_endpoint() else 0,
+        )
+        try:
+            if retried and response.status_code == 200:
+                print(f"✅ 429 重试成功（第 {retried} 次）")
+        # =========================================================================
+        # [Gemini/Vertex AI 专用] 上游 429 重试调用 END
+        # =========================================================================
             # 打印上游响应头（排查thinking问题用）
             upstream_ct = response.headers.get("content-type", "")
             print(f"📨 上游响应: status={response.status_code}, content-type={upstream_ct}", flush=True)
@@ -791,6 +841,8 @@ async def _stream_and_capture_inner(
             if line_buffer:
                 yield line_buffer.encode("utf-8")
             stream_succeeded = response.status_code == 200
+        finally:
+            await response.aclose()
 
     assistant_msg = "".join(full_response)
     assistant_reasoning = "".join(full_reasoning) if full_reasoning else None
