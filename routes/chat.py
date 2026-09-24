@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 import uuid
 
 import httpx
@@ -708,9 +709,9 @@ async def _stream_and_capture_inner(
                     stripped_line = line.strip()
                     if stripped_line == "data: [DONE]":
                         _mark_terminal()
-                        if captured_finish_reason == "malformed_function_call":
+                        if captured_finish_reason == "malformed_function_call" or (not full_response and not accumulated_tool_calls):
                             held_done_bytes = (line + "\n").encode("utf-8")
-                            print("🛡️ malformed_function_call 已拦截 [DONE]，等兜底完成后放行")
+                            print("🛡️ malformed/空正文已拦截 [DONE]，等兜底完成后放行")
                         else:
                             yield (line + "\n").encode("utf-8")
                         continue
@@ -795,17 +796,24 @@ async def _stream_and_capture_inner(
     assistant_reasoning = "".join(full_reasoning) if full_reasoning else None
     assistant_tool_calls = list(accumulated_tool_calls.values()) if accumulated_tool_calls else None
 
+    # 状态码门禁：若上游本身返回非 200（如 429、500 等），错误已在流中原样透传，严格禁止触发补刀，
+    # 立即打印错误日志并结束生成器，防止 429 连环加剧造成死循环
+    if not stream_succeeded:
+        if error_body_parts:
+            error_text = b"".join(error_body_parts).decode("utf-8", errors="ignore")[:500]
+            print(f"❌ 上游错误内容: {error_text}", flush=True)
+        return
+
     # =========================================================================
     # [Gemini/Vertex AI 专用] 工具调用异常挽救与空回复无感兜底 START
     # -------------------------------------------------------------------------
     # 【设计背景与原理】
-    # 1. 在 Vertex AI 上使用 Gemini 3.1 Pro / Gemini 2.5 开启 high 深度思考时，
-    #    模型在调用工具前由于思考链过长或边界转场偶发语法微瑕，极易触发
-    #    finish_reason: "malformed_function_call" 导致正文与工具双空回。
+    # 1. 状态码门禁：仅在上游 HTTP 200 OK 且正文/工具空回时才允许补刀；非 200 上游错误严禁介入。
     # 2. 挽救逻辑（阶段一）：优先保留原请求中的 tools，将思考等级降为 low 进行
     #    轻量级非流式重试。此时模型不会发生思维溢出，能高概率成功产出合法的 tool_calls
     #    并以标准 OpenAI SSE 格式推送给客户端执行，彻底保住工具调用能力。
     # 3. 自然降级（阶段二）：若二次重试依然无工具，静默剥离 tools 重新生成自然回复。
+    #    【思考链切除】：非流式补发拿到 content 后，自动剔除 <thought>/<think> 标签，防思考流出。
     #    【关键规范】：绝对不向 messages 插入任何系统或用户伪指令（避免破坏角色扮演人设）。
     #
     # 【未来剥离指引】
@@ -846,6 +854,8 @@ async def _stream_and_capture_inner(
                         r_msg = first_c.get("message", {})
                         r_tool_calls = r_msg.get("tool_calls")
                         r_content = r_msg.get("content") or ""
+                        # 切除非流式思考链小作文标签（<thought>.*?</thought> 或 <think>.*?</think>）
+                        r_content = re.sub(r'<(thought|think)>.*?</\1>', '', r_content, flags=re.DOTALL).strip()
                         r_finish = first_c.get("finish_reason")
 
                         # 成功挽救真实的工具调用！推送给客户端执行工具
@@ -901,6 +911,8 @@ async def _stream_and_capture_inner(
                         text_data = text_resp.json()
                         text_c = text_data.get("choices", [{}])[0]
                         text_content = text_c.get("message", {}).get("content") or ""
+                        # 切除非流式思考链小作文标签
+                        text_content = re.sub(r'<(thought|think)>.*?</\1>', '', text_content, flags=re.DOTALL).strip()
                         if text_content:
                             print(f"🩹 降级纯文本成功: 补发 {len(text_content)} 字符")
                             c_payload = json.dumps(
