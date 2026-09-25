@@ -416,6 +416,20 @@ def _effective_days_ago(event_date, created_at, now_utc):
     return max(0.0, (now_utc - created_at).total_seconds() / 86400.0)
 
 
+def _anchored_semantic_normalize(scores: dict, threshold: float) -> dict:
+    """语义轴归一化：下界取批内最低，上界不低于语义阈值。
+    池里有候选过阈值时与 min-max 一致；全弱池不再把最高项拉满"""
+    if not scores:
+        return {}
+    vals = list(scores.values())
+    min_v = min(vals)
+    max_v = max(max(vals), threshold)
+    spread = max_v - min_v
+    if spread == 0:
+        return {k: 0.0 if max_v == 0 else 1.0 for k in scores}
+    return {k: (v - min_v) / spread for k, v in scores.items()}
+
+
 async def search_memories_hybrid(
     query: str,
     limit: int = 10,
@@ -448,9 +462,24 @@ async def search_memories_hybrid(
                 params.append(kw)
 
             hit_count_expr = " + ".join(case_parts)
-            max_hits = len(keywords)
             where_parts = [f"content ILIKE '%' || ${i+1} || '%'" for i in range(len(keywords))]
             where_clause = f"is_active = TRUE AND ({' OR '.join(where_parts)})"
+
+            # IDF：ln((活跃总数+1)/(df+1))+1，df 与命中同一 ILIKE 口径；
+            # df=0 的词谁都命中不了，权重记 0、不进分母，全为 0 时无候选
+            df_cols = ", ".join(
+                f"COUNT(*) FILTER (WHERE content ILIKE '%' || ${i+1} || '%') AS df_{i}"
+                for i in range(len(keywords))
+            )
+            idf_cols = ", ".join(
+                f"CASE WHEN df_{i} > 0 THEN LN((total + 1)::float8 / (df_{i} + 1)) + 1 ELSE 0 END AS w_{i}"
+                for i in range(len(keywords))
+            )
+            weighted_expr = " + ".join(
+                f"CASE WHEN content ILIKE '%' || ${i+1} || '%' THEN w_{i} ELSE 0 END"
+                for i in range(len(keywords))
+            )
+            weight_total_expr = " + ".join(f"w_{i}" for i in range(len(keywords)))
 
             if excluded_ids:
                 exclude_idx = len(params) + 1
@@ -461,10 +490,17 @@ async def search_memories_hybrid(
             params.append(limit * 3)
 
             kw_sql = f"""
+                WITH kw_df AS (
+                    SELECT COUNT(*) AS total, {df_cols}
+                    FROM memories
+                    WHERE is_active = TRUE
+                ), kw_idf AS (
+                    SELECT {idf_cols} FROM kw_df
+                )
                 SELECT id, content, importance, created_at, event_date,
                        ({hit_count_expr}) AS hit_count,
-                       ({hit_count_expr})::float / {max_hits}.0 AS kw_score
-                FROM memories
+                       ({weighted_expr}) / NULLIF({weight_total_expr}, 0) AS kw_score
+                FROM memories CROSS JOIN kw_idf
                 WHERE {where_clause}
                 ORDER BY kw_score DESC
                 LIMIT ${limit_idx}
@@ -559,8 +595,12 @@ async def search_memories_hybrid(
             return ([], search_mode) if return_mode else []
 
         # ---- 归一化 + 加权 ----
-        kw_norm = db_search._min_max_normalize({mid: v['kw_score'] for mid, v in candidates.items()})
-        sem_norm = db_search._min_max_normalize({mid: v['similarity'] for mid, v in candidates.items()})
+        # 关键词轴直接用 IDF 覆盖率（0~1），不做批内拉伸，泛词池不会被顶满
+        kw_norm = {mid: v['kw_score'] for mid, v in candidates.items()}
+        sem_norm = _anchored_semantic_normalize(
+            {mid: v['similarity'] for mid, v in candidates.items()},
+            shared.MEMORY_SEMANTIC_THRESHOLD,
+        )
 
         now = datetime.now(dt_timezone.utc)
         final = []
