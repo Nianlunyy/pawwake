@@ -632,6 +632,24 @@ async def _send_stream_with_429_retry(client, url, headers, body, max_retries=2)
         attempt += 1
         print(f"⏳ 上游 429，{wait:.1f}s 后第 {attempt} 次重试")
         await asyncio.sleep(wait)
+
+
+async def _post_chat_completion_with_429_retry(client, url, api_key, body, tag="兜底", max_retries=2):
+    """针对兜底阶段非流式请求的 429 退避重试（仅上游 429 时触发）。
+    返回最后一次 response。"""
+    delays = (2.0, 4.0)
+    attempt = 0
+    while True:
+        resp = await shared.post_chat_completion(client, url, api_key, body)
+        if resp.status_code != 429 or attempt >= max_retries:
+            if attempt > 0 and resp.status_code == 200:
+                print(f"✅ [{tag}] 429 重试成功（第 {attempt} 次）", flush=True)
+            return resp
+        ra = _parse_retry_after(resp.headers.get("retry-after"))
+        wait = min(ra if ra is not None else delays[attempt] + random.uniform(0, 1), 8.0)
+        attempt += 1
+        print(f"⏳ [{tag}] 上游 429，{wait:.1f}s 后第 {attempt} 次重试", flush=True)
+        await asyncio.sleep(wait)
 # =========================================================================
 # [Gemini/Vertex AI 专用] 上游 429 服务端退避重试 END
 # =========================================================================
@@ -897,8 +915,10 @@ async def _stream_and_capture_inner(
                         }
                     }
                 async with httpx.AsyncClient(timeout=120) as retry_client:
-                    retry_resp = await shared.post_chat_completion(
+                    retry_resp = await _post_chat_completion_with_429_retry(
                         retry_client, shared.API_BASE_URL, shared.API_KEY, retry_body,
+                        tag="工具挽救",
+                        max_retries=2 if shared.is_vertex_endpoint() else 0,
                     )
                     if retry_resp.status_code == 200:
                         retry_data = retry_resp.json()
@@ -956,8 +976,10 @@ async def _stream_and_capture_inner(
                 text_body.pop("tools", None)
                 text_body.pop("tool_choice", None)
                 async with httpx.AsyncClient(timeout=120) as retry_client:
-                    text_resp = await shared.post_chat_completion(
+                    text_resp = await _post_chat_completion_with_429_retry(
                         retry_client, shared.API_BASE_URL, shared.API_KEY, text_body,
+                        tag="降级纯文本",
+                        max_retries=2 if shared.is_vertex_endpoint() else 0,
                     )
                     if text_resp.status_code == 200:
                         text_data = text_resp.json()
