@@ -798,8 +798,8 @@ async def _stream_and_capture_inner(
                                 captured_finish_reason = finish_reason
                                 _mark_terminal()
                                 # malformed_function_call: 拦截这个 finish 信号，不透传给客户端
-                                if finish_reason == "malformed_function_call":
-                                    print("🛡️ 拦截 malformed_function_call finish 信号，客户端保持连接")
+                                if finish_reason == "malformed_function_call" or (not full_response and not accumulated_tool_calls):
+                                    print(f"🛡️ 拦截 {finish_reason} finish 信号（当前无正文/工具调用），客户端保持连接")
                                     continue
                             delta = first_choice.get("delta", {})
                             content = delta.get("content", "")
