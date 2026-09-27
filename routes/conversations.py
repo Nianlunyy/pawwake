@@ -304,7 +304,13 @@ async def api_rebuild_conversation_search():
 
 @router.get("/api/admin/conversation-embedding-status")
 async def api_conversation_embedding_status():
-    return await db_search.get_embedding_backfill_status()
+    status = await db_search.get_embedding_backfill_status()
+    return {
+        **status,
+        "key_configured": bool(shared.EMBEDDING_API_KEY),
+        "embedding_ready": db_search.embedding_ready(),
+        "embedding_error": db_search.embedding_status()["error"],
+    }
 
 
 @router.patch("/api/chat/messages/{message_id}")

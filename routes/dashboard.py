@@ -2,6 +2,7 @@
 
 import os
 import secrets
+import logging
 from urllib.parse import parse_qs
 
 import httpx
@@ -12,10 +13,12 @@ import auth
 import shared
 from db import core as db_core
 from db import search as db_search
+from routes.memories import start_memory_embedding_backfill
 
 router = APIRouter()
 settings_router = APIRouter()
 _MASKED_KEYS = {"API_KEY", "EMBEDDING_API_KEY", "MEMORY_API_KEY"}
+logger = logging.getLogger(__name__)
 
 @router.get("/dashboard/login", response_class=HTMLResponse)
 async def dashboard_login_page(request: Request):
@@ -228,8 +231,22 @@ async def get_settings():
             settings[key] = _mask_key(settings[key])
         settings["MEMORY_MODEL"] = db.get("MEMORY_MODEL") or os.environ.get("MEMORY_MODEL", "")
         settings["systemPrompt"] = db.get("systemPrompt") or shared._DEFAULT_SYSTEM_PROMPT or ""
+        try:
+            vector_dimensions = await db_core.get_vector_dimensions()
+        except Exception:
+            vector_dimensions = {}
+        try:
+            vector_presence = await db_core.get_embedding_vector_presence()
+        except Exception:
+            vector_presence = None
 
-        return {"status": "ok", "settings": settings}
+        return {
+            "status": "ok",
+            "settings": settings,
+            "vector_dimensions": vector_dimensions,
+            "vector_presence": vector_presence,
+            "embedding_state": db_search.embedding_status(),
+        }
     except Exception:
         return shared._api_failure("加载设置失败")
 
@@ -244,6 +261,49 @@ async def save_settings(request: Request):
         data = await request.json()
         updated = []
         skipped = []
+        if data.pop("redetect_embedding", False) is True:
+            await db_search.clear_embedding_detection()
+            return {"status": "ok", "message": "已清除检测结果，下次向量请求会重新检测"}
+        confirmed = data.pop("confirm_embedding_rebuild", False) is True
+        retain_vectors = data.pop("retain_embedding_vectors", False) is True
+        embedding_fields_present = retain_vectors or any(
+            key in data for key in ("EMBEDDING_DIM", "EMBEDDING_BASE_URL", "EMBEDDING_MODEL")
+        )
+        embedding_dim = data.pop("EMBEDDING_DIM", shared.EMBEDDING_DIM)
+        embedding_base_url = str(data.pop("EMBEDDING_BASE_URL", shared.EMBEDDING_BASE_URL))
+        embedding_model = str(data.pop("EMBEDDING_MODEL", shared.EMBEDDING_MODEL))
+        embedding_result = None
+        if embedding_fields_present:
+            embedding_key = str(data.get("EMBEDDING_API_KEY", shared.EMBEDDING_API_KEY)).strip()
+            if _is_masked(embedding_key):
+                embedding_key = shared.EMBEDDING_API_KEY
+            try:
+                embedding_dim = int(embedding_dim)
+            except (TypeError, ValueError):
+                return {"error": "Embedding 维度必须为正整数"}
+            try:
+                async with db_search.embedding_write_lock:
+                    embedding_result = await db_core.save_embedding_settings(
+                        embedding_base_url, embedding_model, embedding_dim, confirmed,
+                        allow_empty=not bool(embedding_key),
+                        retain_vectors=retain_vectors,
+                    )
+                    shared.EMBEDDING_BASE_URL = embedding_base_url
+                    shared.EMBEDDING_MODEL = embedding_model
+                    shared.EMBEDDING_DIM = embedding_dim
+                    await db_search.sync_embedding_settings(embedding_result)
+            except ValueError as e:
+                return {"error": str(e)}
+            except Exception:
+                logger.exception("Embedding settings update failed")
+                return {"error": "向量设置更新未完成，请刷新页面检查状态"}
+            for key, value in (
+                ("EMBEDDING_BASE_URL", embedding_base_url),
+                ("EMBEDDING_MODEL", embedding_model),
+                ("EMBEDDING_DIM", embedding_dim),
+            ):
+                os.environ[key] = str(value)
+                updated.append(key)
 
         # 只存 os.environ 的变量
         _ENV_ONLY = {"MEMORY_MODEL": str}
@@ -296,6 +356,13 @@ async def save_settings(request: Request):
 
         if updated:
             shared.sync_memory_extractor_config()
+        if embedding_result and embedding_result["applied"] and not embedding_result.get("retained"):
+            db_search.kick_embedding_backfill()
+            if shared.MEMORY_ENABLED and shared.MEMORY_VECTOR_ENABLED and shared.EMBEDDING_API_KEY:
+                try:
+                    await start_memory_embedding_backfill()
+                except Exception:
+                    logger.exception("Memory embedding backfill failed to start")
         if (
             "CONVERSATION_RECALL_ENABLED" in updated
             and shared.CONVERSATION_RECALL_ENABLED
@@ -307,6 +374,10 @@ async def save_settings(request: Request):
             "status": "ok",
             "updated": updated,
             "skipped": skipped,
+            "vector_rebuilt": embedding_result["rebuilt"] if embedding_result else [],
+            "vector_cleared": embedding_result["cleared"] if embedding_result else False,
+            "vector_retained": embedding_result.get("retained", False) if embedding_result else False,
+            "embedding_pending": embedding_result["pending"] if embedding_result else False,
             "message": f"已更新 {len(updated)} 项配置，立即生效"
         }
     except Exception:

@@ -807,16 +807,22 @@ async def api_backfill_memory_embeddings():
     if not shared.MEMORY_ENABLED:
         return {"error": "记忆系统未启用"}
 
-    if _backfill_mem_status["running"]:
-        return {"error": "补算任务正在运行中，请等待完成"}
-
     try:
-        total = await db_memories.get_pending_memory_embedding_count()
+        return await start_memory_embedding_backfill()
     except Exception:
         return shared._api_failure("查询待处理数量失败")
 
+
+async def start_memory_embedding_backfill():
+    """在后台补算缺少向量的记忆；已有任务在跑时不重复启动。"""
+    if not db_search.embedding_ready():
+        return {"error": "向量来源或维度待确认，请先在 Dashboard 应用"}
+    if _backfill_mem_status["running"]:
+        return {"error": "补算任务正在运行中，请等待完成"}
+
+    total = await db_memories.get_pending_memory_embedding_count()
     if total == 0:
-        return {"status": "done", "message": "所有记忆已有embedding，无需补算", "total": 0, "done": 0}
+        return {"status": "done", "message": "所有活跃记忆已有embedding，无需补算", "total": 0, "done": 0}
 
     _backfill_mem_status["running"] = True
     _backfill_mem_status["total"] = total
@@ -846,13 +852,25 @@ async def api_backfill_memory_embeddings():
     asyncio.create_task(run_backfill())
     return {"status": "started", "total": total}
 
+
 @maintenance_router.get("/api/admin/backfill-memory-embeddings/status")
 async def api_backfill_memory_embeddings_status():
     """查询记忆embedding补算进度"""
+    try:
+        counts = await db_memories.get_active_memory_embedding_counts()
+    except Exception:
+        logger.exception("Memory embedding counts unavailable")
+        counts = {"cumulative_embedded": None, "remaining": None}
     return {
         "running": _backfill_mem_status["running"],
         "total": _backfill_mem_status["total"],
         "done": _backfill_mem_status["done"],
         "error": _backfill_mem_status["error"],
         "finished_at": _backfill_mem_status["finished_at"],
+        **counts,
+        "enabled": shared.MEMORY_ENABLED,
+        "vector_enabled": shared.MEMORY_VECTOR_ENABLED,
+        "key_configured": bool(shared.EMBEDDING_API_KEY),
+        "embedding_ready": db_search.embedding_ready(),
+        "embedding_error": db_search.embedding_status()["error"],
     }

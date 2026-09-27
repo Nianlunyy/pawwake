@@ -354,6 +354,131 @@ async def init_tables():
     print("✅ 数据库表结构已就绪")
 
 
+async def _vector_dimensions(conn) -> dict:
+    return {
+        table: await conn.fetchval(
+            """SELECT atttypmod FROM pg_attribute
+               WHERE attrelid = to_regclass($1) AND attname = 'embedding'
+                 AND NOT attisdropped""",
+            table,
+        )
+        for table in ("memories", "conversations")
+    }
+
+
+async def get_vector_dimensions() -> dict:
+    if not HAS_PGVECTOR:
+        return {}
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await _vector_dimensions(conn)
+
+
+async def get_embedding_vector_presence() -> dict:
+    """Check both tables, including inactive and deleted rows, before a clear."""
+    column = "embedding" if HAS_PGVECTOR else "embedding_json"
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return {
+            table: await conn.fetchval(
+                f"SELECT EXISTS (SELECT 1 FROM {table} WHERE {column} IS NOT NULL)"
+            )
+            for table in ("memories", "conversations")
+        }
+
+
+async def save_embedding_settings(base_url: str, model: str, dim: int,
+                                  confirmed: bool, *, allow_empty: bool = False,
+                                  retain_vectors: bool = False) -> dict:
+    """Save settings and update vector provenance atomically on approval."""
+    if dim <= 0:
+        raise ValueError("Embedding 维度必须大于 0")
+    incomplete = not base_url.strip() or not model.strip()
+    if incomplete and not allow_empty:
+        raise ValueError("Embedding 地址和模型不能为空")
+    target = [base_url.strip().rstrip("/"), model.strip(), dim]
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            dimensions = await _vector_dimensions(conn) if HAS_PGVECTOR else {}
+            rebuilt = [table for table, current in dimensions.items() if current != dim]
+            column = "embedding" if HAS_PGVECTOR else "embedding_json"
+            has_vectors = any([
+                await conn.fetchval(
+                    f"SELECT EXISTS (SELECT 1 FROM {table} WHERE {column} IS NOT NULL)"
+                )
+                for table in ("memories", "conversations")
+            ])
+            raw_source = await conn.fetchval(
+                "SELECT value FROM gateway_config WHERE key = 'embedding_vector_source' FOR UPDATE"
+            )
+            source = json.loads(raw_source) if raw_source else [
+                shared.EMBEDDING_BASE_URL.strip().rstrip("/"),
+                shared.EMBEDDING_MODEL.strip(), shared.EMBEDDING_DIM,
+            ]
+            if retain_vectors:
+                if (not has_vectors or source[0] == target[0]
+                        or source[1:] != target[1:] or rebuilt):
+                    raise ValueError("只有地址变更且模型和维度未变时才能保留旧向量")
+                raw_detection = await conn.fetchval(
+                    "SELECT value FROM gateway_config WHERE key = 'embedding_detection'"
+                )
+                detection = json.loads(raw_detection) if raw_detection else None
+                if (not detection or detection.get("reprobe")
+                        or detection.get("base_url") != target[0]
+                        or detection.get("model") != target[1]
+                        or detection.get("dimension") != dim):
+                    raise ValueError("请先用新地址完成向量维度检测，再选择保留旧向量")
+            needs_migration = source != target or bool(rebuilt)
+            applied = not incomplete and needs_migration and (
+                retain_vectors or confirmed or not has_vectors
+            )
+            if applied:
+                if not retain_vectors:
+                    for table in ("memories", "conversations"):
+                        if table in rebuilt:
+                            await conn.execute(f"ALTER TABLE {table} DROP COLUMN IF EXISTS embedding")
+                            await conn.execute(f"ALTER TABLE {table} ADD COLUMN embedding vector({dim})")
+                        else:
+                            await conn.execute(f"UPDATE {table} SET {column} = NULL WHERE {column} IS NOT NULL")
+                await conn.execute("""
+                    INSERT INTO gateway_config (key, value)
+                    VALUES ('embedding_vector_source', $1)
+                    ON CONFLICT (key) DO UPDATE SET value = $1
+                """, json.dumps(target))
+                source = target
+            for key, value in (
+                ("EMBEDDING_BASE_URL", base_url),
+                ("EMBEDDING_MODEL", model),
+                ("EMBEDDING_DIM", str(dim)),
+            ):
+                await conn.execute("""
+                    INSERT INTO gateway_config (key, value) VALUES ($1, $2)
+                    ON CONFLICT (key) DO UPDATE SET value = $2
+                """, key, value)
+
+        if applied and "memories" in rebuilt:
+            try:
+                await conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_memories_embedding
+                    ON memories USING ivfflat (embedding vector_cosine_ops)
+                    WITH (lists = 10);
+                """)
+            except Exception:
+                pass  # 搜索仍可用；初期数据不足时索引可能建不起来
+    return {
+        "source": source,
+        "dimensions": {table: dim if applied else current
+                       for table, current in dimensions.items()},
+        "applied": applied,
+        "retained": retain_vectors and applied,
+        "rebuilt": rebuilt if applied else [],
+        "cleared": applied and has_vectors and not retain_vectors,
+        "pending": needs_migration and not applied,
+        "has_vectors": has_vectors,
+    }
+
+
 # ============================================================
 # 网关配置
 # ============================================================
