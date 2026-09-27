@@ -163,11 +163,154 @@ def build_tsquery(query: str) -> str:
 # 向量搜索（OpenAI 兼容 Embedding API）
 # ============================================================
 
+_embedding_source = None
+_embedding_detection = None
+_embedding_dimensions = {}
+_embedding_state_error = None
+embedding_write_lock = asyncio.Lock()
+
+
+class _EmbeddingVector(list):
+    def __init__(self, values, target):
+        super().__init__(values)
+        self.target = target
+
+
+def _embedding_target():
+    return [shared.EMBEDDING_BASE_URL.strip().rstrip("/"),
+            shared.EMBEDDING_MODEL.strip(), shared.EMBEDDING_DIM]
+
+
+def _active_detection():
+    record = _embedding_detection
+    target = _embedding_target()
+    if not record or record.get("base_url") != target[0] or record.get("model") != target[1]:
+        return None
+    if (not record.get("no_dimensions")
+            and record.get("requested_dim") != target[2]
+            and record.get("dimension") != target[2]):
+        return None
+    return record
+
+
+def embedding_ready() -> bool:
+    target = _embedding_target()
+    record = _active_detection()
+    return (
+        not _embedding_state_error
+        and _embedding_source == target
+        and all(dim == target[2] for dim in _embedding_dimensions.values())
+        and (record is None or (not record.get("reprobe") and record["dimension"] == target[2]))
+    )
+
+
+def embedding_status() -> dict:
+    record = _active_detection()
+    return {
+        "ready": embedding_ready(),
+        "source": _embedding_source,
+        "detection": record,
+        "error": _embedding_state_error,
+    }
+
+
+def pause_embedding_state(reason: str):
+    global _embedding_source, _embedding_detection, _embedding_dimensions
+    global _embedding_state_error
+    _embedding_source = None
+    _embedding_detection = None
+    _embedding_dimensions = {"unavailable": None}
+    _embedding_state_error = reason
+    _query_embed_cache.clear()
+
+
+async def load_embedding_state():
+    """Restore vector provenance after Dashboard settings have been loaded."""
+    global _embedding_source, _embedding_detection, _embedding_dimensions
+    global _embedding_state_error
+    pause_embedding_state("向量状态加载中")
+    raw_source = await db_core.get_gateway_config("embedding_vector_source")
+    if raw_source:
+        source = json.loads(raw_source)
+    else:
+        source = _embedding_target()
+        await db_core.set_gateway_config(
+            "embedding_vector_source", json.dumps(source)
+        )
+    raw_detection = await db_core.get_gateway_config("embedding_detection")
+    detection = json.loads(raw_detection) if raw_detection else None
+    dimensions = await db_core.get_vector_dimensions()
+    _embedding_source = source
+    _embedding_detection = detection
+    _embedding_dimensions = dimensions
+    if _embedding_detection and _active_detection() is None:
+        await clear_embedding_detection()
+    _embedding_state_error = None
+
+
+async def clear_embedding_detection():
+    """A retry only forgets provider capability, never vector provenance."""
+    global _embedding_detection
+    target = _embedding_target()
+    marker = {
+        "base_url": target[0], "model": target[1],
+        "requested_dim": target[2], "dimension": 0,
+        "no_dimensions": False, "reprobe": True,
+    }
+    _embedding_detection = marker
+    _query_embed_cache.clear()
+    await db_core.set_gateway_config("embedding_detection", json.dumps(marker))
+
+
+async def sync_embedding_settings(result: dict):
+    """Keep hot runtime state aligned with the committed Dashboard transaction."""
+    global _embedding_source, _embedding_detection, _embedding_dimensions
+    _embedding_source = result["source"]
+    _embedding_dimensions = result["dimensions"]
+    if _embedding_detection and _active_detection() is None:
+        await clear_embedding_detection()
+    _query_embed_cache.clear()
+
+
+def _embedding_error_detail(resp) -> str:
+    """只记录上游错误码和说明，不把任意响应体写进日志。"""
+    try:
+        payload = resp.json()
+    except ValueError:
+        return "未提供可解析的错误码和说明"
+    if not isinstance(payload, dict):
+        return "未提供可解析的错误码和说明"
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        error = payload
+    code = error.get("code", payload.get("code"))
+    message = error.get("message", payload.get("message"))
+    parts = []
+    if isinstance(code, (str, int)):
+        parts.append(f"code={str(code)[:50]}")
+    if isinstance(message, str):
+        parts.append(f"message={' '.join(message.split())[:300]}")
+    return " ".join(parts) or "未提供错误码和说明"
+
+
 async def compute_embedding(text: str) -> list:
     """调用 OpenAI 兼容的 Embedding API 计算文本向量"""
-    if not shared.EMBEDDING_API_KEY:
+    global _embedding_detection
+    if not shared.EMBEDDING_API_KEY or _embedding_state_error:
         return []
 
+    was_ready = embedding_ready()
+    # Pending migration gets one real request to learn the provider's dimension.
+    # Once learned, no more paid calls can produce unusable vectors.
+    if not embedding_ready() and _active_detection() and not _active_detection().get("reprobe"):
+        return []
+
+    base_url = shared.EMBEDDING_BASE_URL.strip().rstrip("/")
+    model = shared.EMBEDDING_MODEL.strip()
+    dim = shared.EMBEDDING_DIM
+    target = [base_url, model, dim]
+    detection = _active_detection()
+    dropped = ""
     try:
         import httpx
 
@@ -175,28 +318,82 @@ async def compute_embedding(text: str) -> list:
             text = text[:4000]
 
         body = {
-            "model": shared.EMBEDDING_MODEL,
+            "model": model,
             "input": text,
         }
-        if shared.EMBEDDING_DIM > 0:
-            body["dimensions"] = shared.EMBEDDING_DIM
+        send_dimensions = dim > 0 and not (detection and detection["no_dimensions"])
+        if send_dimensions:
+            body["dimensions"] = dim
 
         async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"{shared.EMBEDDING_BASE_URL}/embeddings",
-                headers={
-                    "Authorization": f"Bearer {shared.EMBEDDING_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json=body,
-                timeout=30.0,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return data["data"][0]["embedding"]
+            async def post():
+                return await client.post(
+                    f"{base_url}/embeddings",
+                    headers={
+                        "Authorization": f"Bearer {shared.EMBEDDING_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json=body,
+                    timeout=30.0,
+                )
+
+            resp = await post()
+            if send_dimensions and resp.status_code in (400, 422):
+                # A 400/422 can be a rejected dimension or an unsupported parameter.
+                dropped = (
+                    f"不接受 dimensions={dim}"
+                    f"（HTTP {resp.status_code}: {_embedding_error_detail(resp)}）"
+                )
+                del body["dimensions"]
+                resp = await post()
+            if not resp.is_success:
+                print(
+                    f"⚠️ Embedding计算失败: HTTP {resp.status_code} {base_url}/embeddings "
+                    f"model={model} {dropped + '；' if dropped else ''} "
+                    f"响应: {_embedding_error_detail(resp)}"
+                )
+                return []
+            vector = resp.json()["data"][0]["embedding"]
     except Exception as e:
         print(f"⚠️ Embedding计算失败: {e}")
         return []
+
+    if target != _embedding_target() or not isinstance(vector, list) or not vector:
+        return []
+    record = {
+        "base_url": base_url,
+        "model": model,
+        "requested_dim": dim,
+        "dimension": len(vector),
+        "no_dimensions": bool(dropped or (detection and detection["no_dimensions"])),
+    }
+    if record != _embedding_detection:
+        try:
+            await db_core.set_gateway_config("embedding_detection", json.dumps(record))
+        except Exception as e:
+            print(f"⚠️ Embedding检测结果保存失败: {e}")
+            return []
+        _embedding_detection = record
+
+    if dim > 0 and len(vector) != dim:
+        print(
+            f"⚠️ Embedding维度不一致: 模型 {model} "
+            f"{dropped + '，省略后' if dropped else ''}返回 {len(vector)} 维，"
+            f"当前 Embedding 维度设置为 {dim}。请在 Dashboard「向量搜索」里把"
+            f"「Embedding 维度」改成 {len(vector)}"
+        )
+        return []
+    if dropped:
+        print(f"ℹ️ Embedding模型 {model} {dropped}，已自动省略该参数，后续请求不再发送")
+    if not was_ready and embedding_ready():
+        kick_embedding_backfill()
+        if shared.MEMORY_ENABLED and shared.MEMORY_VECTOR_ENABLED:
+            try:
+                from routes.memories import start_memory_embedding_backfill
+                await start_memory_embedding_backfill()
+            except Exception:
+                logger.exception("Memory embedding backfill failed to restart")
+    return _EmbeddingVector(vector, tuple(target)) if embedding_ready() else []
 
 
 # 搜索记忆与对话时复用同一条 query embedding。持久写入与 backfill 绕过缓存。
@@ -240,18 +437,15 @@ async def get_query_embedding(query: str) -> list:
     import asyncio
     import time
 
-    if not shared.EMBEDDING_API_KEY:
+    if not shared.EMBEDDING_API_KEY or _embedding_state_error:
+        return []
+    if not embedding_ready() and _active_detection() and not _active_detection().get("reprobe"):
         return []
     normalized_query = query.strip()
     if not normalized_query:
         return []
 
-    key = (
-        normalized_query,
-        shared.EMBEDDING_BASE_URL.rstrip("/"),
-        shared.EMBEDDING_MODEL,
-        shared.EMBEDDING_DIM,
-    )
+    key = (normalized_query, *_embedding_target())
     lock = _get_query_embed_lock()
     async with lock:
         hit = _query_embed_cache.get(key)
@@ -260,7 +454,7 @@ async def get_query_embedding(query: str) -> list:
             if time.monotonic() < expires_at:
                 _query_embed_cache.pop(key, None)
                 _query_embed_cache[key] = (expires_at, vector)
-                return list(vector)
+                return _EmbeddingVector(vector, key[1:])
             _query_embed_cache.pop(key, None)
 
         task = _query_embed_inflight.get(key)
@@ -277,46 +471,51 @@ async def get_query_embedding(query: str) -> list:
     except Exception as e:
         print(f"⚠️ query向量共享任务失败: {e}")
         return []
-    return list(result)
+    return (_EmbeddingVector(result, key[1:])
+            if result and key[1:] == tuple(_embedding_target()) else [])
 
 
 async def save_memory_embedding(conn, memory_id: int, embedding: list):
     """保存记忆向量到memories表"""
-    if not embedding:
-        return
+    async with embedding_write_lock:
+        if (not embedding or not embedding_ready()
+                or getattr(embedding, "target", tuple(_embedding_target())) != tuple(_embedding_target())):
+            return
 
-    if db_core.HAS_PGVECTOR:
-        vec_str = '[' + ','.join(str(f) for f in embedding) + ']'
-        await conn.execute(
-            "UPDATE memories SET embedding = $1::vector WHERE id = $2",
-            vec_str, memory_id
-        )
-    else:
-        await conn.execute(
-            "UPDATE memories SET embedding_json = $1 WHERE id = $2",
-            json.dumps(embedding), memory_id
-        )
+        if db_core.HAS_PGVECTOR:
+            vec_str = '[' + ','.join(str(f) for f in embedding) + ']'
+            await conn.execute(
+                "UPDATE memories SET embedding = $1::vector WHERE id = $2",
+                vec_str, memory_id
+            )
+        else:
+            await conn.execute(
+                "UPDATE memories SET embedding_json = $1 WHERE id = $2",
+                json.dumps(embedding), memory_id
+            )
 
 
 async def save_conversation_embedding(conn, message_id: int, embedding: list):
     """保存单条原始对话向量。"""
-    if not embedding:
-        return
-    if db_core.HAS_PGVECTOR:
-        vector_text = "[" + ",".join(str(value) for value in embedding) + "]"
-        await conn.execute(
-            """UPDATE conversations SET embedding = $1::vector
-               WHERE id = $2 AND deleted_at IS NULL""",
-            vector_text,
-            message_id,
-        )
-    else:
-        await conn.execute(
-            """UPDATE conversations SET embedding_json = $1
-               WHERE id = $2 AND deleted_at IS NULL""",
-            json.dumps(embedding),
-            message_id,
-        )
+    async with embedding_write_lock:
+        if (not embedding or not embedding_ready()
+                or getattr(embedding, "target", tuple(_embedding_target())) != tuple(_embedding_target())):
+            return
+        if db_core.HAS_PGVECTOR:
+            vector_text = "[" + ",".join(str(value) for value in embedding) + "]"
+            await conn.execute(
+                """UPDATE conversations SET embedding = $1::vector
+                   WHERE id = $2 AND deleted_at IS NULL""",
+                vector_text,
+                message_id,
+            )
+        else:
+            await conn.execute(
+                """UPDATE conversations SET embedding_json = $1
+                   WHERE id = $2 AND deleted_at IS NULL""",
+                json.dumps(embedding),
+                message_id,
+            )
 
 
 def _cosine_sim(a, b):
@@ -877,6 +1076,9 @@ async def backfill_conversation_embeddings_once(
         if not shared.CONVERSATION_RECALL_ENABLED:
             state["stopped_reason"] = "recall_disabled"
             return 0, 0, None
+        if not embedding_ready():
+            state["stopped_reason"] = "embedding_migration_pending"
+            return 0, 0, None
         if not shared.EMBEDDING_API_KEY:
             state["last_error"] = "EMBEDDING_API_KEY未设置"
             state["stopped_reason"] = "no_api_key"
@@ -902,6 +1104,9 @@ async def backfill_conversation_embeddings_once(
             for row in rows:
                 if not shared.CONVERSATION_RECALL_ENABLED:
                     state["stopped_reason"] = "recall_disabled"
+                    return state["done_count"], state["fail_count"], state["last_error"]
+                if not embedding_ready():
+                    state["stopped_reason"] = "embedding_migration_pending"
                     return state["done_count"], state["fail_count"], state["last_error"]
                 try:
                     vector = await compute_embedding(row["content"] or "")
@@ -955,7 +1160,8 @@ def kick_embedding_backfill() -> bool:
     global _embed_backfill_task, _embed_backfill_rerun
     import asyncio as _asyncio
 
-    if not shared.CONVERSATION_RECALL_ENABLED or not shared.EMBEDDING_API_KEY:
+    if (not shared.CONVERSATION_RECALL_ENABLED or not shared.EMBEDDING_API_KEY
+            or not embedding_ready()):
         return False
     try:
         loop = _asyncio.get_running_loop()

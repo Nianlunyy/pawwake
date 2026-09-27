@@ -145,15 +145,9 @@
                         <span style="color: var(--text-light); font-size: 14px;">记忆向量补算（给已有记忆计算 embedding）：</span>
                         <button class="btn btn-primary" id="backfillMemBtn" onclick="startBackfillMemoryEmbeddings()">开始补算</button>
                     </div>
-                    <div id="backfill-mem-progress" style="display: none; margin-top: 12px;">
-                        <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 8px;">
-                            <div style="flex: 1; height: 8px; background: var(--border); border-radius: 4px; overflow: hidden;">
-                                <div id="backfill-mem-bar" style="width: 0%; height: 100%; background: var(--primary); border-radius: 4px; transition: width 0.3s ease;"></div>
-                            </div>
-                            <span id="backfill-mem-text" style="font-size: 13px; color: var(--text-muted); white-space: nowrap;">0/0</span>
-                        </div>
-                    </div>
-                    <div id="backfill-mem-msg" style="margin-top: 8px;"></div>
+                    <progress id="backfill-mem-progress" max="1" value="0" style="width: 100%; margin-top: 12px;"></progress>
+                    <div id="backfill-mem-status" role="status" aria-live="polite" style="margin-top: 8px; font-size: 13px; color: var(--text-muted);">正在读取记忆向量状态...</div>
+                    <small class="form-hint">只补活跃记忆；从归档恢复且缺向量时，请点「开始补算」。</small>
                 </div>
             </section>
 
@@ -403,6 +397,15 @@
                         </div>
                     </div>
                 </details>
+                <div class="card" style="margin-top: 16px; padding: 16px;">
+                    <div style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap;">
+                        <span style="color: var(--text-light); font-size: 14px;">对话向量补算（平时自动运行）：</span>
+                        <button class="btn btn-primary" id="backfillConvBtn" onclick="startBackfillConversationEmbeddings()">手动唤醒</button>
+                    </div>
+                    <progress id="backfill-conv-progress" max="1" value="0" style="width: 100%; margin-top: 12px;"></progress>
+                    <div id="backfill-conv-status" role="status" aria-live="polite" style="margin-top: 8px; font-size: 13px; color: var(--text-muted);">正在读取对话向量状态...</div>
+                    <small class="form-hint">补算会按待补条数调用向量接口，可能产生费用。</small>
+                </div>
             </section>
 
             <!-- 对话线管理 Section -->
@@ -640,6 +643,12 @@
                     <div class="settings-field">
                         <label>Embedding 维度</label>
                         <input type="number" id="set-EMBEDDING_DIM" class="input" min="64" max="4096">
+                        <small class="form-hint" id="embedding-detection-hint">首次向量请求会检测实际维度；需要迁移时，在这里确认后补算。</small>
+                        <button type="button" class="btn" id="redetect-embedding-btn" onclick="redetectEmbedding()" style="display:none; margin-top:8px;">重新检测</button>
+                        <div id="retain-embedding-vectors-option" style="display:none; margin-top:8px;">
+                            <button type="button" class="btn" id="retain-embedding-vectors-btn" onclick="retainEmbeddingVectors()">同一个模型，保留旧向量</button>
+                            <small class="form-hint">不确定两边是不是同一个模型就别点。</small>
+                        </div>
                     </div>
                 </div>
 
@@ -704,6 +713,6 @@
         </main>
     </div>
 
-    <script src="/static/js/dashboard.js?v=4.1.5"></script>
+    <script src="/static/js/dashboard.js?v=4.1.7"></script>
 </body>
 </html>

@@ -52,12 +52,14 @@ async def lifespan(app: FastAPI):
         yield
         return
 
+    db_search.pause_embedding_state("向量状态尚未加载")
     try:
         await db_core.init_tables()
         await db_conversations.ensure_token_usage_table()
 
         # 从数据库恢复面板配置。这一步不能受 MEMORY_ENABLED 控制，
         # 否则 Dashboard 写入 false 后将无法重新开启记忆。
+        config_restored = True
         try:
             db_cfg = await db_core.get_all_gateway_config()
             if db_cfg:
@@ -80,7 +82,24 @@ async def lifespan(app: FastAPI):
                     shared.sync_memory_extractor_config()
                     print(f"🔄 从数据库恢复 {len(restored)} 项面板配置: {', '.join(restored)}")
         except Exception as e:
+            config_restored = False
+            db_search.pause_embedding_state("面板配置恢复失败，请重启")
             print(f"[warning] 恢复面板配置失败: {e}")
+
+        # Older databases have no vector provenance; the current settings form
+        # their upgrade baseline before any automatic backfill starts.
+        if config_restored:
+            try:
+                await db_search.load_embedding_state()
+                dimensions = await db_core.get_vector_dimensions()
+                if any(current != shared.EMBEDDING_DIM for current in dimensions.values()):
+                    print(
+                        f"[warning] 向量列维度 {dimensions} 与 Embedding 维度设置 "
+                        f"{shared.EMBEDDING_DIM} 不一致，请在 Dashboard 确认重建"
+                    )
+            except Exception as e:
+                db_search.pause_embedding_state("向量状态加载失败，请重启")
+                print(f"[warning] 检查向量列维度失败: {e}")
 
         if shared.MEMORY_ENABLED:
             count = await db_memories.get_all_memories_count()
@@ -120,7 +139,7 @@ async def lifespan(app: FastAPI):
 
 
 
-app = FastAPI(title="Pawwake", version="4.1.6", lifespan=lifespan)
+app = FastAPI(title="Pawwake", version="4.1.7", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 app.middleware("http")(auth.gateway_auth_middleware)
 

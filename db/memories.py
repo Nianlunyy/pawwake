@@ -810,17 +810,32 @@ async def get_extraction_candidates(
 
 
 async def get_pending_memory_embedding_count():
-    """查询还没有embedding的记忆数量"""
+    """查询还没有embedding的活跃记忆数量"""
     embedding_column = "embedding" if db_core.HAS_PGVECTOR else "embedding_json"
     pool = await db_core.get_pool()
     async with pool.acquire() as conn:
         return await conn.fetchval(
-            f"SELECT COUNT(*) FROM memories WHERE {embedding_column} IS NULL AND content IS NOT NULL"
+            f"SELECT COUNT(*) FROM memories WHERE is_active = TRUE AND {embedding_column} IS NULL AND content IS NOT NULL"
         )
+
+
+async def get_active_memory_embedding_counts():
+    """Dashboard 只展示活跃记忆的向量覆盖率。"""
+    embedding_column = "embedding" if db_core.HAS_PGVECTOR else "embedding_json"
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(f"""
+            SELECT COUNT(*) FILTER (WHERE {embedding_column} IS NOT NULL) AS cumulative_embedded,
+                   COUNT(*) FILTER (WHERE {embedding_column} IS NULL) AS remaining
+            FROM memories WHERE is_active = TRUE AND content IS NOT NULL
+        """)
+    return dict(row)
 
 
 async def backfill_memory_embeddings(batch_size: int = 20):
     """给已有记忆补算embedding（没有embedding的记忆）"""
+    if not db_search.embedding_ready():
+        return 0
     if not shared.EMBEDDING_API_KEY:
         print("⚠️ EMBEDDING_API_KEY 未设置，无法补算embedding")
         return 0
@@ -832,19 +847,21 @@ async def backfill_memory_embeddings(batch_size: int = 20):
     async with pool.acquire() as conn:
         rows = await conn.fetch(f"""
             SELECT id, content FROM memories
-            WHERE {embedding_column} IS NULL AND content IS NOT NULL
+            WHERE is_active = TRUE AND {embedding_column} IS NULL AND content IS NOT NULL
             ORDER BY id
             LIMIT $1
         """, batch_size)
 
     if not rows:
-        print("✅ 所有记忆已有embedding，无需补算")
+        print("✅ 所有活跃记忆已有embedding，无需补算")
         return 0
 
     print(f"🔄 开始补算记忆embedding... 本批 {len(rows)} 条")
 
     async with pool.acquire() as conn:
         for row in rows:
+            if not db_search.embedding_ready():
+                break
             try:
                 embedding = await db_search.compute_embedding(row['content'] or '')
                 if embedding:
@@ -856,7 +873,7 @@ async def backfill_memory_embeddings(batch_size: int = 20):
     # 检查剩余
     async with pool.acquire() as conn:
         remaining = await conn.fetchval(
-            f"SELECT COUNT(*) FROM memories WHERE {embedding_column} IS NULL AND content IS NOT NULL"
+            f"SELECT COUNT(*) FROM memories WHERE is_active = TRUE AND {embedding_column} IS NULL AND content IS NOT NULL"
         )
 
     print(f"✅ 本批补算完成：{total_updated}/{len(rows)} 条成功" + (f"，剩余 {remaining} 条待处理" if remaining > 0 else ""))

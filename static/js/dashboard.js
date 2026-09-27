@@ -49,6 +49,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initTabs();
     // 加载记忆数据
     loadMemories();
+    pollBackfillStatus();
     // 加载导出统计
     loadExportStats();
 });
@@ -82,8 +83,12 @@ function switchSection(name) {
     if (name === 'export') {
         loadExportStats();
     }
+    if (name === 'manage') {
+        pollBackfillStatus();
+    }
     if (name === 'conversations') {
         loadConversationList(1);
+        pollConversationBackfillStatus();
     }
     if (name === 'threads') {
         loadThreads();
@@ -2463,83 +2468,111 @@ let _backfillPollTimer = null;
 
 async function startBackfillMemoryEmbeddings() {
     const btn = document.getElementById('backfillMemBtn');
-    const progress = document.getElementById('backfill-mem-progress');
-    const msgEl = document.getElementById('backfill-mem-msg');
-    
+    const status = document.getElementById('backfill-mem-status');
     btn.disabled = true;
-    btn.textContent = '启动中...';
-    msgEl.innerHTML = '';
-    
+    status.textContent = '正在启动记忆补算...';
     try {
         const resp = await fetch('/api/admin/backfill-memory-embeddings', { method: 'POST' });
-        
-        if (!resp.ok) {
-            const text = await resp.text();
-            msgEl.innerHTML = `<span style="color: var(--danger);">❌ 服务器错误 (${resp.status})：${text.substring(0, 200)}</span>`;
-            btn.disabled = false;
-            btn.textContent = '开始补算';
-            return;
-        }
-        
         const data = await resp.json();
-        
-        if (data.error) {
-            msgEl.innerHTML = `<span style="color: var(--danger);">❌ ${data.error}</span>`;
-            btn.disabled = false;
-            btn.textContent = '开始补算';
-            return;
-        }
-        
-        if (data.status === 'done') {
-            msgEl.innerHTML = `<span style="color: var(--success);">✅ ${data.message}</span>`;
-            btn.disabled = false;
-            btn.textContent = '开始补算';
-            return;
-        }
-        
-        progress.style.display = 'block';
-        updateBackfillProgress(0, data.total);
-        _backfillPollTimer = setInterval(pollBackfillStatus, 2000);
+        if (!resp.ok || data.error) throw new Error(data.error || `服务器错误 (${resp.status})`);
+        await pollBackfillStatus();
     } catch (e) {
-        msgEl.innerHTML = `<span style="color: var(--danger);">❌ ${e.message}</span>`;
+        status.textContent = '补算启动失败：' + e.message;
         btn.disabled = false;
-        btn.textContent = '开始补算';
     }
 }
 
 async function pollBackfillStatus() {
+    const btn = document.getElementById('backfillMemBtn');
+    const status = document.getElementById('backfill-mem-status');
+    const progress = document.getElementById('backfill-mem-progress');
     try {
         const resp = await fetch('/api/admin/backfill-memory-embeddings/status');
+        if (!resp.ok) throw new Error(`服务器错误 (${resp.status})`);
         const data = await resp.json();
-        
-        updateBackfillProgress(data.done, data.total);
-        
-        if (!data.running) {
+        const countsKnown = Number.isInteger(data.remaining) && Number.isInteger(data.cumulative_embedded);
+        progress.style.display = countsKnown ? '' : 'none';
+        if (countsKnown) {
+            progress.max = Math.max(1, data.cumulative_embedded + data.remaining);
+            progress.value = data.cumulative_embedded;
+        }
+        const reason = !data.enabled ? '记忆系统未开启' :
+            !data.vector_enabled ? '记忆向量未开启' :
+            !data.key_configured ? '未配置向量密钥' :
+            data.embedding_error ? data.embedding_error :
+            !data.embedding_ready ? '向量迁移待确认' :
+            data.running ? '正在补算' :
+            data.error ? `补算出错：${data.error}` :
+            data.remaining === 0 ? '活跃记忆已补齐' : '等待补算';
+        status.textContent = (countsKnown
+            ? `活跃记忆已有向量 ${data.cumulative_embedded} 条，待补 ${data.remaining} 条；`
+            : '活跃记忆向量数量暂不可用；') + reason;
+        btn.disabled = !data.enabled || !data.vector_enabled || !data.key_configured || !data.embedding_ready || data.running;
+        if (data.running && !_backfillPollTimer) {
+            _backfillPollTimer = setInterval(pollBackfillStatus, 2000);
+        } else if (!data.running && _backfillPollTimer) {
             clearInterval(_backfillPollTimer);
             _backfillPollTimer = null;
-            
-            const btn = document.getElementById('backfillMemBtn');
-            const msgEl = document.getElementById('backfill-mem-msg');
-            btn.disabled = false;
-            btn.textContent = '开始补算';
-            
-            if (data.error) {
-                msgEl.innerHTML = `<span style="color: var(--danger);">❌ 补算出错：${data.error}</span>`;
-            } else {
-                msgEl.innerHTML = `<span style="color: var(--success);">✅ 补算完成！共处理 ${data.done} 条记忆</span>`;
-            }
         }
     } catch (e) {
-        console.error('轮询补算状态失败:', e);
+        status.textContent = '读取记忆补算状态失败：' + e.message;
+        btn.disabled = false;
     }
 }
 
-function updateBackfillProgress(done, total) {
-    const bar = document.getElementById('backfill-mem-bar');
-    const text = document.getElementById('backfill-mem-text');
-    const pct = total > 0 ? Math.round((done / total) * 100) : 0;
-    bar.style.width = pct + '%';
-    text.textContent = `${done}/${total} (${pct}%)`;
+let _conversationBackfillPollTimer = null;
+
+async function startBackfillConversationEmbeddings() {
+    const btn = document.getElementById('backfillConvBtn');
+    const status = document.getElementById('backfill-conv-status');
+    btn.disabled = true;
+    status.textContent = '正在唤醒对话补算...';
+    try {
+        const resp = await fetch('/api/admin/rebuild-conversation-search', { method: 'POST' });
+        const data = await resp.json();
+        if (!resp.ok || data.error) throw new Error(data.error || `服务器错误 (${resp.status})`);
+        await pollConversationBackfillStatus();
+    } catch (e) {
+        status.textContent = '唤醒失败：' + e.message;
+        btn.disabled = false;
+    }
+}
+
+async function pollConversationBackfillStatus() {
+    const btn = document.getElementById('backfillConvBtn');
+    const status = document.getElementById('backfill-conv-status');
+    const progress = document.getElementById('backfill-conv-progress');
+    try {
+        const resp = await fetch('/api/admin/conversation-embedding-status');
+        if (!resp.ok) throw new Error(`服务器错误 (${resp.status})`);
+        const data = await resp.json();
+        const countsKnown = Number.isInteger(data.remaining) && Number.isInteger(data.cumulative_embedded);
+        progress.style.display = countsKnown ? '' : 'none';
+        if (countsKnown) {
+            progress.max = Math.max(1, data.cumulative_embedded + data.remaining);
+            progress.value = data.cumulative_embedded;
+        }
+        const reason = !data.enabled ? '对话召回未开启' :
+            !data.key_configured ? '未配置向量密钥' :
+            data.embedding_error ? data.embedding_error :
+            !data.embedding_ready ? '向量迁移待确认' :
+            data.running ? '正在补算' :
+            data.stopped_reason ? `本轮已停止：${data.stopped_reason}${data.last_error ? '；' + data.last_error : ''}` :
+            data.remaining === 0 ? '已补齐' : '等待补算';
+        status.textContent = (countsKnown
+            ? `已有向量 ${data.cumulative_embedded} 条，待补 ${data.remaining} 条，关键词索引待补 ${data.content_tsv_remaining ?? '?'} 条；`
+            : '对话向量数量暂不可用；') + reason;
+        btn.disabled = !data.enabled || !data.key_configured || !data.embedding_ready || data.running;
+        if (data.running && !_conversationBackfillPollTimer) {
+            _conversationBackfillPollTimer = setInterval(pollConversationBackfillStatus, 2000);
+        } else if (!data.running && _conversationBackfillPollTimer) {
+            clearInterval(_conversationBackfillPollTimer);
+            _conversationBackfillPollTimer = null;
+        }
+    } catch (e) {
+        status.textContent = '读取对话补算状态失败：' + e.message;
+        btn.disabled = false;
+    }
 }
 
 
@@ -2549,6 +2582,10 @@ function updateBackfillProgress(done, total) {
 
 let _settingsLoaded = false;
 let _modelList = [];
+let _loadedVectorDimensions = {};
+let _loadedVectorPresence = {};
+let _loadedEmbeddingState = {};
+let _loadedEmbeddingSettings = {};
 
 // 所有需要读写的字段 key（开源版：EMBEDDING_API_KEY + EMBEDDING_BASE_URL）
 const _SETTINGS_FIELDS = {
@@ -2595,6 +2632,51 @@ async function loadSettings() {
             const el = document.getElementById('set-' + k);
             if (el) el.value = s[k];
         });
+        _loadedVectorDimensions = data.vector_dimensions || {};
+        _loadedVectorPresence = data.vector_presence;
+        _loadedEmbeddingState = data.embedding_state || {};
+        _loadedEmbeddingSettings = {
+            base: s.EMBEDDING_BASE_URL || '',
+            model: s.EMBEDDING_MODEL || '',
+            dim: s.EMBEDDING_DIM,
+        };
+        const dimEl = document.getElementById('set-EMBEDDING_DIM');
+        const detection = _loadedEmbeddingState.detection;
+        const detected = detection && !detection.reprobe;
+        const source = _loadedEmbeddingState.source;
+        const targetBase = (s.EMBEDDING_BASE_URL || '').trim().replace(/\/+$/, '');
+        const targetModel = (s.EMBEDDING_MODEL || '').trim();
+        const addressOnlyPending = !_loadedEmbeddingState.error && !_loadedEmbeddingState.ready &&
+            Array.isArray(source) && source[0] !== targetBase &&
+            source[1] === targetModel && source[2] === s.EMBEDDING_DIM &&
+            detected && detection.base_url === targetBase &&
+            detection.model === targetModel && detection.dimension === s.EMBEDDING_DIM &&
+            Object.values(_loadedVectorDimensions).every(dim => dim === s.EMBEDDING_DIM) &&
+            _loadedVectorPresence && Object.values(_loadedVectorPresence).some(Boolean);
+        if (detected && dimEl) dimEl.value = detection.dimension;
+        if (dimEl) dimEl.disabled = !!(detected && detection.no_dimensions);
+        const hint = document.getElementById('embedding-detection-hint');
+        if (hint) hint.textContent = _loadedEmbeddingState.error || (detected
+            ? `检测到 ${detection.dimension} 维` +
+              (detection.no_dimensions ? '，该模型当前不接受维度参数。' : '。') +
+              (!_loadedEmbeddingState.ready
+                  ? (addressOnlyPending ? '可确认重算，或在确认同一模型后保留旧向量。'
+                                        : '保存并确认后会清空旧向量并补算。')
+                  : '')
+            : (!_loadedEmbeddingState.ready ? '向量待检测或迁移，当前只用关键词。发一条消息后再回这里查看。'
+                                             : '首次向量请求会检测实际维度；需要迁移时，在这里确认后补算。'));
+        const redetectBtn = document.getElementById('redetect-embedding-btn');
+        if (redetectBtn) redetectBtn.style.display = detected ? '' : 'none';
+        const retainOption = document.getElementById('retain-embedding-vectors-option');
+        if (retainOption) retainOption.style.display = addressOnlyPending ? '' : 'none';
+        for (const key of ['EMBEDDING_BASE_URL', 'EMBEDDING_MODEL']) {
+            const field = document.getElementById('set-' + key);
+            if (field) field.oninput = () => {
+                if (dimEl) dimEl.disabled = false;
+                if (retainOption) retainOption.style.display = 'none';
+            };
+        }
+        if (dimEl) dimEl.oninput = () => { if (retainOption) retainOption.style.display = 'none'; };
         // 浮点
         _SETTINGS_FIELDS.float.forEach(k => {
             const el = document.getElementById('set-' + k);
@@ -2638,6 +2720,27 @@ async function loadSettings() {
 
 async function saveSettings() {
     const btn = document.getElementById('save-settings-btn');
+    const dimEl = document.getElementById('set-EMBEDDING_DIM');
+    const targetDim = parseInt(dimEl?.value) || 0;
+    const targetBase = document.getElementById('set-EMBEDDING_BASE_URL')?.value.trim().replace(/\/$/, '') || '';
+    const targetModel = document.getElementById('set-EMBEDDING_MODEL')?.value.trim() || '';
+    const changedIdentity = targetBase !== (_loadedEmbeddingSettings.base || '').replace(/\/$/, '') ||
+                            targetModel !== _loadedEmbeddingSettings.model;
+    const needsRebuild = Object.values(_loadedVectorDimensions).some(dim => dim !== targetDim);
+    const hasVectors = _loadedVectorPresence === null ||
+                       Object.values(_loadedVectorPresence || {}).some(Boolean);
+    const detected = _loadedEmbeddingState.detection && !_loadedEmbeddingState.detection.reprobe;
+    const source = _loadedEmbeddingState.source;
+    const sourceMatchesTarget = Array.isArray(source) && source[0] === targetBase &&
+                                source[1] === targetModel && source[2] === targetDim;
+    const needsApply = !changedIdentity && (needsRebuild ||
+        (!sourceMatchesTarget && (targetDim !== _loadedEmbeddingSettings.dim ||
+                                  (!_loadedEmbeddingState.ready && detected))));
+    const needsConfirm = needsApply && hasVectors;
+    if (needsConfirm &&
+        !confirm('确认清空记忆和对话的旧向量，并在后台用当前模型重新补算？')) {
+        return;
+    }
     btn.disabled = true;
     btn.textContent = '保存中...';
 
@@ -2671,6 +2774,7 @@ async function saveSettings() {
     // 长文本
     const promptEl = document.getElementById('set-systemPrompt');
     if (promptEl) payload.systemPrompt = promptEl.value;
+    if (needsConfirm) payload.confirm_embedding_rebuild = true;
 
     try {
         const resp = await fetch('/api/settings', {
@@ -2683,14 +2787,53 @@ async function saveSettings() {
             showSettingsMsg('error', '保存失败: ' + data.error);
         } else {
             const msg = `已更新 ${data.updated?.length || 0} 项` +
-                        (data.skipped?.length ? `，跳过 ${data.skipped.length} 项（未修改）` : '');
+                        (data.skipped?.length ? `，跳过 ${data.skipped.length} 项（未修改）` : '') +
+                        (data.vector_cleared ? '；旧向量已清空，正在后台重新补算' : '') +
+                        (data.embedding_pending ? '；向量待检测或确认，当前只用关键词' : '');
             showSettingsMsg('success', msg);
+            await loadSettings();
         }
     } catch (e) {
         showSettingsMsg('error', '保存失败: ' + e.message);
     } finally {
         btn.disabled = false;
         btn.textContent = '保存设置';
+    }
+}
+
+async function redetectEmbedding() {
+    try {
+        const resp = await fetch('/api/settings', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({redetect_embedding: true})
+        });
+        const data = await resp.json();
+        if (data.error) throw new Error(data.error);
+        await loadSettings();
+        showSettingsMsg('success', '已清除检测结果，下次向量请求会重新检测。');
+    } catch (e) {
+        showSettingsMsg('error', '重新检测失败: ' + e.message);
+    }
+}
+
+async function retainEmbeddingVectors() {
+    const button = document.getElementById('retain-embedding-vectors-btn');
+    if (button) button.disabled = true;
+    try {
+        const resp = await fetch('/api/settings', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({retain_embedding_vectors: true})
+        });
+        const data = await resp.json();
+        if (data.error) throw new Error(data.error);
+        await loadSettings();
+        showSettingsMsg('success', '已确认同一模型，旧向量已保留。');
+    } catch (e) {
+        showSettingsMsg('error', '保留旧向量失败: ' + e.message);
+    } finally {
+        if (button) button.disabled = false;
     }
 }
 
