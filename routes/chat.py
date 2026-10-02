@@ -934,7 +934,7 @@ async def _stream_and_capture_inner(
                         if r_tool_calls:
                             print(f"🩹 兜底成功 (工具调用挽救): 捕获 {len(r_tool_calls)} 个工具调用")
                             tc_payload = json.dumps(
-                                {"choices": [{"index": 0, "delta": {"tool_calls": r_tool_calls}}]},
+                                {"choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": r_tool_calls}}]},
                                 ensure_ascii=False,
                             )
                             yield f"data: {tc_payload}\n\n".encode("utf-8")
@@ -952,7 +952,7 @@ async def _stream_and_capture_inner(
                         elif r_content:
                             print(f"🩹 兜底成功 (直接输出正文): 补发 {len(r_content)} 字符")
                             c_payload = json.dumps(
-                                {"choices": [{"index": 0, "delta": {"content": r_content}}]},
+                                {"choices": [{"index": 0, "delta": {"role": "assistant", "content": r_content}}]},
                                 ensure_ascii=False,
                             )
                             yield f"data: {c_payload}\n\n".encode("utf-8")
@@ -990,7 +990,7 @@ async def _stream_and_capture_inner(
                         if text_content:
                             print(f"🩹 降级纯文本成功: 补发 {len(text_content)} 字符")
                             c_payload = json.dumps(
-                                {"choices": [{"delta": {"content": text_content}}]},
+                                {"choices": [{"index": 0, "delta": {"role": "assistant", "content": text_content}}]},
                                 ensure_ascii=False,
                             )
                             yield f"data: {c_payload}\n\n".encode("utf-8")
