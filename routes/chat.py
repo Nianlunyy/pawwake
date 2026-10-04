@@ -895,9 +895,41 @@ async def _stream_and_capture_inner(
 
     if is_malformed or is_empty_reply:
         _reason = "malformed_function_call" if is_malformed else "空正文且无 tool_calls"
+        keepalive_task = None
         try:
-            print(f"🩹 兜底触发 ({_reason}): 启动工具挽救与平稳恢复流程")
-            await asyncio.sleep(0.8)  # 缓冲防 Vertex 429 频控
+            print(f"🩹 兜底触发 ({_reason}): 启动工具挽救与平稳恢复流程", flush=True)
+
+            # 保活注释定时生成队列与后台任务（每隔 2 秒产生一次 keep-alive，配合取消防止泄漏）
+            keepalive_queue = asyncio.Queue()
+
+            async def _keepalive_loop():
+                try:
+                    while True:
+                        await asyncio.sleep(2.0)
+                        await keepalive_queue.put(b": keep-alive\n\n")
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+
+            keepalive_task = asyncio.create_task(_keepalive_loop())
+
+            async def _drain_keepalive_during(waitable):
+                task = asyncio.ensure_future(waitable)
+                while not task.done():
+                    get_item_task = asyncio.create_task(keepalive_queue.get())
+                    done, _ = await asyncio.wait([task, get_item_task], return_when=asyncio.FIRST_COMPLETED)
+                    if get_item_task in done:
+                        yield get_item_task.result()
+                    else:
+                        get_item_task.cancel()
+                        try:
+                            await get_item_task
+                        except asyncio.CancelledError:
+                            pass
+
+            async for ping in _drain_keepalive_during(asyncio.sleep(0.8)):  # 缓冲防 Vertex 429 频控
+                yield ping
 
             has_tools = bool(body.get("tools"))
             rescued_ok = False
@@ -915,11 +947,17 @@ async def _stream_and_capture_inner(
                         }
                     }
                 async with httpx.AsyncClient(timeout=120) as retry_client:
-                    retry_resp = await _post_chat_completion_with_429_retry(
-                        retry_client, shared.API_BASE_URL, shared.API_KEY, retry_body,
-                        tag="工具挽救",
-                        max_retries=2 if shared.is_vertex_endpoint() else 0,
+                    retry_task = asyncio.create_task(
+                        _post_chat_completion_with_429_retry(
+                            retry_client, shared.API_BASE_URL, shared.API_KEY, retry_body,
+                            tag="工具挽救",
+                            max_retries=2 if shared.is_vertex_endpoint() else 0,
+                        )
                     )
+                    async for ping in _drain_keepalive_during(retry_task):
+                        yield ping
+                    retry_resp = await retry_task
+
                     if retry_resp.status_code == 200:
                         retry_data = retry_resp.json()
                         first_c = retry_data.get("choices", [{}])[0]
@@ -932,7 +970,12 @@ async def _stream_and_capture_inner(
 
                         # 成功挽救真实的工具调用！推送给客户端执行工具
                         if r_tool_calls:
-                            print(f"🩹 兜底成功 (工具调用挽救): 捕获 {len(r_tool_calls)} 个工具调用")
+                            if keepalive_task and not keepalive_task.done():
+                                keepalive_task.cancel()
+                            r_tc_preview = json.dumps(r_tool_calls, ensure_ascii=False)
+                            if len(r_tc_preview) > 200:
+                                r_tc_preview = r_tc_preview[:200] + "..."
+                            print(f"🩹 兜底成功 (工具调用挽救): 捕获 {len(r_tool_calls)} 个工具调用 | 内容: {r_tc_preview}", flush=True)
                             tc_payload = json.dumps(
                                 {"choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": r_tool_calls}}]},
                                 ensure_ascii=False,
@@ -950,7 +993,10 @@ async def _stream_and_capture_inner(
 
                         # 挽救得到正常的文本正文
                         elif r_content:
-                            print(f"🩹 兜底成功 (直接输出正文): 补发 {len(r_content)} 字符")
+                            if keepalive_task and not keepalive_task.done():
+                                keepalive_task.cancel()
+                            r_content_preview = r_content[:200] + ("..." if len(r_content) > 200 else "")
+                            print(f"🩹 兜底成功 (直接输出正文): 补发 {len(r_content)} 字符 | 内容: {r_content_preview}", flush=True)
                             c_payload = json.dumps(
                                 {"choices": [{"index": 0, "delta": {"role": "assistant", "content": r_content}}]},
                                 ensure_ascii=False,
@@ -970,17 +1016,27 @@ async def _stream_and_capture_inner(
             # --- 阶段二：若无 tools 或工具挽救失败，无感剥离 tools 生成纯文本 ---
             # 注意：绝不向 messages 追加提示，仅底层取消 tools 定义，模型自然输出文本且不破人设
             if not rescued_ok:
-                print("🩹 工具挽救未果，平稳退化为无工具自然作答")
+                print("🩹 工具挽救未果，平稳退化为无工具自然作答", flush=True)
                 text_body = dict(body)
                 text_body["stream"] = False
                 text_body.pop("tools", None)
                 text_body.pop("tool_choice", None)
                 async with httpx.AsyncClient(timeout=120) as retry_client:
-                    text_resp = await _post_chat_completion_with_429_retry(
-                        retry_client, shared.API_BASE_URL, shared.API_KEY, text_body,
-                        tag="降级纯文本",
-                        max_retries=2 if shared.is_vertex_endpoint() else 0,
+                    text_task = asyncio.create_task(
+                        _post_chat_completion_with_429_retry(
+                            retry_client, shared.API_BASE_URL, shared.API_KEY, text_body,
+                            tag="降级纯文本",
+                            max_retries=2 if shared.is_vertex_endpoint() else 0,
+                        )
                     )
+                    async for ping in _drain_keepalive_during(text_task):
+                        yield ping
+                    text_resp = await text_task
+
+                    # 真正拿到 Vertex 响应后，及时取消保活任务
+                    if keepalive_task and not keepalive_task.done():
+                        keepalive_task.cancel()
+
                     if text_resp.status_code == 200:
                         text_data = text_resp.json()
                         text_c = text_data.get("choices", [{}])[0]
@@ -988,7 +1044,8 @@ async def _stream_and_capture_inner(
                         # 切除非流式思考链小作文标签
                         text_content = re.sub(r'<(thought|think)>.*?</\1>', '', text_content, flags=re.DOTALL).strip()
                         if text_content:
-                            print(f"🩹 降级纯文本成功: 补发 {len(text_content)} 字符")
+                            text_preview = text_content[:200] + ("..." if len(text_content) > 200 else "")
+                            print(f"🩹 降级纯文本成功: 补发 {len(text_content)} 字符 | 内容: {text_preview}", flush=True)
                             c_payload = json.dumps(
                                 {"choices": [{"index": 0, "delta": {"role": "assistant", "content": text_content}}]},
                                 ensure_ascii=False,
@@ -1001,6 +1058,9 @@ async def _stream_and_capture_inner(
 
         except Exception:
             logger.warning("兜底流程异常，跳过", exc_info=True)
+        finally:
+            if keepalive_task and not keepalive_task.done():
+                keepalive_task.cancel()
 
     # 放行被拦截的 [DONE]，让客户端正常关闭连接
     if held_done_bytes is not None:
