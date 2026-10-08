@@ -5,6 +5,7 @@ import json
 import logging
 import random
 import re
+import time
 import uuid
 
 import httpx
@@ -896,6 +897,8 @@ async def _stream_and_capture_inner(
     if is_malformed or is_empty_reply:
         _reason = "malformed_function_call" if is_malformed else "空正文且无 tool_calls"
         keepalive_task = None
+        keepalive_count = 0
+        fallback_start_time = time.monotonic()
         try:
             print(f"🩹 兜底触发 ({_reason}): 启动工具挽救与平稳恢复流程", flush=True)
 
@@ -915,11 +918,13 @@ async def _stream_and_capture_inner(
             keepalive_task = asyncio.create_task(_keepalive_loop())
 
             async def _drain_keepalive_during(waitable):
+                nonlocal keepalive_count
                 task = asyncio.ensure_future(waitable)
                 while not task.done():
                     get_item_task = asyncio.create_task(keepalive_queue.get())
                     done, _ = await asyncio.wait([task, get_item_task], return_when=asyncio.FIRST_COMPLETED)
                     if get_item_task in done:
+                        keepalive_count += 1
                         yield get_item_task.result()
                     else:
                         get_item_task.cancel()
@@ -1061,6 +1066,8 @@ async def _stream_and_capture_inner(
         finally:
             if keepalive_task and not keepalive_task.done():
                 keepalive_task.cancel()
+            fallback_duration = time.monotonic() - fallback_start_time
+            print(f"🩹 兜底结束: 发送保活 {keepalive_count} 次 | 总耗时 {fallback_duration:.2f}s", flush=True)
 
     # 放行被拦截的 [DONE]，让客户端正常关闭连接
     if held_done_bytes is not None:
