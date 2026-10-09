@@ -948,125 +948,131 @@ async def _stream_and_capture_inner(
 
             # --- 阶段一：若原请求带 tools，优先尝试低思考等级重试，挽救工具调用 ---
             if has_tools:
-                retry_body = dict(body)
-                retry_body["stream"] = False
-                # 针对 Vertex Gemini：将思考等级降为 low，避免思维溢出破坏工具协议
-                if "google" in retry_body and "thinking_config" in retry_body.get("google", {}):
-                    retry_body["google"] = {
-                        "thinking_config": {
-                            "thinking_level": "low",
-                            "include_thoughts": True,
+                try:
+                    retry_body = dict(body)
+                    retry_body["stream"] = False
+                    # 针对 Vertex Gemini：将思考等级降为 low，避免思维溢出破坏工具协议
+                    if "google" in retry_body and "thinking_config" in retry_body.get("google", {}):
+                        retry_body["google"] = {
+                            "thinking_config": {
+                                "thinking_level": "low",
+                                "include_thoughts": True,
+                            }
                         }
-                    }
-                async with httpx.AsyncClient(timeout=120) as retry_client:
-                    retry_task = asyncio.create_task(
-                        _post_chat_completion_with_429_retry(
-                            retry_client, shared.API_BASE_URL, shared.API_KEY, retry_body,
-                            tag="工具挽救",
-                            max_retries=2 if shared.is_vertex_endpoint() else 0,
+                    async with httpx.AsyncClient(timeout=120) as retry_client:
+                        retry_task = asyncio.create_task(
+                            _post_chat_completion_with_429_retry(
+                                retry_client, shared.API_BASE_URL, shared.API_KEY, retry_body,
+                                tag="工具挽救",
+                                max_retries=2 if shared.is_vertex_endpoint() else 0,
+                            )
                         )
-                    )
-                    async for ping in _drain_keepalive_during(retry_task):
-                        yield ping
-                    retry_resp = await retry_task
+                        async for ping in _drain_keepalive_during(retry_task):
+                            yield ping
+                        retry_resp = await retry_task
 
-                    if retry_resp.status_code == 200:
-                        retry_data = retry_resp.json()
-                        first_c = retry_data.get("choices", [{}])[0]
-                        r_msg = first_c.get("message", {})
-                        r_tool_calls = r_msg.get("tool_calls")
-                        r_content = r_msg.get("content") or ""
-                        # 切除非流式思考链小作文标签（<thought>.*?</thought> 或 <think>.*?</think>）
-                        r_content = re.sub(r'<(thought|think)>.*?</\1>', '', r_content, flags=re.DOTALL).strip()
-                        r_finish = first_c.get("finish_reason")
+                        if retry_resp.status_code == 200:
+                            retry_data = retry_resp.json()
+                            first_c = retry_data.get("choices", [{}])[0]
+                            r_msg = first_c.get("message", {})
+                            r_tool_calls = r_msg.get("tool_calls")
+                            r_content = r_msg.get("content") or ""
+                            # 切除非流式思考链小作文标签（<thought>.*?</thought> 或 <think>.*?</think>）
+                            r_content = re.sub(r'<(thought|think)>.*?</\1>', '', r_content, flags=re.DOTALL).strip()
+                            r_finish = first_c.get("finish_reason")
 
-                        # 成功挽救真实的工具调用！推送给客户端执行工具
-                        if r_tool_calls:
-                            if keepalive_task and not keepalive_task.done():
-                                keepalive_task.cancel()
-                            r_tc_preview = json.dumps(r_tool_calls, ensure_ascii=False)
-                            if len(r_tc_preview) > 200:
-                                r_tc_preview = r_tc_preview[:200] + "..."
-                            print(f"🩹 兜底成功 (工具调用挽救): 捕获 {len(r_tool_calls)} 个工具调用 | 上游usage: {usage_str} | 内容: {r_tc_preview}", flush=True)
-                            tc_payload = json.dumps(
-                                {"choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": r_tool_calls}}]},
-                                ensure_ascii=False,
-                            )
-                            yield f"data: {tc_payload}\n\n".encode("utf-8")
-                            fr_payload = json.dumps(
-                                {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
-                                ensure_ascii=False,
-                            )
-                            yield f"data: {fr_payload}\n\n".encode("utf-8")
-                            assistant_tool_calls = r_tool_calls
-                            for idx, tc in enumerate(r_tool_calls):
-                                accumulated_tool_calls[idx] = tc
-                            rescued_ok = True
+                            # 成功挽救真实的工具调用！推送给客户端执行工具
+                            if r_tool_calls:
+                                if keepalive_task and not keepalive_task.done():
+                                    keepalive_task.cancel()
+                                r_tc_preview = json.dumps(r_tool_calls, ensure_ascii=False)
+                                if len(r_tc_preview) > 200:
+                                    r_tc_preview = r_tc_preview[:200] + "..."
+                                print(f"🩹 兜底成功 (工具调用挽救): 捕获 {len(r_tool_calls)} 个工具调用 | 上游usage: {usage_str} | 内容: {r_tc_preview}", flush=True)
+                                tc_payload = json.dumps(
+                                    {"choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": r_tool_calls}}]},
+                                    ensure_ascii=False,
+                                )
+                                yield f"data: {tc_payload}\n\n".encode("utf-8")
+                                fr_payload = json.dumps(
+                                    {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+                                    ensure_ascii=False,
+                                )
+                                yield f"data: {fr_payload}\n\n".encode("utf-8")
+                                assistant_tool_calls = r_tool_calls
+                                for idx, tc in enumerate(r_tool_calls):
+                                    accumulated_tool_calls[idx] = tc
+                                rescued_ok = True
 
-                        # 挽救得到正常的文本正文
-                        elif r_content:
-                            if keepalive_task and not keepalive_task.done():
-                                keepalive_task.cancel()
-                            r_content_preview = r_content[:200] + ("..." if len(r_content) > 200 else "")
-                            print(f"🩹 兜底成功 (直接输出正文): 补发 {len(r_content)} 字符 | 上游usage: {usage_str} | 内容: {r_content_preview}", flush=True)
-                            c_payload = json.dumps(
-                                {"choices": [{"index": 0, "delta": {"role": "assistant", "content": r_content}}]},
-                                ensure_ascii=False,
-                            )
-                            yield f"data: {c_payload}\n\n".encode("utf-8")
-                            fr_payload = json.dumps(
-                                {"choices": [{"index": 0, "delta": {}, "finish_reason": r_finish or "stop"}]},
-                                ensure_ascii=False,
-                            )
-                            yield f"data: {fr_payload}\n\n".encode("utf-8")
-                            assistant_msg = r_content
-                            full_response.append(r_content)
-                            rescued_ok = True
-                    else:
-                        logger.warning("工具挽救重试失败: status=%s", retry_resp.status_code)
+                            # 挽救得到正常的文本正文
+                            elif r_content:
+                                if keepalive_task and not keepalive_task.done():
+                                    keepalive_task.cancel()
+                                r_content_preview = r_content[:200] + ("..." if len(r_content) > 200 else "")
+                                print(f"🩹 兜底成功 (直接输出正文): 补发 {len(r_content)} 字符 | 上游usage: {usage_str} | 内容: {r_content_preview}", flush=True)
+                                c_payload = json.dumps(
+                                    {"choices": [{"index": 0, "delta": {"role": "assistant", "content": r_content}}]},
+                                    ensure_ascii=False,
+                                )
+                                yield f"data: {c_payload}\n\n".encode("utf-8")
+                                fr_payload = json.dumps(
+                                    {"choices": [{"index": 0, "delta": {}, "finish_reason": r_finish or "stop"}]},
+                                    ensure_ascii=False,
+                                )
+                                yield f"data: {fr_payload}\n\n".encode("utf-8")
+                                assistant_msg = r_content
+                                full_response.append(r_content)
+                                rescued_ok = True
+                        else:
+                            logger.warning("工具挽救重试失败: status=%s", retry_resp.status_code)
+                except Exception:
+                    logger.warning("兜底阶段一（工具挽救）异常，继续尝试阶段二", exc_info=True)
 
             # --- 阶段二：若无 tools 或工具挽救失败，无感剥离 tools 生成纯文本 ---
             # 注意：绝不向 messages 追加提示，仅底层取消 tools 定义，模型自然输出文本且不破人设
             if not rescued_ok:
-                print("🩹 工具挽救未果，平稳退化为无工具自然作答", flush=True)
-                text_body = dict(body)
-                text_body["stream"] = False
-                text_body.pop("tools", None)
-                text_body.pop("tool_choice", None)
-                async with httpx.AsyncClient(timeout=120) as retry_client:
-                    text_task = asyncio.create_task(
-                        _post_chat_completion_with_429_retry(
-                            retry_client, shared.API_BASE_URL, shared.API_KEY, text_body,
-                            tag="降级纯文本",
-                            max_retries=2 if shared.is_vertex_endpoint() else 0,
-                        )
-                    )
-                    async for ping in _drain_keepalive_during(text_task):
-                        yield ping
-                    text_resp = await text_task
-
-                    # 真正拿到 Vertex 响应后，及时取消保活任务
-                    if keepalive_task and not keepalive_task.done():
-                        keepalive_task.cancel()
-
-                    if text_resp.status_code == 200:
-                        text_data = text_resp.json()
-                        text_c = text_data.get("choices", [{}])[0]
-                        text_content = text_c.get("message", {}).get("content") or ""
-                        # 切除非流式思考链小作文标签
-                        text_content = re.sub(r'<(thought|think)>.*?</\1>', '', text_content, flags=re.DOTALL).strip()
-                        if text_content:
-                            text_preview = text_content[:200] + ("..." if len(text_content) > 200 else "")
-                            print(f"🩹 降级纯文本成功: 补发 {len(text_content)} 字符 | 上游usage: {usage_str} | 内容: {text_preview}", flush=True)
-                            c_payload = json.dumps(
-                                {"choices": [{"index": 0, "delta": {"role": "assistant", "content": text_content}}]},
-                                ensure_ascii=False,
+                try:
+                    print("🩹 工具挽救未果，平稳退化为无工具自然作答", flush=True)
+                    text_body = dict(body)
+                    text_body["stream"] = False
+                    text_body.pop("tools", None)
+                    text_body.pop("tool_choice", None)
+                    async with httpx.AsyncClient(timeout=120) as retry_client:
+                        text_task = asyncio.create_task(
+                            _post_chat_completion_with_429_retry(
+                                retry_client, shared.API_BASE_URL, shared.API_KEY, text_body,
+                                tag="降级纯文本",
+                                max_retries=2 if shared.is_vertex_endpoint() else 0,
                             )
-                            yield f"data: {c_payload}\n\n".encode("utf-8")
-                            assistant_msg = text_content
-                            full_response.append(text_content)
-                    else:
-                        logger.warning("降级纯文本请求失败: status=%s", text_resp.status_code)
+                        )
+                        async for ping in _drain_keepalive_during(text_task):
+                            yield ping
+                        text_resp = await text_task
+
+                        # 真正拿到 Vertex 响应后，及时取消保活任务
+                        if keepalive_task and not keepalive_task.done():
+                            keepalive_task.cancel()
+
+                        if text_resp.status_code == 200:
+                            text_data = text_resp.json()
+                            text_c = text_data.get("choices", [{}])[0]
+                            text_content = text_c.get("message", {}).get("content") or ""
+                            # 切除非流式思考链小作文标签
+                            text_content = re.sub(r'<(thought|think)>.*?</\1>', '', text_content, flags=re.DOTALL).strip()
+                            if text_content:
+                                text_preview = text_content[:200] + ("..." if len(text_content) > 200 else "")
+                                print(f"🩹 降级纯文本成功: 补发 {len(text_content)} 字符 | 上游usage: {usage_str} | 内容: {text_preview}", flush=True)
+                                c_payload = json.dumps(
+                                    {"choices": [{"index": 0, "delta": {"role": "assistant", "content": text_content}}]},
+                                    ensure_ascii=False,
+                                )
+                                yield f"data: {c_payload}\n\n".encode("utf-8")
+                                assistant_msg = text_content
+                                full_response.append(text_content)
+                        else:
+                            logger.warning("降级纯文本请求失败: status=%s", text_resp.status_code)
+                except Exception:
+                    logger.warning("兜底阶段二（降级纯文本）异常", exc_info=True)
 
         except Exception:
             logger.warning("兜底流程异常，跳过", exc_info=True)
