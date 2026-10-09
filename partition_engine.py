@@ -259,7 +259,7 @@ async def _call_summary_model(prompt: str, label: str = "摘要生成") -> str:
         print(f"⚠️ {label}失败: HTTP {response.status_code}, model={shared.CACHE_SUMMARY_MODEL}: {response.text[:500]}")
         return ""
     except Exception as e:
-        print(f"⚠️ {label}异常: {e}")
+        print(f"⚠️ {label}异常: {e} | type={type(e).__name__} | repr={repr(e)}")
         return ""
 
 

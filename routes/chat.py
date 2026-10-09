@@ -713,6 +713,7 @@ async def _stream_and_capture_inner(
     full_response = []
     full_reasoning = []
     stream_usage = {}
+    saw_stream_usage = False
     line_buffer = ""
     accumulated_tool_calls = {}  # index -> OpenAI-compatible tool call
     stream_succeeded = False
@@ -790,6 +791,7 @@ async def _stream_and_capture_inner(
 
                             if "usage" in data:
                                 stream_usage = data["usage"]
+                                saw_stream_usage = True
 
                             choices = data.get("choices") or [{}]
                             choice = first_choice = choices[0] if choices else {}
@@ -896,6 +898,11 @@ async def _stream_and_capture_inner(
 
     if is_malformed or is_empty_reply:
         _reason = "malformed_function_call" if is_malformed else "空正文且无 tool_calls"
+        usage_str = "已收到" if (saw_stream_usage or bool(stream_usage)) else "未收到"
+        if not captured_finish_reason:
+            thought_chars = len(assistant_reasoning) if assistant_reasoning else 0
+            content_chars = len(assistant_msg)
+            print(f"⚠️ 流式未收到 finish_reason 即结束: 思考 {thought_chars} 字符 | 正文 {content_chars} 字符 | 上游usage: {usage_str}", flush=True)
         keepalive_task = None
         keepalive_count = 0
         fallback_start_time = time.monotonic()
@@ -980,7 +987,7 @@ async def _stream_and_capture_inner(
                             r_tc_preview = json.dumps(r_tool_calls, ensure_ascii=False)
                             if len(r_tc_preview) > 200:
                                 r_tc_preview = r_tc_preview[:200] + "..."
-                            print(f"🩹 兜底成功 (工具调用挽救): 捕获 {len(r_tool_calls)} 个工具调用 | 内容: {r_tc_preview}", flush=True)
+                            print(f"🩹 兜底成功 (工具调用挽救): 捕获 {len(r_tool_calls)} 个工具调用 | 上游usage: {usage_str} | 内容: {r_tc_preview}", flush=True)
                             tc_payload = json.dumps(
                                 {"choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": r_tool_calls}}]},
                                 ensure_ascii=False,
@@ -1001,7 +1008,7 @@ async def _stream_and_capture_inner(
                             if keepalive_task and not keepalive_task.done():
                                 keepalive_task.cancel()
                             r_content_preview = r_content[:200] + ("..." if len(r_content) > 200 else "")
-                            print(f"🩹 兜底成功 (直接输出正文): 补发 {len(r_content)} 字符 | 内容: {r_content_preview}", flush=True)
+                            print(f"🩹 兜底成功 (直接输出正文): 补发 {len(r_content)} 字符 | 上游usage: {usage_str} | 内容: {r_content_preview}", flush=True)
                             c_payload = json.dumps(
                                 {"choices": [{"index": 0, "delta": {"role": "assistant", "content": r_content}}]},
                                 ensure_ascii=False,
@@ -1050,7 +1057,7 @@ async def _stream_and_capture_inner(
                         text_content = re.sub(r'<(thought|think)>.*?</\1>', '', text_content, flags=re.DOTALL).strip()
                         if text_content:
                             text_preview = text_content[:200] + ("..." if len(text_content) > 200 else "")
-                            print(f"🩹 降级纯文本成功: 补发 {len(text_content)} 字符 | 内容: {text_preview}", flush=True)
+                            print(f"🩹 降级纯文本成功: 补发 {len(text_content)} 字符 | 上游usage: {usage_str} | 内容: {text_preview}", flush=True)
                             c_payload = json.dumps(
                                 {"choices": [{"index": 0, "delta": {"role": "assistant", "content": text_content}}]},
                                 ensure_ascii=False,
