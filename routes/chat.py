@@ -930,18 +930,41 @@ async def _stream_and_capture_inner(
             async def _drain_keepalive_during(waitable):
                 nonlocal keepalive_count
                 task = asyncio.ensure_future(waitable)
-                while not task.done():
-                    get_item_task = asyncio.create_task(keepalive_queue.get())
-                    done, _ = await asyncio.wait([task, get_item_task], return_when=asyncio.FIRST_COMPLETED)
-                    if get_item_task in done:
-                        keepalive_count += 1
-                        yield get_item_task.result()
-                    else:
+                get_item_task = None
+                try:
+                    while not task.done():
+                        get_item_task = asyncio.create_task(keepalive_queue.get())
+                        done, _ = await asyncio.wait([task, get_item_task], return_when=asyncio.FIRST_COMPLETED)
+                        if get_item_task in done:
+                            keepalive_count += 1
+                            item = get_item_task.result()
+                            get_item_task = None
+                            yield item
+                        else:
+                            get_item_task.cancel()
+                            try:
+                                await get_item_task
+                            except asyncio.CancelledError:
+                                pass
+                            get_item_task = None
+                finally:
+                    if get_item_task and not get_item_task.done():
                         get_item_task.cancel()
                         try:
                             await get_item_task
                         except asyncio.CancelledError:
                             pass
+                        except Exception:
+                            logger.warning("取消保活队列读取任务异常", exc_info=True)
+                    if not task.done():
+                        task.cancel()
+                        print("🛑 兜底等待任务已取消", flush=True)
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception:
+                            logger.warning("取消兜底后台任务异常", exc_info=True)
 
             async for ping in _drain_keepalive_during(asyncio.sleep(0.8)):  # 缓冲防 Vertex 429 频控
                 yield ping
