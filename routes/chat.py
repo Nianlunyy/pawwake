@@ -1085,6 +1085,12 @@ async def _stream_and_capture_inner(
             fallback_duration = time.monotonic() - fallback_start_time
             print(f"🩹 兜底结束: 发送保活 {keepalive_count} 次 | 总耗时 {fallback_duration:.2f}s", flush=True)
 
+    # 兜底全部失败且未向客户端发出任何正文或工具调用时，在放行 [DONE] 之前发 SSE 错误帧
+    if (is_malformed or is_empty_reply) and not assistant_msg and not assistant_tool_calls:
+        yield ('data: {"error":{"message":"上游暂时不可用，兜底未成功，请稍后重试","type":"fallback_failed","code":502}}\n\n').encode("utf-8")
+        if held_done_bytes is None:
+            held_done_bytes = b"data: [DONE]\n\n"
+
     # 放行被拦截的 [DONE]，让客户端正常关闭连接
     if held_done_bytes is not None:
         yield held_done_bytes
