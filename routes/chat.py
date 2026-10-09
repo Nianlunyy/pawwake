@@ -1094,6 +1094,12 @@ async def _stream_and_capture_inner(
     # 放行被拦截的 [DONE]，让客户端正常关闭连接
     if held_done_bytes is not None:
         yield held_done_bytes
+
+    # 兜底全部失败、无任何内容送达时，不调用记忆入库与后台落库，行为与上游 429 重试耗尽一致
+    if (is_malformed or is_empty_reply) and not assistant_msg and not assistant_tool_calls:
+        if stream_state is not None:
+            stream_state["terminal"] = False
+        return
     # =========================================================================
     # [Gemini/Vertex AI 专用] 工具调用异常挽救与空回复无感兜底 END
     # =========================================================================
