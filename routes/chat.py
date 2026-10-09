@@ -24,6 +24,9 @@ from db import memories as db_memories
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
+FALLBACK_PHASE1_TIMEOUT = 60
+FALLBACK_PHASE2_TIMEOUT = 90
+
 
 class _ReminderLeaseKeeper:
     """发送期间延长到期提醒的处理时限。
@@ -959,7 +962,7 @@ async def _stream_and_capture_inner(
                                 "include_thoughts": True,
                             }
                         }
-                    async with httpx.AsyncClient(timeout=120) as retry_client:
+                    async with httpx.AsyncClient(timeout=FALLBACK_PHASE1_TIMEOUT) as retry_client:
                         retry_task = asyncio.create_task(
                             _post_chat_completion_with_429_retry(
                                 retry_client, shared.API_BASE_URL, shared.API_KEY, retry_body,
@@ -1037,7 +1040,7 @@ async def _stream_and_capture_inner(
                     text_body["stream"] = False
                     text_body.pop("tools", None)
                     text_body.pop("tool_choice", None)
-                    async with httpx.AsyncClient(timeout=120) as retry_client:
+                    async with httpx.AsyncClient(timeout=FALLBACK_PHASE2_TIMEOUT) as retry_client:
                         text_task = asyncio.create_task(
                             _post_chat_completion_with_429_retry(
                                 retry_client, shared.API_BASE_URL, shared.API_KEY, text_body,
