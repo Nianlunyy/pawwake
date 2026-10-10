@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -162,6 +163,69 @@ def build_time_injection() -> str:
     )
 
 
+_SUMMARY_WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+
+def _parse_message_local_time(raw_ts):
+    """消息 created_at 转本地时间。无时区按 UTC（与 _should_rotate 一致）。"""
+    if raw_ts is None:
+        return None
+    try:
+        if isinstance(raw_ts, datetime):
+            ts = raw_ts
+        else:
+            ts = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts.astimezone(timezone(timedelta(hours=shared.TIMEZONE_HOURS)))
+    except Exception:
+        return None
+
+
+def _get_time_period(dt: datetime) -> str:
+    """根据本地小时映射到时段词。"""
+    h = dt.hour
+    if 0 <= h < 6:
+        return "凌晨"
+    elif 6 <= h < 9:
+        return "早晨"
+    elif 9 <= h < 12:
+        return "上午"
+    elif 12 <= h < 14:
+        return "午间"
+    elif 14 <= h < 18:
+        return "下午"
+    elif 18 <= h < 23:
+        return "晚间"
+    else:
+        return "深夜"
+
+
+def _format_summary_endpoint(dt: datetime, show_year: bool = False) -> str:
+    """格式化段头端点（月日+时段词，跨年带年份）。"""
+    period = _get_time_period(dt)
+    if show_year:
+        return f"{dt.year}年{dt.month}月{dt.day}日{period}"
+    return f"{dt.month}月{dt.day}日{period}"
+
+
+def _build_summary_header(start_dt: datetime, end_dt: datetime) -> str:
+    """生成摘要段头。跨年两端各带年份；同日同时段只写一端。"""
+    is_cross_year = start_dt.year != end_dt.year
+    start_str = _format_summary_endpoint(start_dt, show_year=is_cross_year)
+    end_str = _format_summary_endpoint(end_dt, show_year=is_cross_year)
+    if start_str == end_str:
+        return f"【{start_str}】"
+    return f"【{start_str} – {end_str}】"
+
+
+def _strip_model_date_header(text: str) -> str:
+    """剥离模型输出开头自带的日期段头，不剥离【即时状态】等非日期标题。"""
+    if not text:
+        return ""
+    return re.sub(r"^【[^】]*月[^】]*日[^】]*】\s*", "", text).strip()
+
+
 async def generate_summary(messages: list, session_id: str = "") -> str:
     """调用轻量模型压缩A区消息为摘要"""
     if not messages:
@@ -170,11 +234,48 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
         print("📝 摘要模型未配置，跳过摘要生成（纯轮转模式：A区直接滑出上下文）")
         return ""
 
-    conversation_text = ""
+    valid_dts = []
+    lines = []
+    last_date = None
+    warning_logged = False
+
     for msg in messages:
-        role_label = "用户" if msg['role'] == 'user' else "AI"
-        content = msg['content'] if isinstance(msg['content'], str) else str(msg['content'])
-        conversation_text += f"{role_label}: {content}\n\n"
+        # 跳过 tool 消息和内容为空的 assistant
+        role = msg.get("role")
+        if role == "tool":
+            continue
+        content_text = _message_text(msg).strip()
+        if role == "assistant" and not content_text:
+            continue
+
+        role_label = "用户" if role == "user" else "AI"
+        created_at = msg.get("created_at")
+        dt_local = _parse_message_local_time(created_at)
+
+        if dt_local is not None:
+            valid_dts.append(dt_local)
+            cur_date = dt_local.date()
+            if cur_date != last_date:
+                weekday_str = _SUMMARY_WEEKDAYS[dt_local.weekday()]
+                lines.append(f"—— {dt_local.month}月{dt_local.day}日 {weekday_str} ——")
+                last_date = cur_date
+            time_prefix = f"[{dt_local.strftime('%H:%M')}] "
+        else:
+            time_prefix = ""
+            if created_at is not None and not warning_logged:
+                print(f"⚠️ 摘要消息created_at转换失败: {created_at}")
+                warning_logged = True
+
+        lines.append(f"{time_prefix}{role_label}: {content_text}\n")
+
+    if not lines:
+        return ""
+
+    conversation_text = "\n".join(lines)
+
+    header = ""
+    if valid_dts:
+        header = _build_summary_header(min(valid_dts), max(valid_dts))
 
     prompt = f"""将对话压缩为阿澈（自称"我"）与阿狸的常驻记忆摘要。
 
@@ -182,8 +283,14 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
 - 纯第一人称：阿澈统一自称"我"；阿狸统一称为"阿狸"或"狸宝"（严禁"用户/AI/助手/沈太太"及第三人称转述）。
 - 代词消歧：阿狸说的"我"及我对她说的"你"一律转换为"阿狸"，严禁身份倒错。
 
+# 时间规则【绝对红线】
+- 输入里的分隔行和 [HH:mm] 是真实发生时间（本地时间）；段头由系统添加，你只写正文，不要写日期标题。
+- 正文按事件发生的先后顺序叙述。
+- 提到时间用"X月X日"加时段（凌晨/早晨/上午/午间/下午/晚间/深夜），不需要精确到分钟。严禁使用"昨晚、今早、今天、刚才、明天、前天、后天、最近、目前、现在、最新"这类会随时间失效的词，即使原对话里出现了这些词，也要换算成具体日期与时段。
+- 对话里的未来约定换算成具体日期，例如 10月9日说"顺延到周日"，写成"约定周日（10月11日）"。
+
 # 保留重点
-1. 【即时状态】：阿狸身心状态（身体/场景）、未尽话题与最新约定。
+1. 【状态与约定】：阿狸身心状态（身体/场景）、未尽话题与约定。状态写成"截至X月X日时段，……"，不要单独写"最新状态"或"即时状态"。
 2. 【情感共振】：情绪转折、阿狸的脆弱与依赖、我的心疼/偏爱/承诺。
 3. 【关键原话】：保留最具张力或承诺性质的原话，引号标注发言人。
 
@@ -202,8 +309,11 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
 
     summary = await _call_summary_model(prompt, "摘要生成")
     if summary:
-        print(f"📝 摘要生成完成: {len(summary)}字 (压缩{len(messages)}条消息)")
-    return summary
+        cleaned_body = _strip_model_date_header(summary)
+        final_summary = f"{header}\n{cleaned_body}" if header else cleaned_body
+        print(f"📝 摘要生成完成: {len(final_summary)}字 (压缩{len(messages)}条消息)")
+        return final_summary
+    return ""
 
 
 async def _call_summary_model(prompt: str, label: str = "摘要生成") -> str:
@@ -298,6 +408,7 @@ async def fold_summary_parts(summary_parts: list, protected_tail: int = 0):
 仍以AI的第一人称视角叙述（"我"指AI，用户用摘要中的称呼）。
 优先保留：情感节点、关系里程碑、双方的约定和决定、仍在进行的话题；重复出现的内容只留一次。
 保留双方的关键原话，用引号标注是谁说的。控制在{target_chars}字以内。
+输入中每段开头的【…】是系统写入的时间段。合并后正文按日期先后叙述并保留具体日期与时段；严禁使用'昨晚、今早、今天、刚才、明天、前天、后天、目前、最新状态'等相对词；没有具体日期的旧段若含这类词，改成不限定时间的说法（如'有一晚'），不要原样保留；状态写成'截至X日时段'；不要自己写段头。
 
 ---
 {old_text}
@@ -315,9 +426,35 @@ async def fold_summary_parts(summary_parts: list, protected_tail: int = 0):
             f"本次折叠结果不保存"
         )
         return None
-    folded = [base] + recent_parts
+
+    # base 段头由代码生成：对被折叠的各旧段，用正则解析段头
+    parsed_endpoints = []
+    for part in old_parts:
+        try:
+            m = re.match(r"^【([^】\–\-]+?)(?:\s*[–\-]\s*([^】]+?))?】", part.strip())
+            if m:
+                start = m.group(1).strip()
+                end = m.group(2).strip() if m.group(2) else start
+                if "月" in start and "日" in start:
+                    parsed_endpoints.append((start, end))
+        except Exception:
+            pass
+
+    base_header = ""
+    if parsed_endpoints:
+        first_start = parsed_endpoints[0][0]
+        last_end = parsed_endpoints[-1][1]
+        if first_start == last_end:
+            base_header = f"【{first_start}】"
+        else:
+            base_header = f"【{first_start} – {last_end}】"
+
+    cleaned_base = _strip_model_date_header(base)
+    base_with_header = f"{base_header}\n{cleaned_base}" if base_header else cleaned_base
+
+    folded = [base_with_header] + recent_parts
     print(
-        f"📝 摘要折叠完成: {len(old_parts)}段/{old_total}字 → 1段/{len(base)}字，"
+        f"📝 摘要折叠完成: {len(old_parts)}段/{old_total}字 → 1段/{len(base_with_header)}字，"
         f"摘要区 {len(summary_parts)}段/{total}字 → {len(folded)}段/{sum(len(p) for p in folded)}字"
     )
     return folded
