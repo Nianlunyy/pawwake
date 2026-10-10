@@ -165,6 +165,17 @@ def build_time_injection() -> str:
 
 _SUMMARY_WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
+TIME_PERIOD_SPECS = (
+    ("凌晨", 0, 6, "凌晨0–6点"),
+    ("早晨", 6, 9, "早晨6–9点"),
+    ("上午", 9, 12, "上午9–12点"),
+    ("午间", 12, 14, "午间12–14点"),
+    ("下午", 14, 18, "下午14–18点"),
+    ("晚间", 18, 23, "晚间18–23点"),
+    ("深夜", 23, 24, "深夜23–24点"),
+)
+TIME_PERIOD_TABLE_TEXT = "、".join(spec[3] for spec in TIME_PERIOD_SPECS)
+
 
 def _parse_message_local_time(raw_ts):
     """消息 created_at 转本地时间。无时区按 UTC（与 _should_rotate 一致）。"""
@@ -185,20 +196,10 @@ def _parse_message_local_time(raw_ts):
 def _get_time_period(dt: datetime) -> str:
     """根据本地小时映射到时段词。"""
     h = dt.hour
-    if 0 <= h < 6:
-        return "凌晨"
-    elif 6 <= h < 9:
-        return "早晨"
-    elif 9 <= h < 12:
-        return "上午"
-    elif 12 <= h < 14:
-        return "午间"
-    elif 14 <= h < 18:
-        return "下午"
-    elif 18 <= h < 23:
-        return "晚间"
-    else:
-        return "深夜"
+    for name, start, end, _ in TIME_PERIOD_SPECS:
+        if start <= h < end:
+            return name
+    return "深夜"
 
 
 def _format_summary_endpoint(dt: datetime, show_year: bool = False) -> str:
@@ -259,7 +260,8 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
                 weekday_str = _SUMMARY_WEEKDAYS[dt_local.weekday()]
                 lines.append(f"—— {dt_local.month}月{dt_local.day}日 {weekday_str} ——")
                 last_date = cur_date
-            time_prefix = f"[{dt_local.strftime('%H:%M')}] "
+            period_str = _get_time_period(dt_local)
+            time_prefix = f"[{period_str} {dt_local.strftime('%H:%M')}] "
         else:
             time_prefix = ""
             if created_at is not None and not warning_logged:
@@ -284,9 +286,10 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
 - 代词消歧：阿狸说的"我"及我对她说的"你"一律转换为"阿狸"，严禁身份倒错。
 
 # 时间规则【绝对红线】
-- 输入里的分隔行和 [HH:mm] 是真实发生时间（本地时间）；段头由系统添加，你只写正文，不要写日期标题。
+- 输入里的分隔行和 [时段 HH:mm] 是真实发生时间（本地时间）；段头由系统添加，你只写正文，不要写日期标题。
 - 正文按事件发生的先后顺序叙述。
-- 提到时间用"X月X日"加时段（凌晨/早晨/上午/午间/下午/晚间/深夜），不需要精确到分钟。严禁使用"昨晚、今早、今天、刚才、明天、前天、后天、最近、目前、现在、最新"这类会随时间失效的词，即使原对话里出现了这些词，也要换算成具体日期与时段。
+- 时段划分对照表：{TIME_PERIOD_TABLE_TEXT}。时段词直接采用输入里标注的，凌晨属于该钟表日期，不要写成前一天的深夜。
+- 提到时间用"X月X日"加时段，不需要精确到分钟。严禁使用"昨晚、今早、今天、刚才、明天、前天、后天、最近、目前、现在、最新"这类会随时间失效的词，即使原对话里出现了这些词，也要换算成具体日期与时段。
 - 对话里的未来约定换算成具体日期，例如 10月9日说"顺延到周日"，写成"约定周日（10月11日）"。
 
 # 保留重点
@@ -310,6 +313,9 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
     summary = await _call_summary_model(prompt, "摘要生成")
     if summary:
         cleaned_body = _strip_model_date_header(summary)
+        if not cleaned_body:
+            print("⚠️ 摘要生成失败: 模型正文剥离日期段头后为空")
+            return ""
         final_summary = f"{header}\n{cleaned_body}" if header else cleaned_body
         print(f"📝 摘要生成完成: {len(final_summary)}字 (压缩{len(messages)}条消息)")
         return final_summary
@@ -427,8 +433,9 @@ async def fold_summary_parts(summary_parts: list, protected_tail: int = 0):
         )
         return None
 
-    # base 段头由代码生成：对被折叠的各旧段，用正则解析段头
+    # base 段头由代码生成：只有当被折叠的所有旧段都能解析出段头时，base 才加头；只要有一段无法解析，base 不加头
     parsed_endpoints = []
+    all_headers_valid = True
     for part in old_parts:
         try:
             m = re.match(r"^【([^】\–\-]+?)(?:\s*[–\-]\s*([^】]+?))?】", part.strip())
@@ -437,11 +444,15 @@ async def fold_summary_parts(summary_parts: list, protected_tail: int = 0):
                 end = m.group(2).strip() if m.group(2) else start
                 if "月" in start and "日" in start:
                     parsed_endpoints.append((start, end))
+                    continue
+            all_headers_valid = False
+            break
         except Exception:
-            pass
+            all_headers_valid = False
+            break
 
     base_header = ""
-    if parsed_endpoints:
+    if all_headers_valid and len(parsed_endpoints) == len(old_parts) and len(old_parts) > 0:
         first_start = parsed_endpoints[0][0]
         last_end = parsed_endpoints[-1][1]
         if first_start == last_end:
