@@ -360,26 +360,6 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
                 # 重建 client_new_msgs（user此时已只剩末尾连续块，全部保回，别把拆条发送的图丢了）
                 tail_users = [m for m in client_new_msgs if m.get("role") == "user"]
                 client_new_msgs = new_tools[:] + tail_users
-
-                if new_tools:
-                    # Race condition 防护：DB的assistant(tool_calls)已确认存在（db_expecting_tool=True），
-                    # 但仍需检查是否被其他并发请求意外清除
-                    new_tool_ids = {m.get("tool_call_id") for m in new_tools if m.get("tool_call_id")}
-                    db_has_matching_ast = False
-                    for m in db_msgs:
-                        if m.get("role") == "assistant" and m.get("tool_calls"):
-                            ast_tc_ids = {tc.get("id") for tc in m["tool_calls"] if tc.get("id")}
-                            if new_tool_ids & ast_tc_ids:
-                                db_has_matching_ast = True
-                                break
-                    if not db_has_matching_ast and new_tool_ids:
-                        for m in messages:
-                            if m.get("role") == "assistant" and m.get("tool_calls"):
-                                ast_tc_ids = {tc.get("id") for tc in m["tool_calls"] if tc.get("id")}
-                                if new_tool_ids & ast_tc_ids:
-                                    client_new_msgs.insert(0, m)
-                                    print(f"⚠️ Race防护: 从客户端补充assistant(tool_calls)")
-                                    break
         all_msgs = db_msgs + client_new_msgs
         extraction_context_messages = db_extraction_msgs + [dict(m) for m in client_new_msgs]
         extraction_round_count = len(partition_engine.group_by_rounds(all_msgs))
@@ -466,14 +446,7 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
         partition_engine._strip_cache_control(body.get("messages", []))
 
     # ---------- 转发请求 ----------
-    headers = {
-        "Authorization": f"Bearer {shared.API_KEY}",
-        "Content-Type": "application/json",
-    }
-    # OpenRouter 需要的额外头
-    if "openrouter" in shared.API_BASE_URL:
-        headers["HTTP-Referer"] = shared.EXTRA_REFERER
-        headers["X-Title"] = shared.EXTRA_TITLE
+    headers = shared.build_chat_completion_headers(shared.API_BASE_URL, shared.API_KEY)
 
     is_stream = body.get("stream", False)
 

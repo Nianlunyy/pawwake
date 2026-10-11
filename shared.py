@@ -212,7 +212,7 @@ EXTRA_REFERER = os.getenv("EXTRA_REFERER", "https://github.com/garan0613/pawwake
 EXTRA_TITLE = os.getenv("EXTRA_TITLE", "Pawwake")
 
 
-async def post_chat_completion(client, url, api_key, payload):
+def build_chat_completion_headers(url, api_key):
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -220,6 +220,11 @@ async def post_chat_completion(client, url, api_key, payload):
     if "openrouter" in url:
         headers["HTTP-Referer"] = EXTRA_REFERER
         headers["X-Title"] = EXTRA_TITLE
+    return headers
+
+
+async def post_chat_completion(client, url, api_key, payload):
+    headers = build_chat_completion_headers(url, api_key)
     return await client.post(url, headers=headers, json=payload)
 
 
