@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: pawwake
+    runtime: docker
+    plan: free
+    healthCheckPath: /
+    autoDeployTrigger: "off"
+    envVars:
+      - key: GATEWAY_SECRET
+        generateValue: true
+      - key: DASHBOARD_PASSWORD
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: DATABASE_URL
+        sync: false
+      - key: MEMORY_ENABLED
+        value: "true"

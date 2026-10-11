@@ -1,6 +1,6 @@
 # 🐾 Pawwake · 爪迹
 
-**4.1.8 · Madeleine**
+**4.1.9 · Madeleine**
 
 *Follow the pawprints back.*
 
@@ -29,7 +29,7 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 - **记忆向量搜索（可选）** — 关键词 + 语义向量四维混合搜索，说"过年"能搜到"春节"。支持 OpenAI 兼容的 Embedding API
 - **原始对话召回（可选）** — 从历史消息检索带上下文的稳定片段；分区模式按可配置 TTL 自动去重，可开启默认关闭的原文优先去重，raw API 支持调用方传入 session 与片段排除集合
 - **设置面板** — 在 Dashboard 中直接管理所有运行时配置，热更新无需重启。支持模型列表动态拉取、可搜索下拉选择
-- **零成本起步** — 可部署在 Render、Zeabur 等平台的免费额度内
+- **零成本起步** — 可部署在 Render 等平台的免费额度内
 
 ## 🏗️ 架构
 
@@ -46,6 +46,16 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 ```
 
 ## 🚀 快速开始
+
+### 一键部署
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/garan0613/pawwake)
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/ArCLvn?referralCode=f49Wsa&utm_medium=integration&utm_source=template&utm_campaign=pawwake)
+
+- **Render**：只建网关，数据库另备（如 [Neon](https://neon.tech)、[Supabase](https://supabase.com) 的免费档）。创建时填写 `DASHBOARD_PASSWORD` 和 `DATABASE_URL`，`GATEWAY_SECRET` 和 `SESSION_SECRET` 自动生成；部署后在服务的 Environment 页复制 `GATEWAY_SECRET` 给客户端用。Neon 连接串末尾如有 `&channel_binding=require`，请删掉这一段。按钮创建的服务默认不自动部署新提交。
+- **Railway**：网关和带 pgvector 的 PostgreSQL 一起建好并自动连接，三个密钥全部自动生成；部署后在 pawwake 服务的 Variables 页查看 `DASHBOARD_PASSWORD` 和 `GATEWAY_SECRET`。Railway 按用量计费；从上面按钮新注册的账号，升级到付费档（Hobby 或 Pro）后可获得 20 美元 Railway 额度。
+
+部署完成后登录 `/dashboard`，在「设置 → 基础连接」填写 API 地址、Key 和默认模型，需要记忆提取时再填记忆模型；之后接第一阶段第 4 步连接客户端。
 
 ### 第一阶段：纯转发网关（不需要数据库）
 
@@ -107,7 +117,7 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 
 在 Render 中：Dashboard → New → PostgreSQL，创建一个免费的 PostgreSQL 实例，拿到连接字符串（Internal Database URL）。
 
-> ⚠️ Render 免费 PostgreSQL 有 90 天有效期，到期前记得用导出功能备份数据。其他平台（如 [Neon](https://neon.tech)、[Supabase](https://supabase.com)）也提供免费 PostgreSQL，可按需选择。如果使用外部数据库，连接字符串末尾可能需要加 `?sslmode=require`。
+> ⚠️ Render 免费 PostgreSQL 创建 30 天后到期，之后有 14 天宽限期可升级付费档，过了宽限期数据库连同数据会被删除。到期前记得用导出功能备份数据。其他平台（如 [Neon](https://neon.tech)、[Supabase](https://supabase.com)）也提供免费 PostgreSQL，可按需选择。如果使用外部数据库，连接字符串末尾可能需要加 `?sslmode=require`。
 
 **2. 添加环境变量**
 
@@ -333,7 +343,7 @@ pawwake/
 
 **原始对话召回（可选）：**
 
-对话召回默认关闭。开启后，新写入、编辑、重复提交覆盖和导入都会同步维护关键词索引，旧向量会失效并由可续跑 worker 补算。混合排序使用关键词、语义和新近度；语义候选先按原始余弦相似度过滤，再做 min-max 归一化，避免弱候选池把无关头名拉成满分。
+对话召回默认关闭。开启后，新写入、编辑、重复提交覆盖和导入都会同步维护关键词索引，旧向量会失效并由可续跑 worker 补算。混合排序使用关键词、语义和新近度；关键词命中任一词即可入选，按命中词在对话记录中的稀有度计分；语义候选先按原始余弦相似度过滤，再做 min-max 归一化，避免弱候选池把无关头名拉成满分。
 
 | 环境变量 | 说明 | 默认值 |
 |---------|------|--------|
@@ -379,7 +389,7 @@ A: 如果数据库和网关不在同一个平台，连接字符串末尾可能�
 A: 每次最多注入 15 条记忆（可调），不会无限增长地消耗 token。分区模式按 session 的逻辑轮提取近期对话，非分区模式使用客户端本次携带的上下文；两者都不会发送整条会话。把 `MEMORY_EXTRACT_INTERVAL` 调大可以减少提取调用次数，设为 `0` 可完全禁用自动提取。
 
 **Q: 能用免费额度跑吗？**
-A: Render 免费层支持 Web Service + PostgreSQL，网关资源消耗很低，够用（注意免费 PostgreSQL 有 90 天期限）。也可以用 Neon 或 Supabase 的免费 PostgreSQL 作为长期方案。LLM API 费用另算（推荐 OpenRouter，按量付费）。
+A: Render 免费层支持 Web Service + PostgreSQL，网关资源消耗很低，够用（注意免费 PostgreSQL 30 天到期，另有 14 天宽限期）。也可以用 Neon 或 Supabase 的免费 PostgreSQL 作为长期方案。LLM API 费用另算（推荐 OpenRouter，按量付费）。
 
 **Q: 怎么备份记忆？换平台会丢数据吗？**
 A: 打开 `https://你的网关地址/dashboard`，在「导出备份」页面下载所有记忆的 JSON，建议定期备份。迁移到新平台后，在「导入记忆」页面选择「JSON 备份恢复」上传导出的文件即可。
@@ -388,6 +398,14 @@ A: 打开 `https://你的网关地址/dashboard`，在「导出备份」页面�
 A: 能。这个项目的第一个部署者就是不会写代码的——代码是 AI 写的，部署是她自己看文档搞定的。
 
 ## 📋 更新日志
+
+### v4.1.9 · Madeleine（2026-10-11）
+
+- **一键部署** — README 新增 Render 和 Railway 部署按钮，仓库根目录新增 `render.yaml`。Render 只建网关、数据库另备；Railway 同时建好网关和 pgvector 数据库。
+- **对话召回只取选中片段** — 先在数据库里选出要用的片段，再只取回这些片段的正文，不再把整段会话拉回网关，数据库流出流量明显下降。
+- **对话召回关键词按稀有度加权** — 消息不再需要包含全部关键词，命中任一词即可入选；每条消息按命中词在对话记录中的稀有度计分，会话的关键词分取其中最高的一条，片段也按同一分数挑选。命中少见词的会话排在只碰到常见词的会话前面。
+- **摘要带上日期** — 生成摘要时每条消息附本地时间，摘要开头标注记录时段，提示词禁止“昨晚”“下周”这类相对时间词，换算不了的写明具体日期未知。注入时提醒模型不要按今天的日期重新理解摘要。升级后分区缓存会断一次；旧的无日期摘要折叠后不补记录时段。
+- **模型列表适配更多服务商** — 除 Google 外，Dashboard 统一按 API 地址请求同级的 `/models` 接口，OpenRouter、OpenAI 和其他兼容服务商都能下拉选择；地址无效时提示手动输入，拉取失败时直接报错。
 
 ### v4.1.8 · Madeleine（2026-10-08）
 
@@ -406,7 +424,7 @@ A: 能。这个项目的第一个部署者就是不会写代码的——代码�
 ### v4.1.6 · Madeleine（2026-09-25）
 
 - **弱相似候选不再被抬成满分** — 混合搜索以候选池内最低相似度为零点，并保证归一化上界不低于 `MEMORY_SEMANTIC_THRESHOLD`，避免整池相似度都偏低时头名仍拿到满分。
-- **关键词按稀有度加权** — 混合搜索按关键词在活跃记忆库中的稀有度计分，并在截取候选前完成排序；命中少见关键词的记忆更靠前，只碰到常见词的候选不再被批内放大。
+- **记忆关键词按稀有度加权** — 混合搜索按关键词在活跃记忆库中的稀有度计分，并在截取候选前完成排序；命中少见关键词的记忆更靠前，只碰到常见词的候选不再被批内放大。
 
 ### v4.1.5 · Madeleine（2026-09-22）
 

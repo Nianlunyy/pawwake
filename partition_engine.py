@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -145,6 +146,65 @@ MEMORY_USAGE_GUIDE = """
 - 自然引用："记得你说过..."，避免机械式表达如"根据检索到的信息..."
 """
 
+SUMMARY_CONTEXT_HEADER = (
+    "[以下是之前对话的摘要，帮助你回忆上下文。"
+    "摘要记录的是历史语境，不得把其中的相对时间按当前日期重新解释；"
+    "当前时间只以 gateway_context 为准]"
+)
+
+SUMMARY_RANGE_RE = re.compile(
+    r"^【记录时段：(?P<start>\d{4}-\d{2}-\d{2} \d{2}:\d{2}) 至 "
+    r"(?P<end>\d{4}-\d{2}-\d{2} \d{2}:\d{2})（(?P<timezone>UTC[+-]\d{1,2})）】"
+)
+
+
+def _local_message_time(value):
+    """Return a stored UTC timestamp in the configured local timezone."""
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc) + timedelta(hours=shared.TIMEZONE_HOURS)
+
+
+def _format_summary_range(start: datetime, end: datetime) -> str:
+    timezone_label = f"UTC{shared.TIMEZONE_HOURS:+d}"
+    return (
+        f"【记录时段：{start.strftime('%Y-%m-%d %H:%M')} 至 "
+        f"{end.strftime('%Y-%m-%d %H:%M')}（{timezone_label}）】"
+    )
+
+
+def _combined_summary_range(parts: list) -> str:
+    """Combine code-written range headers only when every folded part has one."""
+    parsed = []
+    timezone_label = None
+    for part in parts:
+        match = SUMMARY_RANGE_RE.match(part)
+        if not match:
+            return ""
+        if timezone_label is None:
+            timezone_label = match.group("timezone")
+        elif match.group("timezone") != timezone_label:
+            return ""
+        try:
+            start = datetime.strptime(match.group("start"), "%Y-%m-%d %H:%M")
+            end = datetime.strptime(match.group("end"), "%Y-%m-%d %H:%M")
+        except ValueError:
+            return ""
+        if end < start:
+            return ""
+        parsed.append((start, end))
+
+    if not parsed:
+        return ""
+    start = min(item[0] for item in parsed)
+    end = max(item[1] for item in parsed)
+    return (
+        f"【记录时段：{start.strftime('%Y-%m-%d %H:%M')} 至 "
+        f"{end.strftime('%Y-%m-%d %H:%M')}（{timezone_label}）】"
+    )
+
 
 def build_time_injection() -> str:
     """构建时间注入文本（东八区）"""
@@ -169,14 +229,22 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
         return ""
 
     conversation_text = ""
+    message_times = []
     for msg in messages:
         role_label = "用户" if msg['role'] == 'user' else "AI"
         content = msg['content'] if isinstance(msg['content'], str) else str(msg['content'])
-        conversation_text += f"{role_label}: {content}\n\n"
+        local_time = _local_message_time(msg.get('created_at'))
+        time_prefix = ""
+        if local_time:
+            message_times.append(local_time)
+            time_prefix = f"[{local_time.strftime('%Y-%m-%d %H:%M')}] "
+        conversation_text += f"{time_prefix}{role_label}: {content}\n\n"
 
     prompt = f"""请将以下对话压缩成摘要。这份摘要会作为AI的记忆注入后续对话，请以AI的第一人称视角叙述（"我"指AI，用户用对话中的称呼）。
 优先保留：情感节点、关系里程碑、双方的约定和决定、正在进行的话题。
 保留双方的关键原话，用引号标注是谁说的。
+每条消息开头的时间戳是事实锚点。摘要不得使用会随读取时间变化的相对时间词（如今天、昨晚、今早、明天、刚才、这周、下周）。
+能换算时写成 YYYY-MM-DD 或 YYYY-MM-DD HH:mm；无法换算时保留事件并标注“具体日期未知”，不得猜测或删除。关键原话中的相对时间也按本规则转述，时间规则优先于逐字引用。
 去掉日常寒暄和重复内容。控制在300字以内。
 
 ---
@@ -187,6 +255,8 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
 
     summary = await _call_summary_model(prompt, "摘要生成")
     if summary:
+        if message_times:
+            summary = f"{_format_summary_range(min(message_times), max(message_times))}\n{summary}"
         print(f"📝 摘要生成完成: {len(summary)}字 (压缩{len(messages)}条消息)")
     return summary
 
@@ -278,11 +348,15 @@ async def fold_summary_parts(summary_parts: list, protected_tail: int = 0):
     recent_parts = summary_parts[-keep:]
     old_total = sum(len(p) for p in old_parts)
     target_chars = max(300, budget // 3)  # 基础摘要目标字数，模型返回后按它校验
+    range_header = _combined_summary_range(old_parts)
+    body_target_chars = max(100, target_chars - len(range_header) - (1 if range_header else 0))
     old_text = "\n\n".join(f"【第{i + 1}段】\n{p}" for i, p in enumerate(old_parts))
     prompt = f"""下面是同一段对话历史的多段摘要，按时间从早到晚排列。请把它们合并压缩成一段更精简的基础摘要。
 仍以AI的第一人称视角叙述（"我"指AI，用户用摘要中的称呼）。
 优先保留：情感节点、关系里程碑、双方的约定和决定、仍在进行的话题；重复出现的内容只留一次。
-保留双方的关键原话，用引号标注是谁说的。控制在{target_chars}字以内。
+保留双方的关键原话，用引号标注是谁说的。
+记录时段和旧摘要里的绝对日期是事实锚点。不得使用会随读取时间变化的相对时间词；能换算时改成绝对日期，缺少锚点时保留事件并标注“具体日期未知”，不得猜测、删除或按本次折叠日期解释。时间规则优先于逐字引用。
+只输出摘要正文，不重复输出记录时段。控制在{body_target_chars}字以内。
 
 ---
 {old_text}
@@ -293,6 +367,8 @@ async def fold_summary_parts(summary_parts: list, protected_tail: int = 0):
     base = await _call_summary_model(prompt, "摘要折叠")
     if not base:
         return None
+    if range_header:
+        base = f"{range_header}\n{base}"
     # 不能全信模型守字数：基础摘要必须比被折叠的旧段短，且不超过目标；否则预算形同虚设，按失败走整轮回滚
     if len(base) > target_chars or len(base) >= old_total:
         print(
@@ -553,7 +629,7 @@ async def build_partitioned_messages(
 
     # 摘要区（多block，尾部追加模式）
     if summary_parts:
-        blocks = [{"type": "text", "text": "[以下是之前对话的摘要，帮助你回忆上下文]"}]
+        blocks = [{"type": "text", "text": SUMMARY_CONTEXT_HEADER}]
         for i, part in enumerate(summary_parts):
             item = {"type": "text", "text": part}
             if i == len(summary_parts) - 1:
@@ -636,7 +712,7 @@ async def _build_basic_cached(
     # 新建/继承的对话线在历史不足 X 轮时也必须读到继承摘要。
     # 否则 dashboard 和 DB 都显示摘要存在，但首轮请求不会注入。
     if summary_parts:
-        blocks = [{"type": "text", "text": "[以下是之前对话的摘要，帮助你回忆上下文]"}]
+        blocks = [{"type": "text", "text": SUMMARY_CONTEXT_HEADER}]
         for i, part in enumerate(summary_parts):
             item = {"type": "text", "text": part}
             if i == len(summary_parts) - 1:

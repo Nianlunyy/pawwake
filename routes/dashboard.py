@@ -4,7 +4,7 @@ import os
 import re
 import secrets
 import logging
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 import httpx
 from fastapi import APIRouter, Depends, Request
@@ -128,6 +128,22 @@ def _google_model_sort_key(model):
         return (1, 0, 0, model_id)
     return (0, -int(match.group(1)), -int(match.group(2) or 0), model_id)
 
+
+def _openai_models_url(api_base_url):
+    """Derive the sibling models endpoint from an OpenAI-compatible API URL."""
+    try:
+        parsed = urlsplit(api_base_url)
+    except ValueError:
+        return None
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    path = parsed.path.rstrip("/")
+    if path.endswith("/chat/completions"):
+        path = path[:-len("/chat/completions")]
+    if not path.endswith("/models"):
+        path += "/models"
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
 @settings_router.get("/api/models")
 async def get_models():
     """获取可用模型列表（根据 API_BASE_URL 自动适配）"""
@@ -135,25 +151,10 @@ async def get_models():
         hostname = urlsplit(shared.API_BASE_URL).hostname
     except ValueError:
         hostname = None
-    is_openrouter = hostname == "openrouter.ai"
     is_google = hostname == "generativelanguage.googleapis.com"
-    is_openai = hostname == "api.openai.com"
 
     try:
-        if is_openrouter:
-            async with httpx.AsyncClient(timeout=30) as client:
-                response = await client.get(
-                    "https://openrouter.ai/api/v1/models",
-                    headers={"Authorization": f"Bearer {shared.API_KEY}"}
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    models = data.get("data", [])
-                    simplified = [{"id": m.get("id"), "name": m.get("name"), "context_length": m.get("context_length")} for m in models]
-                    simplified.sort(key=lambda x: x.get("name", ""))
-                    return {"models": simplified, "total": len(simplified), "provider": "openrouter"}
-
-        elif is_google:
+        if is_google:
             async with httpx.AsyncClient(timeout=30) as client:
                 response = await client.get(
                     "https://generativelanguage.googleapis.com/v1beta/models",
@@ -176,27 +177,31 @@ async def get_models():
                     print(f"[get_models] Google API 返回 {response.status_code}: {response.text}")
                     return {"error": f"Google API 返回 {response.status_code}", "models": [], "provider": "google"}
 
-        elif is_openai:
+        else:
+            models_url = _openai_models_url(shared.API_BASE_URL)
+            if not models_url:
+                return {"models": [], "total": 0, "provider": "unknown", "note": "API 地址无效，请手动输入模型名"}
             async with httpx.AsyncClient(timeout=30) as client:
                 response = await client.get(
-                    "https://api.openai.com/v1/models",
+                    models_url,
                     headers={"Authorization": f"Bearer {shared.API_KEY}"}
                 )
                 if response.status_code == 200:
                     data = response.json()
                     models = data.get("data", [])
                     simplified = [
-                        {"id": m.get("id", ""), "name": m.get("id", "")}
+                        {
+                            "id": m.get("id", ""),
+                            "name": m.get("name") or m.get("id", ""),
+                            "context_length": m.get("context_length"),
+                        }
                         for m in models
                         if m.get("id")
                     ]
                     simplified.sort(key=lambda x: x.get("id", ""))
-                    return {"models": simplified, "total": len(simplified), "provider": "openai"}
-                print(f"[get_models] OpenAI API 返回 {response.status_code}: {response.text}")
-                return {"error": f"OpenAI API 返回 {response.status_code}", "models": [], "provider": "openai"}
-
-        else:
-            return {"models": [], "total": 0, "provider": "unknown", "note": "未识别的 API，请手动输入模型名"}
+                    return {"models": simplified, "total": len(simplified), "provider": "openai-compatible"}
+                print(f"[get_models] OpenAI-compatible API 返回 {response.status_code}: {response.text}")
+                return {"error": f"OpenAI-compatible API 返回 {response.status_code}", "models": [], "provider": "openai-compatible"}
 
     except Exception:
         return shared._api_failure("加载模型列表失败", models=[])
