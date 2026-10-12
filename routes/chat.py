@@ -180,7 +180,7 @@ async def health_check():
 
     return {
         "status": "running",
-        "gateway": "Pawwake v4.1.7",
+        "gateway": "Pawwake v4.1.9",
         "system_prompt_loaded": len(resolved_system_prompt) > 0,
         "system_prompt_length": len(resolved_system_prompt),
         "database_enabled": shared.DATABASE_ENABLED,
@@ -197,16 +197,17 @@ async def health_check():
 @router.get("/v1/models")
 async def list_models():
     """模型列表（让客户端不报错）"""
+    models = []
+    if shared.DEFAULT_MODEL:
+        models.append({
+            "id": shared.DEFAULT_MODEL,
+            "object": "model",
+            "created": 1700000000,
+            "owned_by": "pawwake",
+        })
     return {
         "object": "list",
-        "data": [
-            {
-                "id": shared.DEFAULT_MODEL,
-                "object": "model",
-                "created": 1700000000,
-                "owned_by": "pawwake",
-            }
-        ],
+        "data": models,
     }
 
 
@@ -216,7 +217,7 @@ async def chat_completions(request: Request):
     if not shared.API_KEY:
         return JSONResponse(
             status_code=500,
-            content={"error": "API_KEY 未设置，请在环境变量中配置"},
+            content={"error": "API_KEY 未设置，请先在 Dashboard 的基础连接中配置"},
         )
 
     # 到期提醒由这条路由负责兜底：里层抛异常或非流式返回时仍未结清，就在这里交回；
@@ -239,6 +240,13 @@ async def chat_completions(request: Request):
 async def _chat_completions_inner(request: Request, pending_reminder_claims: list = None):
     body = await request.json()
     messages = body.get("messages", [])
+    model = body.get("model") or shared.DEFAULT_MODEL
+    if not model:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "模型未设置，请在请求中指定 model，或先在 Dashboard 设置默认模型"},
+        )
+    body["model"] = model
     pending_fragment_ids = []
     pending_memory_ids = []
     if pending_reminder_claims is None:
@@ -358,26 +366,6 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
                 # 重建 client_new_msgs（user此时已只剩末尾连续块，全部保回，别把拆条发送的图丢了）
                 tail_users = [m for m in client_new_msgs if m.get("role") == "user"]
                 client_new_msgs = new_tools[:] + tail_users
-
-                if new_tools:
-                    # Race condition 防护：DB的assistant(tool_calls)已确认存在（db_expecting_tool=True），
-                    # 但仍需检查是否被其他并发请求意外清除
-                    new_tool_ids = {m.get("tool_call_id") for m in new_tools if m.get("tool_call_id")}
-                    db_has_matching_ast = False
-                    for m in db_msgs:
-                        if m.get("role") == "assistant" and m.get("tool_calls"):
-                            ast_tc_ids = {tc.get("id") for tc in m["tool_calls"] if tc.get("id")}
-                            if new_tool_ids & ast_tc_ids:
-                                db_has_matching_ast = True
-                                break
-                    if not db_has_matching_ast and new_tool_ids:
-                        for m in messages:
-                            if m.get("role") == "assistant" and m.get("tool_calls"):
-                                ast_tc_ids = {tc.get("id") for tc in m["tool_calls"] if tc.get("id")}
-                                if new_tool_ids & ast_tc_ids:
-                                    client_new_msgs.insert(0, m)
-                                    print(f"⚠️ Race防护: 从客户端补充assistant(tool_calls)")
-                                    break
         all_msgs = db_msgs + client_new_msgs
         extraction_context_messages = db_extraction_msgs + [dict(m) for m in client_new_msgs]
         extraction_round_count = len(partition_engine.group_by_rounds(all_msgs))
@@ -459,25 +447,12 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
 
         body["messages"] = messages
 
-    # ---------- 模型处理 ----------
-    model = body.get("model", shared.DEFAULT_MODEL)
-    if not model:
-        model = shared.DEFAULT_MODEL
-    body["model"] = model
-
     # ---------- cache_control 兼容性处理 ----------
     if shared.CACHE_PARTITION_ENABLED and not partition_engine._is_anthropic_model(model):
         partition_engine._strip_cache_control(body.get("messages", []))
 
     # ---------- 转发请求 ----------
-    headers = {
-        "Authorization": f"Bearer {shared.API_KEY}",
-        "Content-Type": "application/json",
-    }
-    # OpenRouter 需要的额外头
-    if "openrouter" in shared.API_BASE_URL:
-        headers["HTTP-Referer"] = shared.EXTRA_REFERER
-        headers["X-Title"] = shared.EXTRA_TITLE
+    headers = shared.build_chat_completion_headers(shared.API_BASE_URL, shared.API_KEY)
     if shared.is_vertex_endpoint():
         try:
             fresh_token = shared.get_vertex_access_token()

@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 from datetime import datetime, timedelta, timezone as dt_timezone
@@ -33,6 +34,8 @@ CUPLIVO_TIMESTAMP_SUFFIX_PATTERN = re.compile(
     r'\s*\((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) \d{2}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\)\s*$'
 )
 _CONVERSATION_CANDIDATE_POOL = 20
+_CONVERSATION_KEYWORD_LIMIT = 16
+_CONVERSATION_SINGLE_CHARACTER_WEIGHT = 0.3
 
 # 中文停用词（高频但无搜索价值的词）
 _STOP_WORDS = frozenset({
@@ -147,15 +150,16 @@ def _conversation_query_terms(query: str) -> tuple[list[str], bool]:
     return sorted(set(phrases)), True
 
 
+def _quote_tsquery_lexeme(token: str) -> str:
+    return "'" + token.replace("\\", "\\\\").replace("'", "''") + "'"
+
+
 def build_tsquery(query: str) -> str:
     """把对话搜索词编码成 tsquery；未知中文词组改走精确子串后备。"""
     tokens, exact_phrase_fallback = _conversation_query_terms(query)
     if exact_phrase_fallback:
         return ""
-    escaped = [
-        "'" + token.replace("\\", "\\\\").replace("'", "''") + "'"
-        for token in tokens
-    ]
+    escaped = [_quote_tsquery_lexeme(token) for token in tokens]
     return " & ".join(escaped)
 
 
@@ -627,52 +631,152 @@ def _session_exclusion_sql(
     )
 
 
-async def _keyword_session_scores(conn, tsquery: str, keyword_terms: list[str],
-                                  pool_size: int, exclude_session_ids: list,
-                                  include_session_before: tuple | None = None):
-    if not keyword_terms:
+def _keyword_weights(tokens, total, dfs):
+    """Return the highest-IDF searchable terms, their weights, and denominator."""
+    idf = [
+        math.log((total + 1) / (df + 1)) + 1 if df > 0 else 0.0
+        for df in dfs
+    ]
+    eligible = sorted(
+        (index for index, df in enumerate(dfs) if df > 0),
+        key=lambda index: (-idf[index], index),
+    )
+    kept = sorted(eligible[:_CONVERSATION_KEYWORD_LIMIT])
+    if not kept:
+        return [], [], 0.0
+    has_multi_character_term = any(len(tokens[index]) > 1 for index in kept)
+    weights = [
+        idf[index] * (
+            _CONVERSATION_SINGLE_CHARACTER_WEIGHT
+            if has_multi_character_term and len(tokens[index]) == 1
+            else 1.0
+        )
+        for index in kept
+    ]
+    return [tokens[index] for index in kept], weights, sum(weights)
+
+
+def _keyword_score_ctes(kw, first: int, where_sql: str, use_tsv: bool):
+    """Build the shared per-message keyword score used by ranking and fragments."""
+    kept, weights, denominator = kw
+    if not kept:
+        return (
+            "kwt AS (SELECT NULL::text AS term, NULL::float8 AS weight WHERE false),\n"
+            "hits AS (SELECT c.id, c.session_id, c.created_at, 0::float8 AS score "
+            "FROM conversations c WHERE false)"
+        ), []
+    if use_tsv:
+        terms = (
+            f"kwt AS MATERIALIZED (SELECT t.term, t.weight, "
+            f"to_tsquery('simple', t.term) AS query "
+            f"FROM unnest(${first}::text[], ${first + 1}::float8[]) "
+            "AS t(term, weight))"
+        )
+        match = "c.content_tsv @@ k.query"
+    else:
+        terms = (
+            f"kwt AS MATERIALIZED (SELECT t.term, t.weight "
+            f"FROM unnest(${first}::text[], ${first + 1}::float8[]) "
+            "AS t(term, weight))"
+        )
+        match = "c.content ILIKE '%' || k.term || '%'"
+    hits = (
+        f"hits AS (SELECT c.id, c.session_id, c.created_at, "
+        f"SUM(k.weight) / NULLIF(${first + 2}::float8, 0) AS score "
+        f"FROM conversations c JOIN kwt k ON {match} "
+        f"WHERE {where_sql} GROUP BY c.id, c.session_id, c.created_at)"
+    )
+    query_terms = (
+        [_quote_tsquery_lexeme(term) for term in kept]
+        if use_tsv
+        else list(kept)
+    )
+    return f"{terms},\n{hits}", [
+        query_terms,
+        [float(weight) for weight in weights],
+        float(denominator),
+    ]
+
+
+async def _keyword_weights_for(conn, tokens: list[str], use_tsv: bool):
+    """Calculate IDF over active searchable conversation messages."""
+    if not tokens:
+        return [], [], 0.0
+    if use_tsv:
+        searchable = "deleted_at IS NULL AND content_tsv IS NOT NULL"
+        matches = [
+            f"content_tsv @@ to_tsquery('simple', ${index + 1})"
+            for index in range(len(tokens))
+        ]
+    else:
+        searchable = (
+            "deleted_at IS NULL AND content IS NOT NULL "
+            "AND content !~ '^\\s*$'"
+        )
+        matches = [
+            f"content ILIKE '%' || ${index + 1} || '%'"
+            for index in range(len(tokens))
+        ]
+    df_columns = ", ".join(
+        f"(SELECT COUNT(*) FROM conversations WHERE {searchable} "
+        f"AND {match}) AS df_{index}"
+        for index, match in enumerate(matches)
+    )
+    query_terms = (
+        [_quote_tsquery_lexeme(token) for token in tokens]
+        if use_tsv
+        else tokens
+    )
+    rows = await conn.fetch(
+        f"""SELECT (SELECT COUNT(*) FROM conversations
+                    WHERE {searchable}) AS total,
+                   {df_columns}""",
+        *query_terms,
+    )
+    if not rows:
+        return [], [], 0.0
+    row = rows[0]
+    return _keyword_weights(
+        tokens,
+        row["total"],
+        [row[f"df_{index}"] for index in range(len(tokens))],
+    )
+
+
+async def _keyword_session_scores(conn, kw, pool_size: int,
+                                  exclude_session_ids: list,
+                                  include_session_before: tuple | None = None,
+                                  use_tsv: bool = True):
+    if not kw[0]:
         return {}
 
-    if not tsquery or not await _conversation_tsv_ready(conn):
-        conditions = [
-            f"content ILIKE '%' || ${index + 1} || '%'"
-            for index in range(len(keyword_terms))
-        ]
-        params = list(keyword_terms)
-        exclusion_sql, exclusion_params = _session_exclusion_sql(
-            exclude_session_ids, len(params) + 1, include_session_before
-        )
-        params.extend(exclusion_params)
-        rows = await conn.fetch(
-            f"""SELECT session_id, COUNT(*)::float AS score,
-                       MAX(created_at) AS latest_match
-                FROM conversations
-                WHERE deleted_at IS NULL
-                  AND ({' AND '.join(conditions)}) {exclusion_sql}
-                GROUP BY session_id
-                ORDER BY score DESC
-                LIMIT {int(pool_size)}""",
-            *params,
-        )
-    else:
-        params = [tsquery]
-        exclusion_sql, exclusion_params = _session_exclusion_sql(
-            exclude_session_ids, len(params) + 1, include_session_before
-        )
-        params.extend(exclusion_params)
-        params.append(pool_size)
-        rows = await conn.fetch(
-            f"""SELECT session_id,
-                       MAX(ts_rank(content_tsv, $1::tsquery, 2)) AS score,
-                       MAX(created_at) AS latest_match
-                FROM conversations
-                WHERE deleted_at IS NULL
-                  AND content_tsv @@ $1::tsquery {exclusion_sql}
-                GROUP BY session_id
-                ORDER BY score DESC
-                LIMIT ${len(params)}""",
-            *params,
-        )
+    exclusion_sql, exclusion_params = _session_exclusion_sql(
+        exclude_session_ids, 4, include_session_before
+    )
+    ctes, params = _keyword_score_ctes(
+        kw,
+        1,
+        f"c.deleted_at IS NULL {exclusion_sql}",
+        use_tsv,
+    )
+    params.extend(exclusion_params)
+    params.append(pool_size)
+    rows = await conn.fetch(
+        f"""WITH {ctes},
+            best AS (
+                SELECT DISTINCT ON (session_id) session_id, score,
+                       created_at AS anchor_at,
+                       MAX(created_at) OVER (PARTITION BY session_id) AS latest_match
+                FROM hits
+                WHERE score > 0
+                ORDER BY session_id, score DESC, created_at DESC, id DESC
+            )
+            SELECT session_id, score, latest_match
+            FROM best
+            ORDER BY score DESC, anchor_at DESC, session_id
+            LIMIT ${len(params)}""",
+        *params,
+    )
     return {
         row["session_id"]: {
             "score": float(row["score"]),
@@ -762,6 +866,30 @@ async def _semantic_session_scores(conn, query_embedding: list, pool_size: int,
     )
 
 
+def _mark_conversation_message(message, keyword_score: float,
+                               semantic_similarity: float, mode: str):
+    """Mark a fragment anchor with the same keyword score used for session ranking."""
+    threshold = shared.CONVERSATION_MIN_SCORE_THRESHOLD
+    span = 1 - threshold
+    semantic_part = (
+        min(1.0, max(0.0, (semantic_similarity - threshold) / span))
+        if span > 0
+        else 0.0
+    )
+    semantic_match = mode == "hybrid" and semantic_similarity >= threshold
+    is_match = keyword_score > 0 or semantic_match
+    return {
+        "id": message["id"],
+        "is_match": is_match,
+        "relevance": (
+            shared.CONVERSATION_HW_KEYWORD * keyword_score
+            + shared.CONVERSATION_HW_SEMANTIC * semantic_part
+            if is_match
+            else 0.0
+        ),
+    }
+
+
 async def search_chat_fragments(
     query: str,
     max_sessions: int = 3,
@@ -789,8 +917,7 @@ async def search_chat_fragments(
     max_matches_per_session = min(5, max(1, int(max_matches_per_session)))
     context = min(5, max(0, int(context)))
 
-    keyword_terms, _ = _conversation_query_terms(query)
-    tsquery = build_tsquery(query)
+    keyword_terms, exact_phrase_fallback = _conversation_query_terms(query)
     query_embedding = (
         await get_query_embedding(query)
         if mode == "hybrid" and shared.EMBEDDING_API_KEY
@@ -799,13 +926,15 @@ async def search_chat_fragments(
     pool_size = max(_CONVERSATION_CANDIDATE_POOL, max_sessions * 3)
     pool = await db_core.get_pool()
     async with pool.acquire() as conn:
+        use_tsv = await _conversation_tsv_ready(conn) and not exact_phrase_fallback
+        keyword_weights = await _keyword_weights_for(conn, keyword_terms, use_tsv)
         keyword_scores = await _keyword_session_scores(
             conn,
-            tsquery,
-            keyword_terms,
+            keyword_weights,
             pool_size,
             exclude_session_ids,
             include_session_before=include_session_before,
+            use_tsv=use_tsv,
         )
         semantic_scores = (
             await _semantic_session_scores(
@@ -823,9 +952,9 @@ async def search_chat_fragments(
     if not session_ids:
         return [], 0
 
-    keyword_normalized = _min_max_normalize({
+    keyword_coverage = {
         session_id: item["score"] for session_id, item in keyword_scores.items()
-    })
+    }
     semantic_normalized = _min_max_normalize({
         session_id: item["score"] for session_id, item in semantic_scores.items()
     })
@@ -845,143 +974,184 @@ async def search_chat_fragments(
     recency_normalized = _min_max_normalize(recency)
 
     if mode == "keyword":
-        final_scores = keyword_normalized
+        final_scores = keyword_coverage
     else:
         final_scores = {
             session_id: (
-                shared.CONVERSATION_HW_KEYWORD * keyword_normalized.get(session_id, 0.0)
+                shared.CONVERSATION_HW_KEYWORD * keyword_coverage.get(session_id, 0.0)
                 + shared.CONVERSATION_HW_SEMANTIC * semantic_normalized.get(session_id, 0.0)
                 + shared.CONVERSATION_HW_RECENCY * recency_normalized.get(session_id, 0.0)
             )
             for session_id in session_ids
         }
-    ranked = sorted(final_scores.items(), key=lambda item: -item[1])
+    ranked = sorted(final_scores.items(), key=lambda item: (-item[1], item[0]))
 
     vector_text = None
     if db_core.HAS_PGVECTOR and query_embedding:
         vector_text = "[" + ",".join(str(value) for value in query_embedding) + "]"
-    results = []
+    plans = []
     async with pool.acquire() as conn:
-        for session_id, final_score in ranked:
-            if len(results) >= max_sessions:
+        for offset in range(0, len(ranked), max_sessions):
+            if len(plans) >= max_sessions:
                 break
+            batch = ranked[offset:offset + max_sessions]
+            batch_session_ids = [session_id for session_id, _ in batch]
+            keyword_ctes, keyword_args = _keyword_score_ctes(
+                keyword_weights,
+                2,
+                "c.session_id = ANY($1::text[]) AND c.deleted_at IS NULL",
+                use_tsv,
+            )
+            params = [batch_session_ids, *keyword_args]
             if db_core.HAS_PGVECTOR and vector_text:
-                params = [session_id, vector_text]
-                prefix_sql = ""
-                if include_session_before and session_id == include_session_before[0]:
-                    prefix_sql = " AND (created_at, id) <= ($3::timestamptz, $4::integer)"
-                    params.extend(include_session_before[1:])
-                messages = await conn.fetch(
-                    f"""SELECT id, role, content, created_at,
-                              CASE WHEN embedding IS NOT NULL
-                                   THEN 1 - (embedding <=> $2::vector)
-                                   ELSE 0 END AS sem_sim
-                       FROM conversations
-                       WHERE session_id = $1 AND deleted_at IS NULL
-                         {prefix_sql}
-                       ORDER BY created_at ASC, id ASC""",
-                    *params,
-                )
+                params.append(vector_text)
+                detail_column = f"""CASE WHEN c.embedding IS NOT NULL
+                                          THEN 1 - (c.embedding <=> ${len(params)}::vector)
+                                          ELSE 0 END AS sem_sim"""
             else:
-                embedding_column = "embedding_json" if not db_core.HAS_PGVECTOR else "NULL::text"
-                params = [session_id]
-                prefix_sql = ""
-                if include_session_before and session_id == include_session_before[0]:
-                    prefix_sql = " AND (created_at, id) <= ($2::timestamptz, $3::integer)"
-                    params.extend(include_session_before[1:])
-                messages = await conn.fetch(
-                    f"""SELECT id, role, content, created_at,
-                               {embedding_column} AS embedding_json
-                        FROM conversations
-                        WHERE session_id = $1 AND deleted_at IS NULL
+                embedding_column = (
+                    "c.embedding_json" if not db_core.HAS_PGVECTOR else "NULL::text"
+                )
+                detail_column = f"{embedding_column} AS embedding_json"
+            prefix_sql = ""
+            if include_session_before:
+                params.extend(include_session_before)
+                prefix_sql = (
+                    f" AND (c.session_id <> ${len(params) - 2} "
+                    f"OR (c.created_at, c.id) <= "
+                    f"(${len(params) - 1}::timestamptz, ${len(params)}::integer))"
+                )
+            messages = await conn.fetch(
+                f"""WITH {keyword_ctes}
+                    SELECT c.session_id, c.id,
+                           COALESCE(h.score, 0) AS keyword_score,
+                           {detail_column}
+                    FROM conversations c LEFT JOIN hits h ON h.id = c.id
+                    WHERE c.session_id = ANY($1::text[]) AND c.deleted_at IS NULL
                           {prefix_sql}
-                        ORDER BY created_at ASC, id ASC""",
-                    *params,
-                )
-
-            marked = []
+                    ORDER BY c.session_id, c.created_at ASC, c.id ASC""",
+                *params,
+            )
+            messages_by_session = {}
             for message in messages:
-                lowered = (message["content"] or "").lower()
-                keyword_match = bool(keyword_terms) and all(
-                    term.lower() in lowered for term in keyword_terms
-                )
-                semantic_similarity = 0.0
-                if db_core.HAS_PGVECTOR and vector_text:
-                    semantic_similarity = float(message["sem_sim"] or 0)
-                elif query_embedding and message["embedding_json"]:
-                    try:
-                        semantic_similarity = _cosine_sim(
-                            query_embedding, json.loads(message["embedding_json"])
-                        )
-                    except Exception:
-                        semantic_similarity = 0.0
-                semantic_match = (
-                    mode == "hybrid"
-                    and semantic_similarity >= shared.CONVERSATION_MIN_SCORE_THRESHOLD
-                )
-                marked.append({
-                    "id": message["id"],
-                    "role": message["role"],
-                    "content": message["content"] or "",
-                    "created_at": message["created_at"],
-                    "is_match": keyword_match or semantic_match,
-                    "relevance": 1.0 if keyword_match else semantic_similarity,
+                messages_by_session.setdefault(message["session_id"], []).append(message)
+
+            for session_id, final_score in batch:
+                if len(plans) >= max_sessions:
+                    break
+                marked = []
+                for message in messages_by_session.get(session_id, []):
+                    keyword_score = float(message["keyword_score"] or 0.0)
+                    semantic_similarity = 0.0
+                    if db_core.HAS_PGVECTOR and vector_text:
+                        semantic_similarity = float(message["sem_sim"] or 0)
+                    elif query_embedding and message["embedding_json"]:
+                        try:
+                            semantic_similarity = _cosine_sim(
+                                query_embedding, json.loads(message["embedding_json"])
+                            )
+                        except Exception:
+                            semantic_similarity = 0.0
+                    marked.append(_mark_conversation_message(
+                        message,
+                        keyword_score,
+                        semantic_similarity,
+                        mode,
+                    ))
+
+                match_candidates = [
+                    (index, item["relevance"])
+                    for index, item in enumerate(marked)
+                    if item["is_match"]
+                ]
+                match_candidates.sort(key=lambda item: -item[1])
+                if not match_candidates:
+                    continue
+                total_matched = len(match_candidates)
+                kept = []
+                used_context_indices = set()
+                for match_index, _ in match_candidates:
+                    context_indices = set(range(
+                        max(0, match_index - context),
+                        min(len(marked), match_index + context + 1),
+                    ))
+                    if disjoint_fragments and used_context_indices & context_indices:
+                        continue
+                    fragment_id = _fragment_id([marked[match_index]["id"]])
+                    if not fragment_id or fragment_id in excluded_fragments:
+                        continue
+                    kept.append((
+                        sorted(context_indices),
+                        {match_index},
+                        fragment_id,
+                        [marked[index]["id"] for index in sorted(context_indices)],
+                    ))
+                    used_context_indices.update(context_indices)
+                    if len(kept) >= max_matches_per_session:
+                        break
+                if not kept:
+                    continue
+                plans.append({
+                    "session_id": session_id,
+                    "title": session_id,
+                    "total_messages": len(marked),
+                    "match_count": total_matched,
+                    "kept": kept,
+                    "has_more_matches": total_matched > len(kept),
+                    "hybrid_scores": {
+                        "kw_raw": round(
+                            keyword_scores.get(session_id, {}).get("score", 0.0), 6
+                        ),
+                        "kw": round(keyword_coverage.get(session_id, 0.0), 3),
+                        "sem_raw": round(
+                            semantic_scores.get(session_id, {}).get("score", 0.0), 6
+                        ),
+                        "sem": round(semantic_normalized.get(session_id, 0.0), 3),
+                        "rec": round(recency_normalized.get(session_id, 0.0), 3),
+                        "final": round(final_score, 3),
+                    },
                 })
 
-            match_candidates = [
-                (index, item["relevance"])
-                for index, item in enumerate(marked)
-                if item["is_match"]
-            ]
-            match_candidates.sort(key=lambda item: -item[1])
-            if not match_candidates:
-                continue
-            total_matched = len(match_candidates)
-            kept = []
-            used_context_indices = set()
-            for match_index, _ in match_candidates:
-                context_indices = set(range(
-                    max(0, match_index - context),
-                    min(len(marked), match_index + context + 1),
-                ))
-                if disjoint_fragments and used_context_indices & context_indices:
-                    continue
-                fragments, fragment_ids = _assemble_fragments(
-                    marked, sorted(context_indices), {match_index}
-                )
-                fragment_id = fragment_ids[0] if fragment_ids else None
-                if not fragment_id or fragment_id in excluded_fragments:
-                    continue
-                kept.append((
-                    fragments[0],
-                    fragment_id,
-                    [marked[index]["id"] for index in sorted(context_indices)],
-                ))
-                used_context_indices.update(context_indices)
-                if len(kept) >= max_matches_per_session:
-                    break
-            if not kept:
-                continue
-            result = {
-                "session_id": session_id,
-                "title": session_id,
-                "total_messages": len(marked),
-                "match_count": total_matched,
-                "fragments": [item[0] for item in kept],
-                "fragment_ids": [item[1] for item in kept],
-                "has_more_matches": total_matched > len(kept),
-                "hybrid_scores": {
-                    "kw_raw": round(keyword_scores.get(session_id, {}).get("score", 0.0), 6),
-                    "kw": round(keyword_normalized.get(session_id, 0.0), 3),
-                    "sem_raw": round(semantic_scores.get(session_id, {}).get("score", 0.0), 6),
-                    "sem": round(semantic_normalized.get(session_id, 0.0), 3),
-                    "rec": round(recency_normalized.get(session_id, 0.0), 3),
-                    "final": round(final_score, 3),
-                },
+        needed_ids = sorted({
+            message_id
+            for plan in plans
+            for _, _, _, message_ids in plan["kept"]
+            for message_id in message_ids
+        })
+        detail_rows = await conn.fetch(
+            """SELECT id, role, LEFT(content, 201) AS content, created_at
+               FROM conversations
+               WHERE id = ANY($1::int[]) AND deleted_at IS NULL""",
+            needed_ids,
+        ) if needed_ids else []
+        details = {row["id"]: row for row in detail_rows}
+
+    results = []
+    for plan in plans:
+        selected_ids = [
+            message_id
+            for _, _, _, message_ids in plan["kept"]
+            for message_id in message_ids
+        ]
+        if any(message_id not in details for message_id in selected_ids):
+            continue
+        fragments = []
+        fragment_ids = []
+        fragment_message_ids = []
+        for indices, matched_indices, fragment_id, message_ids in plan.pop("kept"):
+            messages = {
+                index: details[message_id]
+                for index, message_id in zip(indices, message_ids)
             }
-            if include_message_ids:
-                result["fragment_message_ids"] = [item[2] for item in kept]
-            results.append(result)
+            piece_fragments, _ = _assemble_fragments(messages, indices, matched_indices)
+            fragments.extend(piece_fragments)
+            fragment_ids.append(fragment_id)
+            fragment_message_ids.append(message_ids)
+        plan["fragments"] = fragments
+        plan["fragment_ids"] = fragment_ids
+        if include_message_ids:
+            plan["fragment_message_ids"] = fragment_message_ids
+        results.append(plan)
 
     return results, len(results)
 

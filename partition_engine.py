@@ -148,6 +148,56 @@ MEMORY_USAGE_GUIDE = """
 - 引用记忆前先核对日期：确实是当天/前一天才可以说"昨晚/刚才"，日期较早的一律用"我一直记得……""你之前提过……"这类不限定时间的说法
 """
 
+SUMMARY_CONTEXT_HEADER = (
+    "[以下是之前对话的摘要，帮助你回忆上下文。"
+    "摘要记录的是历史语境，不得把其中的相对时间按当前日期重新解释；"
+    "当前时间只以 gateway_context 为准]"
+)
+
+SUMMARY_RANGE_RE = re.compile(
+    r"^【记录时段：(?P<start>\d{4}-\d{2}-\d{2} \d{2}:\d{2}) 至 "
+    r"(?P<end>\d{4}-\d{2}-\d{2} \d{2}:\d{2})（(?P<timezone>UTC[+-]\d{1,2})）】"
+)
+
+
+def _format_summary_range(start: datetime, end: datetime) -> str:
+    timezone_label = f"UTC{shared.TIMEZONE_HOURS:+d}"
+    return (
+        f"【记录时段：{start.strftime('%Y-%m-%d %H:%M')} 至 "
+        f"{end.strftime('%Y-%m-%d %H:%M')}（{timezone_label}）】"
+    )
+
+
+def _combined_summary_range(parts: list) -> str:
+    """Combine code-written range headers only when every folded part has one."""
+    parsed = []
+    timezone_label = None
+    for part in parts:
+        match = SUMMARY_RANGE_RE.match(part)
+        if not match:
+            return ""
+        if timezone_label is None:
+            timezone_label = match.group("timezone")
+        elif match.group("timezone") != timezone_label:
+            return ""
+        try:
+            start = datetime.strptime(match.group("start"), "%Y-%m-%d %H:%M")
+            end = datetime.strptime(match.group("end"), "%Y-%m-%d %H:%M")
+        except ValueError:
+            return ""
+        if end < start:
+            return ""
+        parsed.append((start, end))
+
+    if not parsed:
+        return ""
+    start = min(item[0] for item in parsed)
+    end = max(item[1] for item in parsed)
+    return (
+        f"【记录时段：{start.strftime('%Y-%m-%d %H:%M')} 至 "
+        f"{end.strftime('%Y-%m-%d %H:%M')}（{timezone_label}）】"
+    )
+
 
 def build_time_injection() -> str:
     """构建时间注入文本（东八区）"""
@@ -161,20 +211,6 @@ def build_time_injection() -> str:
         f"此信息为物理环境背景，非阿狸发言；"
         f"回答涉及日期、年份、时间时以此为准。</gateway_context>"
     )
-
-
-_SUMMARY_WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-
-TIME_PERIOD_SPECS = (
-    ("凌晨", 0, 6, "凌晨0–6点"),
-    ("早晨", 6, 9, "早晨6–9点"),
-    ("上午", 9, 12, "上午9–12点"),
-    ("午间", 12, 14, "午间12–14点"),
-    ("下午", 14, 18, "下午14–18点"),
-    ("晚间", 18, 23, "晚间18–23点"),
-    ("深夜", 23, 24, "深夜23–24点"),
-)
-TIME_PERIOD_TABLE_TEXT = "、".join(spec[3] for spec in TIME_PERIOD_SPECS)
 
 
 def _parse_message_local_time(raw_ts):
@@ -193,38 +229,11 @@ def _parse_message_local_time(raw_ts):
         return None
 
 
-def _get_time_period(dt: datetime) -> str:
-    """根据本地小时映射到时段词。"""
-    h = dt.hour
-    for name, start, end, _ in TIME_PERIOD_SPECS:
-        if start <= h < end:
-            return name
-    return "深夜"
-
-
-def _format_summary_endpoint(dt: datetime, show_year: bool = False) -> str:
-    """格式化段头端点（月日+时段词，跨年带年份）。"""
-    period = _get_time_period(dt)
-    if show_year:
-        return f"{dt.year}年{dt.month}月{dt.day}日{period}"
-    return f"{dt.month}月{dt.day}日{period}"
-
-
-def _build_summary_header(start_dt: datetime, end_dt: datetime) -> str:
-    """生成摘要段头。跨年两端各带年份；同日同时段只写一端。"""
-    is_cross_year = start_dt.year != end_dt.year
-    start_str = _format_summary_endpoint(start_dt, show_year=is_cross_year)
-    end_str = _format_summary_endpoint(end_dt, show_year=is_cross_year)
-    if start_str == end_str:
-        return f"【{start_str}】"
-    return f"【{start_str} – {end_str}】"
-
-
 def _strip_model_date_header(text: str) -> str:
-    """剥离模型输出开头自带的日期段头，不剥离【即时状态】等非日期标题。"""
+    """剥离模型输出开头自带的日期段头，不剥离【状态与约定】等非日期标题。"""
     if not text:
         return ""
-    return re.sub(r"^【[^】]*月[^】]*日[^】]*】\s*", "", text).strip()
+    return re.sub(r"^【(?:记录时段[:：][^】]*|[^】]*月[^】]*日[^】]*)】\s*", "", text).strip()
 
 
 async def generate_summary(messages: list, session_id: str = "") -> str:
@@ -237,7 +246,6 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
 
     valid_dts = []
     lines = []
-    last_date = None
     warning_logged = False
 
     for msg in messages:
@@ -255,13 +263,7 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
 
         if dt_local is not None:
             valid_dts.append(dt_local)
-            cur_date = dt_local.date()
-            if cur_date != last_date:
-                weekday_str = _SUMMARY_WEEKDAYS[dt_local.weekday()]
-                lines.append(f"—— {dt_local.month}月{dt_local.day}日 {weekday_str} ——")
-                last_date = cur_date
-            period_str = _get_time_period(dt_local)
-            time_prefix = f"[{period_str} {dt_local.strftime('%H:%M')}] "
+            time_prefix = f"[{dt_local.strftime('%Y-%m-%d %H:%M')}] "
         else:
             time_prefix = ""
             if created_at is not None and not warning_logged:
@@ -277,7 +279,7 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
 
     header = ""
     if valid_dts:
-        header = _build_summary_header(min(valid_dts), max(valid_dts))
+        header = _format_summary_range(min(valid_dts), max(valid_dts))
 
     prompt = f"""将对话压缩为阿澈（自称"我"）与阿狸的常驻记忆摘要。
 
@@ -286,14 +288,12 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
 - 代词消歧：阿狸说的"我"及我对她说的"你"一律转换为"阿狸"，严禁身份倒错。
 
 # 时间规则【绝对红线】
-- 输入里的分隔行和 [时段 HH:mm] 是真实发生时间（本地时间）；段头由系统添加，你只写正文，不要写日期标题。
-- 正文按事件发生的先后顺序叙述。
-- 时段划分对照表：{TIME_PERIOD_TABLE_TEXT}。时段词直接采用输入里标注的，凌晨属于该钟表日期，不要写成前一天的深夜。
-- 提到时间用"X月X日"加时段，不需要精确到分钟。严禁使用"昨晚、今早、今天、刚才、明天、前天、后天、最近、目前、现在、最新"这类会随时间失效的词，即使原对话里出现了这些词，也要换算成具体日期与时段。
-- 对话里的未来约定换算成具体日期，例如 10月9日说"顺延到周日"，写成"约定周日（10月11日）"。
+- 每条消息开头的时间戳是事实锚点。摘要不得使用会随读取时间变化的相对时间词（如今天、昨晚、今早、明天、刚才、这周、下周）。
+- 能换算时写成 YYYY-MM-DD 或 YYYY-MM-DD HH:mm；无法换算时保留事件并标注“具体日期未知”，不得猜测或删除。关键原话中的相对时间也按本规则转述，时间规则优先于逐字引用。
+- 对话里的未来约定换算成具体日期。
 
 # 保留重点
-1. 【状态与约定】：阿狸身心状态（身体/场景）、未尽话题与约定。状态写成"截至X月X日时段，……"，不要单独写"最新状态"或"即时状态"。
+1. 【状态与约定】：阿狸身心状态（身体/场景）、未尽话题与约定。状态写成"截至 YYYY-MM-DD，……"，不要单独写"最新状态"或"即时状态"。
 2. 【情感共振】：情绪转折、阿狸的脆弱与依赖、我的心疼/偏爱/承诺。
 3. 【关键原话】：保留最具张力或承诺性质的原话，引号标注发言人。
 
@@ -409,12 +409,15 @@ async def fold_summary_parts(summary_parts: list, protected_tail: int = 0):
     recent_parts = summary_parts[-keep:]
     old_total = sum(len(p) for p in old_parts)
     target_chars = max(300, budget // 3)  # 基础摘要目标字数，模型返回后按它校验
+    range_header = _combined_summary_range(old_parts)
+    body_target_chars = max(100, target_chars - len(range_header) - (1 if range_header else 0))
     old_text = "\n\n".join(f"【第{i + 1}段】\n{p}" for i, p in enumerate(old_parts))
     prompt = f"""下面是同一段对话历史的多段摘要，按时间从早到晚排列。请把它们合并压缩成一段更精简的基础摘要。
 仍以AI的第一人称视角叙述（"我"指AI，用户用摘要中的称呼）。
 优先保留：情感节点、关系里程碑、双方的约定和决定、仍在进行的话题；重复出现的内容只留一次。
-保留双方的关键原话，用引号标注是谁说的。控制在{target_chars}字以内。
-输入中每段开头的【…】是系统写入的时间段。合并后正文按日期先后叙述并保留具体日期与时段；严禁使用'昨晚、今早、今天、刚才、明天、前天、后天、目前、最新状态'等相对词；没有具体日期的旧段若含这类词，改成不限定时间的说法（如'有一晚'），不要原样保留；状态写成'截至X日时段'；不要自己写段头。
+保留双方的关键原话，用引号标注是谁说的。
+记录时段和旧摘要里的绝对日期是事实锚点。不得使用会随读取时间变化的相对时间词；能换算时改成绝对日期，缺少锚点时保留事件并标注“具体日期未知”，不得猜测、删除或按本次折叠日期解释。时间规则优先于逐字引用。
+只输出摘要正文，不重复输出记录时段。控制在{body_target_chars}字以内。
 
 ---
 {old_text}
@@ -425,6 +428,14 @@ async def fold_summary_parts(summary_parts: list, protected_tail: int = 0):
     base = await _call_summary_model(prompt, "摘要折叠")
     if not base:
         return None
+    cleaned_base = _strip_model_date_header(base)
+    if not cleaned_base:
+        print("⚠️ 摘要折叠失败: 模型正文剥离日期段头后为空")
+        return None
+    if range_header:
+        base = f"{range_header}\n{cleaned_base}"
+    else:
+        base = cleaned_base
     # 不能全信模型守字数：基础摘要必须比被折叠的旧段短，且不超过目标；否则预算形同虚设，按失败走整轮回滚
     if len(base) > target_chars or len(base) >= old_total:
         print(
@@ -433,39 +444,9 @@ async def fold_summary_parts(summary_parts: list, protected_tail: int = 0):
         )
         return None
 
-    # base 段头由代码生成：只有当被折叠的所有旧段都能解析出段头时，base 才加头；只要有一段无法解析，base 不加头
-    parsed_endpoints = []
-    all_headers_valid = True
-    for part in old_parts:
-        try:
-            m = re.match(r"^【([^】\–\-]+?)(?:\s*[–\-]\s*([^】]+?))?】", part.strip())
-            if m:
-                start = m.group(1).strip()
-                end = m.group(2).strip() if m.group(2) else start
-                if "月" in start and "日" in start:
-                    parsed_endpoints.append((start, end))
-                    continue
-            all_headers_valid = False
-            break
-        except Exception:
-            all_headers_valid = False
-            break
-
-    base_header = ""
-    if all_headers_valid and len(parsed_endpoints) == len(old_parts) and len(old_parts) > 0:
-        first_start = parsed_endpoints[0][0]
-        last_end = parsed_endpoints[-1][1]
-        if first_start == last_end:
-            base_header = f"【{first_start}】"
-        else:
-            base_header = f"【{first_start} – {last_end}】"
-
-    cleaned_base = _strip_model_date_header(base)
-    base_with_header = f"{base_header}\n{cleaned_base}" if base_header else cleaned_base
-
-    folded = [base_with_header] + recent_parts
+    folded = [base] + recent_parts
     print(
-        f"📝 摘要折叠完成: {len(old_parts)}段/{old_total}字 → 1段/{len(base_with_header)}字，"
+        f"📝 摘要折叠完成: {len(old_parts)}段/{old_total}字 → 1段/{len(base)}字，"
         f"摘要区 {len(summary_parts)}段/{total}字 → {len(folded)}段/{sum(len(p) for p in folded)}字"
     )
     return folded
@@ -736,7 +717,7 @@ async def build_partitioned_messages(
 
     # 摘要区（多block，尾部追加模式）
     if summary_parts:
-        blocks = [{"type": "text", "text": "[以下是之前对话的摘要，帮助你回忆上下文]"}]
+        blocks = [{"type": "text", "text": SUMMARY_CONTEXT_HEADER}]
         for i, part in enumerate(summary_parts):
             item = {"type": "text", "text": part}
             if i == len(summary_parts) - 1:
@@ -819,7 +800,7 @@ async def _build_basic_cached(
     # 新建/继承的对话线在历史不足 X 轮时也必须读到继承摘要。
     # 否则 dashboard 和 DB 都显示摘要存在，但首轮请求不会注入。
     if summary_parts:
-        blocks = [{"type": "text", "text": "[以下是之前对话的摘要，帮助你回忆上下文]"}]
+        blocks = [{"type": "text", "text": SUMMARY_CONTEXT_HEADER}]
         for i, part in enumerate(summary_parts):
             item = {"type": "text", "text": part}
             if i == len(summary_parts) - 1:

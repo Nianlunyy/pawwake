@@ -1,9 +1,10 @@
 """Dashboard pages, model listing, and runtime settings."""
 
 import os
+import re
 import secrets
 import logging
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 import httpx
 from fastapi import APIRouter, Depends, Request
@@ -119,34 +120,47 @@ async def dashboard_page(request: Request):
 # 设置面板的 combo-box 用，根据 API_BASE_URL 自动适配
 # ============================================================
 
+def _google_model_sort_key(model):
+    """Put versioned Gemini models first, newest major/minor version first."""
+    model_id = model.get("id", "")
+    match = re.search(r"(?:^|/)gemini-(\d+)(?:\.(\d+))?", model_id)
+    if not match:
+        return (1, 0, 0, model_id)
+    return (0, -int(match.group(1)), -int(match.group(2) or 0), model_id)
+
+
+def _openai_models_url(api_base_url):
+    """Derive the sibling models endpoint from an OpenAI-compatible API URL."""
+    try:
+        parsed = urlsplit(api_base_url)
+    except ValueError:
+        return None
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    path = parsed.path.rstrip("/")
+    if path.endswith("/chat/completions"):
+        path = path[:-len("/chat/completions")]
+    if not path.endswith("/models"):
+        path += "/models"
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
 @settings_router.get("/api/models")
 async def get_models():
     """获取可用模型列表（根据 API_BASE_URL 自动适配）"""
-    is_vertex = shared.is_vertex_endpoint()
-    is_openrouter = "openrouter.ai" in shared.API_BASE_URL
-    is_google = not is_vertex and ("googleapis.com" in shared.API_BASE_URL or "generativelanguage" in shared.API_BASE_URL)
-    is_openai = "api.openai.com" in shared.API_BASE_URL
+    try:
+        hostname = urlsplit(shared.API_BASE_URL).hostname
+    except ValueError:
+        hostname = None
+    is_google = hostname == "generativelanguage.googleapis.com"
 
     try:
-        if is_vertex:
+        if shared.is_vertex_endpoint():
             return {"models": [], "total": 0, "provider": "vertex", "note": "Vertex AI 暂不支持动态拉取模型列表，请手动输入模型名"}
-        elif is_openrouter:
+        if is_google:
             async with httpx.AsyncClient(timeout=30) as client:
                 response = await client.get(
-                    "https://openrouter.ai/api/v1/models",
-                    headers={"Authorization": f"Bearer {shared.API_KEY}"}
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    models = data.get("data", [])
-                    simplified = [{"id": m.get("id"), "name": m.get("name"), "context_length": m.get("context_length")} for m in models]
-                    simplified.sort(key=lambda x: x.get("name", ""))
-                    return {"models": simplified, "total": len(simplified), "provider": "openrouter"}
-
-        elif is_google:
-            async with httpx.AsyncClient(timeout=30) as client:
-                response = await client.get(
-                    f"https://generativelanguage.googleapis.com/v1beta/models?key={shared.API_KEY}"
+                    "https://generativelanguage.googleapis.com/v1beta/models",
+                    params={"key": shared.API_KEY, "pageSize": 1000},
                 )
                 if response.status_code == 200:
                     data = response.json()
@@ -159,40 +173,37 @@ async def get_models():
                         supported_methods = m.get("supportedGenerationMethods", [])
                         if "generateContent" in supported_methods:
                             simplified.append({"id": model_id, "name": display_name, "context_length": m.get("inputTokenLimit"), "output_limit": m.get("outputTokenLimit")})
-                    def sort_key(x):
-                        name = x.get("id", "")
-                        if "gemini-3" in name: return "0" + name
-                        elif "gemini-2.5" in name: return "1" + name
-                        elif "gemini-2.0" in name: return "2" + name
-                        else: return "9" + name
-                    simplified.sort(key=sort_key)
+                    simplified.sort(key=_google_model_sort_key)
                     return {"models": simplified, "total": len(simplified), "provider": "google"}
                 else:
                     print(f"[get_models] Google API 返回 {response.status_code}: {response.text}")
                     return {"error": f"Google API 返回 {response.status_code}", "models": [], "provider": "google"}
 
-        elif is_openai:
+        else:
+            models_url = _openai_models_url(shared.API_BASE_URL)
+            if not models_url:
+                return {"models": [], "total": 0, "provider": "unknown", "note": "API 地址无效，请手动输入模型名"}
             async with httpx.AsyncClient(timeout=30) as client:
                 response = await client.get(
-                    "https://api.openai.com/v1/models",
+                    models_url,
                     headers={"Authorization": f"Bearer {shared.API_KEY}"}
                 )
                 if response.status_code == 200:
                     data = response.json()
                     models = data.get("data", [])
-                    simplified = [{"id": m.get("id", ""), "name": m.get("id", "")} for m in models if m.get("id", "").startswith(("gpt-", "o1", "o3", "o4"))]
+                    simplified = [
+                        {
+                            "id": m.get("id", ""),
+                            "name": m.get("name") or m.get("id", ""),
+                            "context_length": m.get("context_length"),
+                        }
+                        for m in models
+                        if m.get("id")
+                    ]
                     simplified.sort(key=lambda x: x.get("id", ""))
-                    return {"models": simplified, "total": len(simplified), "provider": "openai"}
-            openai_models = [
-                {"id": "gpt-4.1", "name": "GPT-4.1"},
-                {"id": "gpt-4o", "name": "GPT-4o"},
-                {"id": "gpt-4o-mini", "name": "GPT-4o Mini"},
-                {"id": "o3-mini", "name": "o3-mini"},
-            ]
-            return {"models": openai_models, "total": len(openai_models), "provider": "openai"}
-
-        else:
-            return {"models": [], "total": 0, "provider": "unknown", "note": "未识别的 API，请手动输入模型名"}
+                    return {"models": simplified, "total": len(simplified), "provider": "openai-compatible"}
+                print(f"[get_models] OpenAI-compatible API 返回 {response.status_code}: {response.text}")
+                return {"error": f"OpenAI-compatible API 返回 {response.status_code}", "models": [], "provider": "openai-compatible"}
 
     except Exception:
         return shared._api_failure("加载模型列表失败", models=[])
