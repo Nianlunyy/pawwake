@@ -143,6 +143,32 @@ class TestMemoryExtractBudget(unittest.TestCase):
         self.assertIn("秒", output)
         print(f"✅ 用例4(正常提取与计时): ⏱ 计时日志正常打印，解析结果正确: {result}")
 
+    def test_malformed_json_detailed_diagnostics(self):
+        """5. 畸形 JSON 导致解析失败 -> 打印带行号/光标的详细上下文及完整原始文本"""
+        malformed_json = '[\n  {"content": "item1"}\n  {"content": "item2"}\n]'
+        resp_data = {
+            "choices": [
+                {
+                    "message": {"content": malformed_json},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"completion_tokens": 30},
+        }
+        mock_response = FakeResponse(resp_data, status_code=200)
+
+        f = io.StringIO()
+        with contextlib.redirect_stdout(f):
+            with patch("shared.post_chat_completion", new_callable=AsyncMock, return_value=mock_response):
+                result = asyncio.run(memory_extractor.extract_memories(self.sample_messages))
+
+        output = f.getvalue()
+        self.assertEqual(result, [])
+        self.assertIn("记忆提取结果解析失败", output)
+        self.assertIn("错误行及上下文", output)
+        self.assertIn("完整原始返回", output)
+        print(f"✅ 用例5(畸形JSON行上下文诊断): 成功定位行号与完整原始返回，输出片段:\n{output.strip()[:300]}...")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -82,6 +82,30 @@ def _diagnose_incomplete(finish_reason, completion_tokens, reasoning_tokens) -> 
     )
 
 
+def _diagnose_json_error(e: json.JSONDecodeError, content: str) -> str:
+    """提取 JSONDecodeError 出错行附近内容及光标指示，方便完全定位报错根源。"""
+    lines = content.splitlines()
+    lineno = getattr(e, "lineno", None)
+    colno = getattr(e, "colno", None)
+    pos = getattr(e, "pos", None)
+    parts = [f"⚠️  记忆提取结果解析失败: {e}"]
+    if lineno is not None and 1 <= lineno <= len(lines):
+        parts.append("    🔍 错误行及上下文:")
+        start_line = max(1, lineno - 2)
+        end_line = min(len(lines), lineno + 2)
+        for i in range(start_line, end_line + 1):
+            line_str = lines[i - 1]
+            parts.append(f"    [{i:3d}] {line_str}")
+            if i == lineno and colno is not None and colno >= 1:
+                pointer = " " * (colno - 1) + "^"
+                parts.append(f"          {pointer} (报错点: line {lineno}, col {colno})")
+    elif pos is not None and 0 <= pos <= len(content):
+        start = max(0, pos - 40)
+        end = min(len(content), pos + 40)
+        parts.append(f"    🔍 错误片段 (char {pos}): ...{content[start:end]}...")
+    return "\n".join(parts)
+
+
 _WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 
@@ -445,7 +469,8 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
                         memories = json.loads(match.group())
                         print(f"📝 JSON正则兜底提取成功")
                     except json.JSONDecodeError as e:
-                        print(f"⚠️  记忆提取结果解析失败: {e}")
+                        print(_diagnose_json_error(e, match.group()))
+                        print(f"📝 完整原始返回（共 {len(text)} 字符）:\n{text}", flush=True)
                         return []
                 else:
                     # 不要补上收尾的 ]：断掉的可能是半个字符串，
@@ -454,6 +479,7 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
                         f"⚠️  记忆提取结果中未找到完整 JSON 数组（共 {raw_len} 字符），本轮跳过\n"
                         f"    {_diagnose_incomplete(finish_reason, completion_tokens, reasoning_tokens)}"
                     )
+                    print(f"📝 完整原始返回（共 {len(text)} 字符）:\n{text}", flush=True)
                     return []
 
             if not isinstance(memories, list):
@@ -512,7 +538,10 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
         print(f"⚠️  记忆提取超时 ({type(e).__name__}): 超过 {MEMORY_TIMEOUT} 秒，已耗时 {elapsed:.1f} 秒")
         return []
     except json.JSONDecodeError as e:
-        print(f"⚠️  记忆提取结果解析失败: {e}")
+        raw_text = text if "text" in locals() else ""
+        print(_diagnose_json_error(e, raw_text))
+        if raw_text:
+            print(f"📝 完整原始返回（共 {len(raw_text)} 字符）:\n{raw_text}", flush=True)
         return []
     except Exception as e:
         err_msg = str(e) if str(e) else repr(e)
