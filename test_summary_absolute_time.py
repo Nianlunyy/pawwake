@@ -166,29 +166,90 @@ def test_empty_body_guard():
 
 
 def test_prompt_rules_and_skeleton():
-    """6. 提示词骨架与时间规则核对：含时间规则上游版、'截至 YYYY-MM-DD'、'未来约定换算成具体日期'"""
+    """6. 提示词骨架、格式约束、时间规则与人称映射核对"""
     msgs = [{"role": "user", "content": "测试对话", "created_at": "2026-10-10T04:00:00Z"}]
-    captured_prompt = None
+    captured_gen_prompt = None
 
-    async def mock_call(prompt, label="摘要生成"):
-        nonlocal captured_prompt
-        captured_prompt = prompt
+    async def mock_call_gen(prompt, label="摘要生成"):
+        nonlocal captured_gen_prompt
+        captured_gen_prompt = prompt
         return "正文摘要。"
 
-    with patch.object(partition_engine, "_call_summary_model", side_effect=mock_call):
+    with patch.object(partition_engine, "_call_summary_model", side_effect=mock_call_gen):
         with patch.object(shared, "CACHE_SUMMARY_MODEL", "mock-model"):
             asyncio.run(partition_engine.generate_summary(msgs, "sess1"))
 
-    assert captured_prompt is not None
-    assert "将对话压缩为阿澈（自称\"我\"）与阿狸的常驻记忆摘要。" in captured_prompt
-    assert "# 人称映射【绝对红线】" in captured_prompt
-    assert "# 时间规则【绝对红线】" in captured_prompt
-    assert "每条消息开头的时间戳是事实锚点。" in captured_prompt
-    assert "能换算时写成 YYYY-MM-DD 或 YYYY-MM-DD HH:mm" in captured_prompt
-    assert "对话里的未来约定换算成具体日期。" in captured_prompt
-    assert "截至 YYYY-MM-DD" in captured_prompt
-    assert "TIME_PERIOD_TABLE_TEXT" not in captured_prompt
-    return "提示词保留本地第一人称骨架，时间规则与状态约定规则正确更新"
+    assert captured_gen_prompt is not None
+    assert "将对话压缩为阿澈（自称\"我\"）与阿狸的常驻记忆摘要。" in captured_gen_prompt
+
+    # 人称映射一节与改动前逐字相同
+    expected_gen_person_mapping = (
+        "# 人称映射【绝对红线】\n"
+        "- 纯第一人称：阿澈统一自称\"我\"；阿狸统一称为\"阿狸\"或\"狸宝\"（严禁\"用户/AI/助手/沈太太\"及第三人称转述）。\n"
+        "- 代词消歧：阿狸说的\"我\"及我对她说的\"你\"一律转换为\"阿狸\"，严禁身份倒错。"
+    )
+    assert expected_gen_person_mapping in captured_gen_prompt
+
+    # 时间规则部分文字与改动前逐字相同
+    expected_gen_time_rules = (
+        "# 时间规则【绝对红线】\n"
+        "- 每条消息开头的时间戳是事实锚点。摘要不得使用会随读取时间变化的相对时间词（如今天、昨晚、今早、明天、刚才、这周、下周）。\n"
+        "- 能换算时写成 YYYY-MM-DD 或 YYYY-MM-DD HH:mm；无法换算时保留事件并标注“具体日期未知”，不得猜测或删除。关键原话中的相对时间也按本规则转述，时间规则优先于逐字引用。\n"
+        "- 对话里的未来约定换算成具体日期。"
+    )
+    assert expected_gen_time_rules in captured_gen_prompt
+
+    # 两个 prompt 都含新增文字：generate_summary 格式约束追加文字
+    expected_gen_format_1 = (
+        "- 全文是连续的第一人称叙事短句，以\"我\"为主语写我和阿狸之间发生的事，"
+        "分【状态与约定】【情感共振】【关键原话】三节，只用【】做节标题；"
+        "不使用 Markdown（不要 #、**、-、数字列表、反引号、表格），不写\"以下为……摘要\"这类开场白。"
+    )
+    expected_gen_format_2 = (
+        "- 技术、调试、配置类话题，只用一句话写明在做什么、结论是什么；"
+        "网址、命令、依赖清单、配置步骤不写进摘要。"
+    )
+    assert expected_gen_format_1 in captured_gen_prompt
+    assert expected_gen_format_2 in captured_gen_prompt
+
+    assert "截至 YYYY-MM-DD" in captured_gen_prompt
+    assert "TIME_PERIOD_TABLE_TEXT" not in captured_gen_prompt
+
+    # fold prompt 测试与断言
+    captured_fold_prompt = None
+
+    async def mock_call_fold(prompt, label="摘要折叠"):
+        nonlocal captured_fold_prompt
+        captured_fold_prompt = prompt
+        return "合并后的基础摘要正文。"
+
+    old_parts = ["旧段内容超出预算A" * 10, "旧段内容超出预算B" * 10]
+    recent_parts = ["近期段1", "近期段2"]
+    with patch.object(partition_engine, "_call_summary_model", side_effect=mock_call_fold):
+        with patch.object(shared, "CACHE_SUMMARY_MODEL", "mock-model"):
+            with patch.object(shared, "CACHE_SUMMARY_BUDGET_CHARS", 50):
+                asyncio.run(
+                    partition_engine.fold_summary_parts(old_parts + recent_parts, protected_tail=0)
+                )
+
+    assert captured_fold_prompt is not None
+
+    # 两个 prompt 都含新增文字：fold prompt 末尾追加文字
+    expected_fold_format = (
+        "输出是连续的叙事短句，以\"我\"为主语，不使用 Markdown 标题、加粗和列表，不写开场白；"
+        "旧段里的网址、命令、依赖清单不保留。"
+    )
+    assert expected_fold_format in captured_fold_prompt
+
+    # fold prompt 中的时间规则与改动前逐字相同
+    expected_fold_time_rules = (
+        "记录时段和旧摘要里的绝对日期是事实锚点。不得使用会随读取时间变化的相对时间词；"
+        "能换算时改成绝对日期，缺少锚点时保留事件并标注“具体日期未知”，不得猜测、删除或按本次折叠日期解释。"
+        "时间规则优先于逐字引用。"
+    )
+    assert expected_fold_time_rules in captured_fold_prompt
+
+    return "提示词保留本地第一人称骨架，格式约束、时间规则与人称映射断言全部通过"
 
 
 def test_filtering_and_warning_tolerance():
