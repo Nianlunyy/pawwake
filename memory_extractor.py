@@ -9,6 +9,7 @@ v2.3 改进：提取时注入已有记忆，让模型对比后只提取全新信
 
 import os
 import json
+import time
 import httpx
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict
@@ -27,7 +28,10 @@ MEMORY_MODEL = os.getenv("MEMORY_MODEL", "")
 
 # 记忆提取的输出上限，原先硬编码 1000。部分上游会把 reasoning token
 # 也算进这条额度，JSON 可能在收尾前被截断，表面只报"未找到JSON数组"
-MEMORY_MAX_TOKENS = int(os.getenv("MEMORY_MAX_TOKENS", "4000"))
+MEMORY_MAX_TOKENS = int(os.getenv("MEMORY_MAX_TOKENS", "8000"))
+
+# 记忆提取与评分的超时时间（秒）
+MEMORY_TIMEOUT = float(os.getenv("MEMORY_TIMEOUT", "120.0"))
 
 EXTRACT_MAX_CHARS_PER_MESSAGE = 8000
 EXTRACT_MAX_CHARS_TOTAL = 60000
@@ -369,6 +373,7 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
         remind_example=_remind_example(local_now),
     )
 
+    start_time = time.monotonic()
     # 调用 LLM 提取记忆
     try:
         print(
@@ -376,7 +381,7 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
             f"图片块 {image_count} 个, 截断 {truncation_count} 处, 丢弃旧消息 {discarded_count} 条",
             flush=True,
         )
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=MEMORY_TIMEOUT) as client:
             response = await shared.post_chat_completion(
                 client,
                 API_BASE_URL,
@@ -390,6 +395,9 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
                     ],
                 },
             )
+
+            elapsed = time.monotonic() - start_time
+            print(f"⏱ 提取耗时 {elapsed:.1f} 秒", flush=True)
 
             if response.status_code != 200:
                 print(f"⚠️  记忆提取请求失败: {response.status_code}, model={MEMORY_MODEL}: {response.text[:500]}")
@@ -499,11 +507,16 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
             print(f"📝 从对话中提取了 {len(valid_memories)} 条新记忆（已对比 {len(existing_memories or [])} 条已有记忆）")
             return valid_memories
 
+    except httpx.TimeoutException as e:
+        elapsed = time.monotonic() - start_time
+        print(f"⚠️  记忆提取超时 ({type(e).__name__}): 超过 {MEMORY_TIMEOUT} 秒，已耗时 {elapsed:.1f} 秒")
+        return []
     except json.JSONDecodeError as e:
         print(f"⚠️  记忆提取结果解析失败: {e}")
         return []
     except Exception as e:
-        print(f"⚠️  记忆提取出错: {e}")
+        err_msg = str(e) if str(e) else repr(e)
+        print(f"⚠️  记忆提取出错 ({type(e).__name__}): {err_msg}")
         return []
 
 
@@ -542,7 +555,7 @@ async def score_memories(texts: List[str]) -> List[Dict]:
     prompt = SCORING_PROMPT.format(memories_text=memories_text)
 
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=MEMORY_TIMEOUT) as client:
             response = await shared.post_chat_completion(
                 client,
                 API_BASE_URL,
