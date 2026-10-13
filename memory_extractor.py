@@ -29,6 +29,9 @@ MEMORY_MODEL = os.getenv("MEMORY_MODEL", "")
 # 也算进这条额度，JSON 可能在收尾前被截断，表面只报"未找到JSON数组"
 MEMORY_MAX_TOKENS = int(os.getenv("MEMORY_MAX_TOKENS", "4000"))
 
+EXTRACT_MAX_CHARS_PER_MESSAGE = 8000
+EXTRACT_MAX_CHARS_TOTAL = 60000
+
 def get_memory_api_key() -> str:
     return MEMORY_API_KEY or API_KEY
 
@@ -182,6 +185,79 @@ importance 分数 1-10，10 最重要。
 """
 
 
+def _is_image_block(item) -> bool:
+    if not isinstance(item, dict):
+        return False
+    btype = item.get("type")
+    if btype in {"image_url", "image", "input_image"}:
+        return True
+    if isinstance(btype, str) and "image" in btype:
+        return True
+    if "image_url" in item or "image" in item:
+        return True
+    return False
+
+
+def _is_text_block(item) -> bool:
+    if not isinstance(item, dict):
+        return False
+    btype = item.get("type")
+    if btype in {"text", "input_text"}:
+        return True
+    if btype is None and "text" in item:
+        return True
+    return False
+
+
+def _content_to_text(content) -> str:
+    """将消息 content 转换为纯文本，多模态数组中的图片块替换为 '[图片]'。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                if _is_text_block(item):
+                    text = item.get("text")
+                    if text is not None:
+                        parts.append(str(text))
+                elif _is_image_block(item):
+                    parts.append("[图片]")
+            elif isinstance(item, str):
+                parts.append(item)
+        return "\n".join(parts)
+    return ""
+
+
+def _count_image_blocks(content) -> int:
+    """统计 content 中的图片块数量。"""
+    if not isinstance(content, list):
+        return 0
+    return sum(1 for item in content if _is_image_block(item))
+
+
+def _format_conversation(items: list):
+    """格式化对话文本并生成 source_ref 映射。"""
+    conversation_text = ""
+    source_ref_map = {}
+    source_ref_by_id = {}
+    for item in items:
+        role = item.get("role", "unknown")
+        content = item.get("content", "")
+        source_id = item.get("source_id")
+        if isinstance(source_id, int) and not isinstance(source_id, bool):
+            source_ref = source_ref_by_id.setdefault(source_id, len(source_ref_by_id) + 1)
+            source_ref_map[source_ref] = source_id
+            source_prefix = f"[证据#{source_ref}] "
+        else:
+            source_prefix = "[证据不可用] "
+        if role == "user":
+            conversation_text += f"{source_prefix}阿狸: {content}\n"
+        elif role == "assistant":
+            conversation_text += f"{source_prefix}阿澈: {content}\n"
+    return conversation_text, source_ref_map
+
+
 async def extract_memories(messages: List[Dict[str, str]], existing_memories: List = None) -> List[Dict]:
     """
     从对话消息中提取记忆
@@ -204,27 +280,72 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
     if not messages:
         return []
 
-    # 把对话格式化成文本
-    conversation_text = ""
-    source_ref_map = {}
-    source_ref_by_id = {}
+    # 预处理消息、提取纯文本与单条长度保护
+    processed_messages = []
     for msg in messages:
         role = msg.get("role", "unknown")
-        content = msg.get("content", "")
-        source_id = msg.get("_source_message_id")
-        if isinstance(source_id, int) and not isinstance(source_id, bool):
-            source_ref = source_ref_by_id.setdefault(source_id, len(source_ref_by_id) + 1)
-            source_ref_map[source_ref] = source_id
-            source_prefix = f"[证据#{source_ref}] "
-        else:
-            source_prefix = "[证据不可用] "
-        if role == "user":
-            conversation_text += f"{source_prefix}阿狸: {content}\n"
-        elif role == "assistant":
-            conversation_text += f"{source_prefix}阿澈: {content}\n"
+        if role not in {"user", "assistant"}:
+            continue
+        raw_content = msg.get("content", "")
+        text = _content_to_text(raw_content)
+        img_count = _count_image_blocks(raw_content)
+        truncated = False
+        if len(text) > EXTRACT_MAX_CHARS_PER_MESSAGE:
+            text = text[:EXTRACT_MAX_CHARS_PER_MESSAGE] + "…（内容过长，已截断）"
+            truncated = True
+        processed_messages.append({
+            "role": role,
+            "content": text,
+            "source_id": msg.get("_source_message_id"),
+            "img_count": img_count,
+            "truncated": truncated,
+        })
+
+    if not processed_messages:
+        return []
+
+    # 标记至少保留的消息（最后一条 user 与最后一条 assistant）
+    last_user_idx = None
+    last_assistant_idx = None
+    for idx, item in enumerate(processed_messages):
+        if item["role"] == "user":
+            last_user_idx = idx
+        elif item["role"] == "assistant":
+            last_assistant_idx = idx
+
+    protected_indices = set()
+    if last_user_idx is not None:
+        protected_indices.add(last_user_idx)
+    if last_assistant_idx is not None:
+        protected_indices.add(last_assistant_idx)
+
+    # 总长保护：若超过上限，从最旧消息开始丢弃，直到不超；保留受保护消息
+    active_indices = list(range(len(processed_messages)))
+    while True:
+        candidate_items = [processed_messages[i] for i in active_indices]
+        conversation_text, source_ref_map = _format_conversation(candidate_items)
+        if len(conversation_text) <= EXTRACT_MAX_CHARS_TOTAL:
+            break
+        discard_pos = None
+        for pos, idx in enumerate(active_indices):
+            if idx not in protected_indices:
+                discard_pos = pos
+                break
+        if discard_pos is None:
+            break
+        active_indices.pop(discard_pos)
+
+    retained_items = [processed_messages[i] for i in active_indices]
 
     if not conversation_text.strip():
         return []
+
+    discarded_count = len(processed_messages) - len(retained_items)
+    message_count = len(retained_items)
+    total_chars = len(conversation_text)
+    max_chars = max((len(item["content"]) for item in retained_items), default=0)
+    image_count = sum(item["img_count"] for item in retained_items)
+    truncation_count = sum(1 for item in retained_items if item["truncated"])
 
     # 格式化已有记忆
     if existing_memories:
@@ -250,6 +371,11 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
 
     # 调用 LLM 提取记忆
     try:
+        print(
+            f"📏 提取输入: {message_count} 条, 共 {total_chars} 字符, 最长一条 {max_chars} 字符, "
+            f"图片块 {image_count} 个, 截断 {truncation_count} 处, 丢弃旧消息 {discarded_count} 条",
+            flush=True,
+        )
         async with httpx.AsyncClient(timeout=60) as client:
             response = await shared.post_chat_completion(
                 client,
