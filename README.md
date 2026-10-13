@@ -1,5 +1,9 @@
 # 🐾 Pawwake · 爪迹
 
+<a href="https://github.com/DasterProkio/awesome-ai-companion">
+  <img src="https://raw.githubusercontent.com/DasterProkio/awesome-ai-companion/main/assets/featured-in-awesome-ai-companion.png" alt="Featured in Awesome AI Companion" height="24">
+</a>
+
 **4.1.9 · Madeleine**
 
 *Follow the pawprints back.*
