@@ -400,6 +400,7 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
     )
 
     start_time = time.monotonic()
+    finish_reason = None
     # 调用 LLM 提取记忆
     try:
         effort_val = MEMORY_REASONING_EFFORT if MEMORY_REASONING_EFFORT else "未设置"
@@ -549,7 +550,7 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
     except json.JSONDecodeError as e:
         raw_text = text if "text" in locals() else ""
         print(_diagnose_json_error(e, raw_text))
-        if locals().get("finish_reason") == "length":
+        if finish_reason == "length":
             print("⚠️ 本次输出被 max_tokens 截断（finish_reason=length），解析失败多半源于截断，推理 token 占用见上方原始返回行")
         if raw_text:
             print(f"📝 完整原始返回（共 {len(raw_text)} 字符）:\n{raw_text}", flush=True)

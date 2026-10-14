@@ -220,6 +220,32 @@ class TestMemoryThinkingEffort(unittest.TestCase):
 
         print(f"✅ 用例d(正常解析与多档位支持): 正常返回成功解析，多档位透传校验通过")
 
+    def test_case_e_response_json_decode_error(self):
+        """e. mock response.json() 抛 JSONDecodeError -> extract_memories 返回 []，不抛 UnboundLocalError"""
+        class BadJsonResponse:
+            status_code = 200
+            text = "<html>502 Bad Gateway</html>"
+
+            def json(self):
+                raise json.JSONDecodeError("Expecting value", self.text, 0)
+
+        async def mock_post(client, url, key, payload):
+            return BadJsonResponse()
+
+        with patch("shared.post_chat_completion", side_effect=mock_post), \
+             patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+            try:
+                result = asyncio.run(memory_extractor.extract_memories(self.sample_messages))
+            except UnboundLocalError as err:
+                self.fail(f"触发了未初始化引用错误: {err}")
+
+        out = mock_stdout.getvalue()
+        self.assertEqual(result, [])
+        self.assertIn("⚠️  记忆提取结果解析失败", out)
+        self.assertNotIn("本次输出被 max_tokens 截断", out)
+        print(f"✅ 用例e(response.json异常拦截): 成功拦截 response.json() JSONDecodeError，未抛异常且返回 []")
+
 
 if __name__ == "__main__":
     unittest.main()
+
