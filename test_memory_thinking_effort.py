@@ -221,7 +221,12 @@ class TestMemoryThinkingEffort(unittest.TestCase):
         print(f"✅ 用例d(正常解析与多档位支持): 正常返回成功解析，多档位透传校验通过")
 
     def test_case_e_response_json_decode_error(self):
-        """e. mock response.json() 抛 JSONDecodeError -> extract_memories 返回 []，不抛 UnboundLocalError"""
+        """e. mock response.json() 抛 JSONDecodeError -> extract_memories 返回 []，打印响应体而非输入消息"""
+        sentinel = "测试输入哨兵句_唯一特征标识_98765"
+        sample_messages = [
+            {"role": "user", "content": sentinel, "_source_message_id": 101},
+        ]
+
         class BadJsonResponse:
             status_code = 200
             text = "<html>502 Bad Gateway</html>"
@@ -235,15 +240,36 @@ class TestMemoryThinkingEffort(unittest.TestCase):
         with patch("shared.post_chat_completion", side_effect=mock_post), \
              patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
             try:
-                result = asyncio.run(memory_extractor.extract_memories(self.sample_messages))
-            except UnboundLocalError as err:
-                self.fail(f"触发了未初始化引用错误: {err}")
+                result = asyncio.run(memory_extractor.extract_memories(sample_messages))
+            except Exception as err:
+                self.fail(f"触发了非预期异常: {err}")
 
         out = mock_stdout.getvalue()
         self.assertEqual(result, [])
         self.assertIn("⚠️  记忆提取结果解析失败", out)
+        self.assertIn("<html>502", out)
+        self.assertIn("响应体前 2000 字符", out)
+        self.assertNotIn(sentinel, out)
         self.assertNotIn("本次输出被 max_tokens 截断", out)
-        print(f"✅ 用例e(response.json异常拦截): 成功拦截 response.json() JSONDecodeError，未抛异常且返回 []")
+        print(f"✅ 用例e(response.json异常拦截): 成功截获 502 HTML 响应体，日志含 <html>502 且排除哨兵输入句")
+
+    def test_case_f_response_none_json_decode_error(self):
+        """f. mock post_chat_completion 在 response 赋值前抛 JSONDecodeError -> response 为 None 时不抛异常，打印响应体不可用"""
+        async def mock_post_raise(*args, **kwargs):
+            raise json.JSONDecodeError("mock decode error before response assignment", "", 0)
+
+        with patch("shared.post_chat_completion", side_effect=mock_post_raise), \
+             patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+            try:
+                result = asyncio.run(memory_extractor.extract_memories(self.sample_messages))
+            except Exception as err:
+                self.fail(f"response 为 None 时抛出了未预期异常: {err}")
+
+        out = mock_stdout.getvalue()
+        self.assertEqual(result, [])
+        self.assertIn("响应体不可用", out)
+        self.assertNotIn("本次输出被 max_tokens 截断", out)
+        print(f"✅ 用例f(response为None异常拦截): response 为 None 时平稳捕获，打印 '响应体不可用' 且返回 []")
 
 
 if __name__ == "__main__":
