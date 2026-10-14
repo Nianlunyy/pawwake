@@ -26,6 +26,8 @@ MEMORY_API_KEY = os.getenv("MEMORY_API_KEY", "")
 # 用来提取、评分和整理记忆的模型；留空时暂停这些后台调用。
 MEMORY_MODEL = os.getenv("MEMORY_MODEL", "")
 
+MEMORY_REASONING_EFFORT = os.getenv("MEMORY_REASONING_EFFORT", "").strip()
+
 # 记忆提取的输出上限，原先硬编码 1000。部分上游会把 reasoning token
 # 也算进这条额度，JSON 可能在收尾前被截断，表面只报"未找到JSON数组"
 MEMORY_MAX_TOKENS = int(os.getenv("MEMORY_MAX_TOKENS", "8000"))
@@ -400,24 +402,29 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
     start_time = time.monotonic()
     # 调用 LLM 提取记忆
     try:
+        effort_val = MEMORY_REASONING_EFFORT if MEMORY_REASONING_EFFORT else "未设置"
+        print(f"🧠 记忆提取推理档: {effort_val}", flush=True)
         print(
             f"📏 提取输入: {message_count} 条, 共 {total_chars} 字符, 最长一条 {max_chars} 字符, "
             f"图片块 {image_count} 个, 截断 {truncation_count} 处, 丢弃旧消息 {discarded_count} 条",
             flush=True,
         )
         async with httpx.AsyncClient(timeout=MEMORY_TIMEOUT) as client:
+            payload = {
+                "model": MEMORY_MODEL,
+                "max_tokens": MEMORY_MAX_TOKENS,
+                "messages": [
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": f"请从以下对话中提取新的记忆：\n\n{conversation_text}"},
+                ],
+            }
+            if MEMORY_REASONING_EFFORT:
+                payload["reasoning_effort"] = MEMORY_REASONING_EFFORT
             response = await shared.post_chat_completion(
                 client,
                 API_BASE_URL,
                 get_memory_api_key(),
-                {
-                    "model": MEMORY_MODEL,
-                    "max_tokens": MEMORY_MAX_TOKENS,
-                    "messages": [
-                        {"role": "system", "content": prompt},
-                        {"role": "user", "content": f"请从以下对话中提取新的记忆：\n\n{conversation_text}"},
-                    ],
-                },
+                payload,
             )
 
             elapsed = time.monotonic() - start_time
@@ -470,6 +477,8 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
                         print(f"📝 JSON正则兜底提取成功")
                     except json.JSONDecodeError as e:
                         print(_diagnose_json_error(e, match.group()))
+                        if finish_reason == "length":
+                            print("⚠️ 本次输出被 max_tokens 截断（finish_reason=length），解析失败多半源于截断，推理 token 占用见上方原始返回行")
                         print(f"📝 完整原始返回（共 {len(text)} 字符）:\n{text}", flush=True)
                         return []
                 else:
@@ -540,6 +549,8 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
     except json.JSONDecodeError as e:
         raw_text = text if "text" in locals() else ""
         print(_diagnose_json_error(e, raw_text))
+        if locals().get("finish_reason") == "length":
+            print("⚠️ 本次输出被 max_tokens 截断（finish_reason=length），解析失败多半源于截断，推理 token 占用见上方原始返回行")
         if raw_text:
             print(f"📝 完整原始返回（共 {len(raw_text)} 字符）:\n{raw_text}", flush=True)
         return []
