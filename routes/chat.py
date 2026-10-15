@@ -237,6 +237,243 @@ async def chat_completions(request: Request):
     return response
 
 
+# ============================================================
+# 缓存前缀诊断与 Usage 日志（进程内保留，不入库）
+# ============================================================
+
+_LAST_REQUEST_CACHE: dict[str, dict] = {}
+
+
+def _normalize_message_for_hash(msg: dict) -> tuple[str, str, str, int]:
+    """Returns (role, normalized_text, tool_calls_json, char_len)."""
+    if not isinstance(msg, dict):
+        s = str(msg)
+        return ("", s, "", len(s))
+    role = str(msg.get("role") or "")
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "text":
+                    parts.append(str(item.get("text") or ""))
+                elif "text" in item:
+                    parts.append(str(item.get("text") or ""))
+                else:
+                    try:
+                        parts.append(json.dumps(item, sort_keys=True, ensure_ascii=False))
+                    except Exception:
+                        parts.append(str(item))
+            elif isinstance(item, str):
+                parts.append(item)
+            else:
+                parts.append(str(item))
+        text = " ".join(parts)
+    elif content is None:
+        text = ""
+    else:
+        text = str(content)
+
+    tc = msg.get("tool_calls")
+    if tc:
+        try:
+            tc_str = json.dumps(tc, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            tc_str = str(tc)
+    else:
+        tc_str = ""
+
+    return (role, text, tc_str, len(text))
+
+
+def _compute_message_hashes(messages: list) -> tuple[list[str], list[int], list[tuple[str, str]]]:
+    import hashlib
+    hash_list = []
+    char_lens = []
+    meta_list = []
+    prev_h = ""
+    if isinstance(messages, list):
+        for msg in messages:
+            role, text, tc_str, c_len = _normalize_message_for_hash(msg)
+            char_lens.append(c_len)
+            snippet = text.replace("\r", " ").replace("\n", " ").strip()[:40]
+            meta_list.append((role, snippet))
+
+            raw_repr = f"{prev_h}|{role}|{text}|{tc_str}"
+            h = hashlib.sha256(raw_repr.encode("utf-8", errors="replace")).hexdigest()[:16]
+            hash_list.append(h)
+            prev_h = h
+    return hash_list, char_lens, meta_list
+
+
+def _compute_tools_hash(tools) -> str:
+    import hashlib
+    if not tools:
+        return "empty"
+    try:
+        tools_str = json.dumps(tools, sort_keys=True, ensure_ascii=False)
+    except Exception:
+        tools_str = str(tools)
+    return hashlib.sha256(tools_str.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def diagnose_cache_prefix(session_id: str, body: dict) -> dict:
+    """对即将发往模型的 messages 和 tools 计算哈希并与上一请求对比。整个包在 try/except 里。"""
+    try:
+        if not isinstance(body, dict):
+            return {}
+
+        diag_sid = str(body.get("session_id") or session_id or "default")
+        messages = body.get("messages", [])
+        if not isinstance(messages, list):
+            messages = []
+        model = str(body.get("model") or "")
+        tools = body.get("tools")
+
+        curr_hash_list, curr_char_lens, curr_meta = _compute_message_hashes(messages)
+        curr_tools_hash = _compute_tools_hash(tools)
+        now_ts = time.time()
+
+        prev_record = _LAST_REQUEST_CACHE.get(diag_sid)
+        result_meta = {
+            "session_id": diag_sid,
+            "round": 1,
+            "model": model,
+            "tools_same": True,
+            "common_prefix_count": 0,
+            "total_messages": len(curr_hash_list),
+            "common_chars": 0,
+            "total_chars": sum(curr_char_lens),
+            "pct": 0.0,
+            "diff_idx": None,
+            "is_first": True,
+        }
+
+        if prev_record is None:
+            round_num = 1
+            print(f"🧩 前缀对比: round={round_num} model={model} | 无上一请求", flush=True)
+            result_meta["round"] = round_num
+        else:
+            round_num = prev_record.get("round", 1) + 1
+            result_meta["round"] = round_num
+            result_meta["is_first"] = False
+
+            last_time = prev_record.get("time", now_ts)
+            elapsed = max(0.0, now_ts - last_time)
+            elapsed_str = f"{elapsed:.1f}"
+
+            prev_tools_hash = prev_record.get("tools_hash")
+            tools_same = (curr_tools_hash == prev_tools_hash)
+            tools_match_str = "Y" if tools_same else "N"
+            result_meta["tools_same"] = tools_same
+
+            prev_hash_list = prev_record.get("hash_list", [])
+            n = len(curr_hash_list)
+            k = 0
+            min_len = min(n, len(prev_hash_list))
+            while k < min_len and curr_hash_list[k] == prev_hash_list[k]:
+                k += 1
+
+            result_meta["common_prefix_count"] = k
+            common_chars = sum(curr_char_lens[:k])
+            total_chars = sum(curr_char_lens)
+            result_meta["common_chars"] = common_chars
+            result_meta["total_chars"] = total_chars
+
+            pct = (common_chars / total_chars * 100) if total_chars > 0 else 0.0
+            result_meta["pct"] = pct
+            pct_str = f"{pct:.1f}%" if (pct % 1 != 0 and pct > 0) else f"{int(pct)}%"
+
+            if k < n:
+                diff_idx = k
+                diff_role, diff_snippet = curr_meta[k]
+                diff_str = f"首个差异 idx={diff_idx}, role={diff_role}, 片段={diff_snippet}"
+                result_meta["diff_idx"] = diff_idx
+                result_meta["diff_role"] = diff_role
+                result_meta["diff_snippet"] = diff_snippet
+            elif k < len(prev_hash_list):
+                diff_idx = k
+                diff_str = f"首个差异 idx={diff_idx}, role=(本次缩短), 片段=无本次消息"
+                result_meta["diff_idx"] = diff_idx
+            else:
+                diff_str = "首个差异 无"
+                result_meta["diff_idx"] = None
+
+            print(
+                f"🧩 前缀对比: round={round_num} model={model} 距上次={elapsed_str}秒 | tools同={tools_match_str} | "
+                f"共同前缀 {k}/{n} 条（约 {common_chars} 字符，占本次 {pct_str}）| {diff_str}",
+                flush=True,
+            )
+
+        # 限制缓存容量避免内存泄露
+        if len(_LAST_REQUEST_CACHE) > 500:
+            oldest_key = next(iter(_LAST_REQUEST_CACHE))
+            _LAST_REQUEST_CACHE.pop(oldest_key, None)
+
+        _LAST_REQUEST_CACHE[diag_sid] = {
+            "time": now_ts,
+            "model": model,
+            "tools_hash": curr_tools_hash,
+            "hash_list": curr_hash_list,
+            "char_lens": curr_char_lens,
+            "meta": curr_meta,
+            "round": round_num,
+        }
+        return result_meta
+    except Exception as e:
+        logger.warning("Cache prefix diagnostic failed: %s", e)
+        return {}
+
+
+def log_cache_usage(usage: dict):
+    """收到 usage 后打印缓存统计。没有字段按 0。整个包在 try/except 里。"""
+    try:
+        cached_tokens = 0
+        prompt_tokens = 0
+        if isinstance(usage, dict):
+            pt = usage.get("prompt_tokens")
+            if pt is not None and isinstance(pt, (int, float)):
+                prompt_tokens = int(pt)
+
+            pt_details = usage.get("prompt_tokens_details")
+            if isinstance(pt_details, dict):
+                ct = pt_details.get("cached_tokens")
+                if ct is not None and isinstance(ct, (int, float)):
+                    cached_tokens = int(ct)
+
+            if cached_tokens == 0:
+                ct = usage.get("cached_tokens")
+                if ct is not None and isinstance(ct, (int, float)):
+                    cached_tokens = int(ct)
+                elif usage.get("cache_read_input_tokens") is not None:
+                    try:
+                        cached_tokens = int(usage.get("cache_read_input_tokens") or 0)
+                    except Exception:
+                        pass
+                elif usage.get("prompt_cache_hit_tokens") is not None:
+                    try:
+                        cached_tokens = int(usage.get("prompt_cache_hit_tokens") or 0)
+                    except Exception:
+                        pass
+                elif usage.get("cached_content_token_count") is not None:
+                    try:
+                        cached_tokens = int(usage.get("cached_content_token_count") or 0)
+                    except Exception:
+                        pass
+
+        if prompt_tokens > 0:
+            pct = (cached_tokens / prompt_tokens) * 100
+            pct_str = f"{pct:.1f}%" if (pct % 1 != 0 and pct > 0) else f"{int(pct)}%"
+        else:
+            pct_str = "0%"
+
+        print(f"🧮 缓存: cached={cached_tokens} / prompt={prompt_tokens} ({pct_str})", flush=True)
+    except Exception as e:
+        logger.warning("Cache usage diagnostic failed: %s", e)
+
+
 async def _chat_completions_inner(request: Request, pending_reminder_claims: list = None):
     body = await request.json()
     messages = body.get("messages", [])
@@ -512,6 +749,12 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
     # [Gemini/Vertex AI 专用] 工具返回缓冲防 429 END
     # =========================================================================
 
+    # 前缀诊断日志（仅主聊天请求，不改变任何行为，严格异常拦截）
+    try:
+        diagnose_cache_prefix(session_id, body)
+    except Exception as e:
+        logger.warning("Cache prefix diagnostic failed: %s", e)
+
     if is_stream:
         stream = stream_and_capture(
             headers,
@@ -540,6 +783,10 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
                     resp_data = response.json()
                     print(f"🔬 原始响应完整结构: {json.dumps(resp_data.get('choices', [{}])[0].get('message', {}), ensure_ascii=False)[:2000]}")
                     print(f"🔍 完整usage原始数据(排查缓存字段用): {json.dumps(resp_data.get('usage', {}), ensure_ascii=False)}")
+                    try:
+                        log_cache_usage(resp_data.get("usage", {}))
+                    except Exception as e:
+                        logger.warning("Cache usage diagnostic failed: %s", e)
                     assistant_msg = ""
                     assistant_tool_calls = None
                     assistant_reasoning = None
@@ -692,6 +939,7 @@ async def _stream_and_capture_inner(
     full_reasoning = []
     stream_usage = {}
     saw_stream_usage = False
+    logged_stream_usage = False
     line_buffer = ""
     accumulated_tool_calls = {}  # index -> OpenAI-compatible tool call
     stream_succeeded = False
@@ -770,6 +1018,12 @@ async def _stream_and_capture_inner(
                             if "usage" in data:
                                 stream_usage = data["usage"]
                                 saw_stream_usage = True
+                                if not logged_stream_usage:
+                                    logged_stream_usage = True
+                                    try:
+                                        log_cache_usage(stream_usage)
+                                    except Exception as e:
+                                        logger.warning("Cache usage diagnostic failed: %s", e)
 
                             choices = data.get("choices") or [{}]
                             choice = first_choice = choices[0] if choices else {}
@@ -1124,6 +1378,12 @@ async def _stream_and_capture_inner(
         ct = stream_usage.get("completion_tokens", 0)
         tt = stream_usage.get("total_tokens", 0)
         print(f"🔍 完整usage原始数据(排查缓存字段用): {json.dumps(stream_usage, ensure_ascii=False)}")
+        if not logged_stream_usage:
+            logged_stream_usage = True
+            try:
+                log_cache_usage(stream_usage)
+            except Exception as e:
+                logger.warning("Cache usage diagnostic failed: %s", e)
         if shared.DATABASE_ENABLED and tt > 0 and not skip_conversation_log:
             asyncio.create_task(db_conversations.save_token_usage(session_id, model, pt, ct, tt))
             print(f"📊 Stream Token: {pt} + {ct} = {tt}")
