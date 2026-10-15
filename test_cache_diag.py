@@ -10,6 +10,7 @@ test_cache_diag.py: 验证前缀对比诊断日志与缓存 Usage 诊断日志
 """
 
 import asyncio
+import hashlib
 import io
 import json
 import re
@@ -51,10 +52,15 @@ class TestCacheDiag(unittest.TestCase):
 
         out_1 = buf_1.getvalue().strip()
         print(f"用例1 请求1 日志: {out_1}")
+        expected_sys_hash = hashlib.sha256("你是一个贴心助手".encode("utf-8")).hexdigest()[:8]
         self.assertTrue(res_1["is_first"])
         self.assertEqual(res_1["round"], 1)
+        self.assertEqual(res_1["client_sys"], expected_sys_hash)
+        self.assertEqual(res_1["db_history"], 0)
         self.assertIn("无上一请求", out_1)
         self.assertIn("round=1", out_1)
+        self.assertIn(f"client_sys={expected_sys_hash}", out_1)
+        self.assertIn("db_history=0", out_1)
 
         # 第二次请求：仅在末尾新增一条 user 消息
         body_2 = {
@@ -77,6 +83,8 @@ class TestCacheDiag(unittest.TestCase):
 
         self.assertFalse(res_2["is_first"])
         self.assertEqual(res_2["round"], 2)
+        self.assertEqual(res_2["client_sys"], expected_sys_hash)
+        self.assertEqual(res_2["db_history"], 0)
         # 共同前缀应等于上一次全部 (3 条)
         self.assertEqual(res_2["common_prefix_count"], len(body_1["messages"]))
         self.assertEqual(res_2["common_prefix_count"], 3)
@@ -89,6 +97,8 @@ class TestCacheDiag(unittest.TestCase):
 
         # 检查日志格式
         self.assertIn("round=2", out_2)
+        self.assertIn(f"client_sys={expected_sys_hash}", out_2)
+        self.assertIn("db_history=0", out_2)
         self.assertIn("tools同=Y", out_2)
         self.assertIn("共同前缀 3/4 条", out_2)
         self.assertIn("首个差异 idx=3, role=user, 片段=那明天会下雨吗？", out_2)
@@ -510,7 +520,7 @@ class TestCacheDiag(unittest.TestCase):
         out = buf.getvalue()
         print(f"用例10 慢响应告警输出:\n{out}")
         self.assertEqual(resp.status_code, 200)
-        self.assertIn("⏱ req=test04 尝试#1 已等待 60s 仍无响应", out)
+        self.assertIn("⏱ req=test04 尝试#1 已等待 0.03s 仍无响应", out)
         self.assertRegex(out, r"⏱ req=test04 尝试#1: 发出→响应头 \d+\.\d+s status=200")
         self.assertRegex(out, r"⏱ req=test04 首字节 \d+\.\d+s")
         self.assertNotIn("🔌 req=test04 客户端断开", out)
@@ -555,6 +565,233 @@ class TestCacheDiag(unittest.TestCase):
         self.assertIn("📡 req=test05 请求:", out)
         self.assertRegex(out, r"⏱ req=test05 首字节 \d+\.\d+s")
         self.assertRegex(out, r"🔌 req=test05 客户端断开: 已用时 \d+\.\d+ 秒, 阶段=接收中")
+
+    def test_case_12_fast_response_no_slow_warning(self):
+        """用例⑫：阈值内正常响应，定时器被及时取消，期间不得出现告警"""
+        req_body = {
+            "model": "google/gemini-2.5-flash",
+            "messages": [{"role": "user", "content": "快速响应测试"}],
+            "stream": True,
+            "req_id": "test06",
+        }
+        request = _make_mock_request(req_body)
+
+        sse_lines = [
+            'data: {"choices": [{"index": 0, "delta": {"content": "秒回正文"}}]}',
+            'data: {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}',
+            'data: [DONE]',
+        ]
+
+        async def mock_fast_send(req, stream=True):
+            await asyncio.sleep(0.01)  # 远小于 0.2s 阈值
+            return _MockStreamResponse(200, sse_lines=sse_lines)
+
+        async def run_flow():
+            resp = await chat_routes._chat_completions_inner(request)
+            chunks = []
+            async for chunk in resp.body_iterator:
+                chunks.append(chunk)
+            return resp, chunks
+
+        buf = io.StringIO()
+        with patch.dict("os.environ", {"UPSTREAM_SLOW_WARN_TIMEOUT": "0.2"}):
+            with patch("sys.stdout", buf):
+                with patch("httpx.AsyncClient.send", side_effect=mock_fast_send):
+                    with patch.object(shared, "API_KEY", "test-key"):
+                        with patch.object(shared, "DATABASE_ENABLED", False):
+                            with patch.object(shared, "CACHE_PARTITION_ENABLED", False):
+                                resp, chunks = asyncio.run(run_flow())
+
+        out = buf.getvalue()
+        print(f"用例12 阈值内快响应输出:\n{out}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotIn("已等待", out)
+        self.assertRegex(out, r"⏱ req=test06 尝试#1: 发出→响应头 \d+\.\d+s status=200")
+        combined_text = "".join([c.decode("utf-8") for c in chunks])
+        self.assertIn("秒回正文", combined_text)
+
+    def test_case_13_httpx_payload_no_req_id(self):
+        """用例⑬：断言发送给上游 httpx 的 json payload 绝不含 req_id（含 429 重试与兜底阶段二）"""
+        captured_stream_payloads = []
+
+        # 1. 验证流式 + 429 重试时的 payload
+        req_body_stream = {
+            "model": "google/gemini-2.5-flash",
+            "messages": [{"role": "user", "content": "测试429与流式payload"}],
+            "stream": True,
+            "req_id": "cli_999",  # 客户端在 body 显式带入 req_id
+        }
+        request_stream = _make_mock_request(req_body_stream)
+
+        attempt = 0
+        async def mock_stream_send(req, stream=True):
+            nonlocal attempt
+            attempt += 1
+            payload = json.loads(req.content.decode("utf-8"))
+            captured_stream_payloads.append(payload)
+            if attempt == 1:
+                return _MockStreamResponse(429, headers={"retry-after": "0"})
+            else:
+                return _MockStreamResponse(200, sse_lines=[
+                    'data: {"choices": [{"index": 0, "delta": {"content": "ok"}}]}',
+                    'data: [DONE]',
+                ])
+
+        async def run_stream():
+            resp = await chat_routes._chat_completions_inner(request_stream)
+            async for _ in resp.body_iterator:
+                pass
+
+        with patch("httpx.AsyncClient.send", side_effect=mock_stream_send):
+            with patch.object(shared, "API_KEY", "test-key"):
+                with patch.object(shared, "DATABASE_ENABLED", False):
+                    with patch.object(shared, "CACHE_PARTITION_ENABLED", False):
+                        with patch.object(shared, "is_vertex_endpoint", return_value=True):
+                            with patch.object(shared, "get_vertex_access_token", return_value="mock-token"):
+                                asyncio.run(run_stream())
+
+        self.assertEqual(len(captured_stream_payloads), 2)
+        for idx, p in enumerate(captured_stream_payloads, 1):
+            self.assertNotIn("req_id", p, f"流式尝试#{idx} payload 不应含 req_id")
+            self.assertEqual(p.get("model"), "google/gemini-2.5-flash")
+
+        # 2. 验证兜底阶段二（无感降级纯文本）时的 payload
+        captured_fallback_payloads = []
+        req_body_fallback = {
+            "model": "google/gemini-2.5-flash",
+            "messages": [{"role": "user", "content": "测试兜底阶段二"}],
+            "stream": True,
+            "tools": [{"type": "function", "function": {"name": "search"}}],
+            "req_id": "cli_888",
+        }
+        request_fallback = _make_mock_request(req_body_fallback)
+
+        malformed_sse = [
+            'data: {"choices": [{"index": 0, "delta": {"role": "assistant", "content": "thinking"}, "finish_reason": "malformed_function_call"}]}',
+            'data: [DONE]',
+        ]
+        async def mock_fallback_stream_send(req, stream=True):
+            p = json.loads(req.content.decode("utf-8"))
+            captured_fallback_payloads.append(("stream", p))
+            return _MockStreamResponse(200, sse_lines=malformed_sse)
+
+        async def mock_post_chat(client, url, api_key, payload):
+            captured_fallback_payloads.append(("post", payload))
+            resp = unittest.mock.MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {
+                "choices": [{"message": {"role": "assistant", "content": "纯文本兜底成功"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            }
+            return resp
+
+        async def run_fallback():
+            resp = await chat_routes._chat_completions_inner(request_fallback)
+            async for _ in resp.body_iterator:
+                pass
+
+        with patch("httpx.AsyncClient.send", side_effect=mock_fallback_stream_send):
+            with patch("shared.post_chat_completion", side_effect=mock_post_chat):
+                with patch.object(shared, "API_KEY", "test-key"):
+                    with patch.object(shared, "DATABASE_ENABLED", False):
+                        with patch.object(shared, "CACHE_PARTITION_ENABLED", False):
+                            with patch.object(shared, "is_vertex_endpoint", return_value=True):
+                                with patch.object(shared, "get_vertex_access_token", return_value="mock-token"):
+                                    asyncio.run(run_fallback())
+
+        self.assertGreaterEqual(len(captured_fallback_payloads), 2)
+        for tag, p in captured_fallback_payloads:
+            self.assertNotIn("req_id", p, f"兜底 {tag} payload 不应含 req_id")
+
+        # 3. 验证非流式发送
+        req_body_sync = {
+            "model": "test-sync-model",
+            "messages": [{"role": "user", "content": "同步测试"}],
+            "stream": False,
+            "req_id": "cli_777",
+        }
+        request_sync = _make_mock_request(req_body_sync)
+        sync_payloads = []
+
+        async def mock_sync_post(url, headers=None, json=None):
+            sync_payloads.append(json)
+            resp = unittest.mock.MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {
+                "choices": [{"message": {"role": "assistant", "content": "sync resp"}}],
+                "usage": {},
+            }
+            return resp
+
+        with patch("httpx.AsyncClient.post", side_effect=mock_sync_post):
+            with patch.object(shared, "API_KEY", "test-key"):
+                with patch.object(shared, "DATABASE_ENABLED", False):
+                    with patch.object(shared, "CACHE_PARTITION_ENABLED", False):
+                        asyncio.run(chat_routes._chat_completions_inner(request_sync))
+
+        self.assertEqual(len(sync_payloads), 1)
+        self.assertNotIn("req_id", sync_payloads[0], "非流式 payload 不应含 req_id")
+        print("✅ 用例13 验证通过：发往 httpx 的所有 payload（流式、429重试、兜底阶段二、非流式）均无 req_id")
+
+    def test_case_14_db_history_and_client_sys_diagnostics(self):
+        """用例⑭：验证 db_history=N 与 client_sys=xxxxxxxx 在诊断日志中正确输出与隔离"""
+        sid = "test-session-sys"
+        # 客户端 1：带有特定 system prompt
+        client1_prompt = "你是智能助手 Alpha，擅长代码编写。"
+        c1_hash = hashlib.sha256(client1_prompt.encode("utf-8")).hexdigest()[:8]
+        body_c1 = {
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "system", "content": client1_prompt},
+                {"role": "user", "content": "你好"},
+            ],
+        }
+
+        buf1 = io.StringIO()
+        with patch("sys.stdout", buf1):
+            res_c1 = chat_routes.diagnose_cache_prefix(sid, body_c1, db_history=12)
+
+        out1 = buf1.getvalue()
+        self.assertEqual(res_c1["db_history"], 12)
+        self.assertEqual(res_c1["client_sys"], c1_hash)
+        self.assertIn("db_history=12", out1)
+        self.assertIn(f"client_sys={c1_hash}", out1)
+
+        # 客户端 2：带有不同 system prompt，且 db_history=14
+        client2_prompt = "你是智能助手 Beta，擅长英文翻译。"
+        c2_hash = hashlib.sha256(client2_prompt.encode("utf-8")).hexdigest()[:8]
+        self.assertNotEqual(c1_hash, c2_hash)
+        body_c2 = {
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "system", "content": client2_prompt},
+                {"role": "user", "content": "你好"},
+            ],
+        }
+
+        buf2 = io.StringIO()
+        with patch("sys.stdout", buf2):
+            res_c2 = chat_routes.diagnose_cache_prefix(sid, body_c2, db_history=14)
+
+        out2 = buf2.getvalue()
+        self.assertEqual(res_c2["db_history"], 14)
+        self.assertEqual(res_c2["client_sys"], c2_hash)
+        self.assertIn("db_history=14", out2)
+        self.assertIn(f"client_sys={c2_hash}", out2)
+
+        # 无 system prompt 的情况
+        body_nosys = {
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "无系统提示词"}],
+        }
+        buf3 = io.StringIO()
+        with patch("sys.stdout", buf3):
+            res_nosys = chat_routes.diagnose_cache_prefix("test-nosys", body_nosys, db_history=0)
+        out3 = buf3.getvalue()
+        self.assertEqual(res_nosys["client_sys"], "none")
+        self.assertIn("client_sys=none", out3)
+        self.assertIn("db_history=0", out3)
+        print("✅ 用例14 验证通过：db_history 与两个客户端不同的 client_sys 正确计算并输出")
 
 
 def _make_mock_request(body_dict, headers_dict=None):

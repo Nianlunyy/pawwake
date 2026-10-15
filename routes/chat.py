@@ -1,6 +1,7 @@
 """Core OpenAI-compatible chat routes."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -320,7 +321,13 @@ def _compute_tools_hash(tools) -> str:
     return hashlib.sha256(tools_str.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
-def diagnose_cache_prefix(session_id: str, body: dict, req_id: str = "") -> dict:
+def diagnose_cache_prefix(
+    session_id: str,
+    body: dict,
+    req_id: str = "",
+    db_history: int = 0,
+    client_sys: str = "",
+) -> dict:
     """对即将发往模型的 messages 和 tools 计算哈希并与上一请求对比。整个包在 try/except 里。"""
     try:
         if not isinstance(body, dict):
@@ -335,6 +342,15 @@ def diagnose_cache_prefix(session_id: str, body: dict, req_id: str = "") -> dict
         rid = req_id or str(body.get("req_id") or "")
         req_prefix = f"req={rid} " if rid else ""
 
+        if not client_sys and isinstance(messages, list):
+            try:
+                sys_text = partition_engine._extract_client_system_text(messages)
+                client_sys = hashlib.sha256(sys_text.encode("utf-8")).hexdigest()[:8] if sys_text else "none"
+            except Exception:
+                client_sys = "none"
+        if not client_sys:
+            client_sys = "none"
+
         curr_hash_list, curr_char_lens, curr_meta = _compute_message_hashes(messages)
         curr_tools_hash = _compute_tools_hash(tools)
         now_ts = time.time()
@@ -343,6 +359,8 @@ def diagnose_cache_prefix(session_id: str, body: dict, req_id: str = "") -> dict
         result_meta = {
             "session_id": diag_sid,
             "round": 1,
+            "db_history": db_history,
+            "client_sys": client_sys,
             "model": model,
             "tools_same": True,
             "common_prefix_count": 0,
@@ -356,7 +374,7 @@ def diagnose_cache_prefix(session_id: str, body: dict, req_id: str = "") -> dict
 
         if prev_record is None:
             round_num = 1
-            print(f"🧩 {req_prefix}前缀对比: round={round_num} model={model} | 无上一请求", flush=True)
+            print(f"🧩 {req_prefix}前缀对比: round={round_num} db_history={db_history} client_sys={client_sys} model={model} | 无上一请求", flush=True)
             result_meta["round"] = round_num
         else:
             round_num = prev_record.get("round", 1) + 1
@@ -405,7 +423,7 @@ def diagnose_cache_prefix(session_id: str, body: dict, req_id: str = "") -> dict
                 result_meta["diff_idx"] = None
 
             print(
-                f"🧩 {req_prefix}前缀对比: round={round_num} model={model} 距上次={elapsed_str}秒 | tools同={tools_match_str} | "
+                f"🧩 {req_prefix}前缀对比: round={round_num} db_history={db_history} client_sys={client_sys} model={model} 距上次={elapsed_str}秒 | tools同={tools_match_str} | "
                 f"共同前缀 {k}/{n} 条（约 {common_chars} 字符，占本次 {pct_str}）| {diff_str}",
                 flush=True,
             )
@@ -423,6 +441,8 @@ def diagnose_cache_prefix(session_id: str, body: dict, req_id: str = "") -> dict
             "char_lens": curr_char_lens,
             "meta": curr_meta,
             "round": round_num,
+            "db_history": db_history,
+            "client_sys": client_sys,
         }
         return result_meta
     except Exception as e:
@@ -483,8 +503,13 @@ def log_cache_usage(usage: dict, req_id: str = ""):
 async def _chat_completions_inner(request: Request, pending_reminder_claims: list = None):
     body = await request.json()
     req_id = str(body.get("req_id") or request.headers.get("X-Request-ID") or uuid.uuid4().hex[:6])[:6]
-    body["req_id"] = req_id
+    body.pop("req_id", None)
     messages = body.get("messages", [])
+    try:
+        client_sys_text = partition_engine._extract_client_system_text(messages)
+        client_sys = hashlib.sha256(client_sys_text.encode("utf-8")).hexdigest()[:8] if client_sys_text else "none"
+    except Exception:
+        client_sys = "none"
     model = body.get("model") or shared.DEFAULT_MODEL
     if not model:
         return JSONResponse(
@@ -535,6 +560,7 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
     session_id = str(uuid.uuid4())[:8]
 
     # ---------- 分区缓存模式 ----------
+    db_history_count = 0
     if shared.CACHE_PARTITION_ENABLED and not skip_conversation_log:
         active_sid = shared.get_active_session_id()
         if active_sid:
@@ -552,6 +578,7 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
                 db_msgs.append(msg)
                 recall_history.append({**msg, "id": m.get("id")})
                 db_extraction_msgs.append({**msg, "_source_message_id": m.get("id")})
+            db_history_count = len(db_msgs)
         except Exception as e:
             print(f"❌ 分区缓存不可用：读取对话历史失败: {e}")
             return JSONResponse(
@@ -760,7 +787,13 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
 
     # 前缀诊断日志（仅主聊天请求，不改变任何行为，严格异常拦截）
     try:
-        diagnose_cache_prefix(session_id, body, req_id=req_id)
+        diagnose_cache_prefix(
+            session_id,
+            body,
+            req_id=req_id,
+            db_history=db_history_count,
+            client_sys=client_sys,
+        )
     except Exception as e:
         logger.warning("Cache prefix diagnostic failed: %s", e)
 
@@ -857,6 +890,7 @@ async def _send_stream_with_429_retry(client, url, headers, body, max_retries=2,
     rid = req_id or (str(body.get("req_id") or "") if isinstance(body, dict) else "")
     req_prefix = f"req={rid} " if rid else ""
     warn_timeout = float(os.getenv("UPSTREAM_SLOW_WARN_TIMEOUT", "60.0"))
+    timeout_desc = f"{int(warn_timeout)}s" if warn_timeout.is_integer() else f"{warn_timeout:g}s"
     while True:
         attempt_num = attempt + 1
         req = client.build_request("POST", url, headers=headers, json=body)
@@ -864,7 +898,7 @@ async def _send_stream_with_429_retry(client, url, headers, body, max_retries=2,
         async def _warn_slow():
             try:
                 await asyncio.sleep(warn_timeout)
-                print(f"⏱ {req_prefix}尝试#{attempt_num} 已等待 60s 仍无响应", flush=True)
+                print(f"⏱ {req_prefix}尝试#{attempt_num} 已等待 {timeout_desc} 仍无响应", flush=True)
             except asyncio.CancelledError:
                 pass
             except Exception as e:
