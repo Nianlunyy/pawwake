@@ -7,6 +7,7 @@ import logging
 import os
 import random
 import re
+import sys
 import time
 import uuid
 
@@ -996,9 +997,15 @@ async def stream_and_capture(
         try:
             if not stream_state.get("completed"):
                 elapsed = time.monotonic() - req_start_time
-                print(f"🔌 {req_prefix}客户端断开: 已用时 {elapsed:.1f} 秒, 阶段={stream_state.get('phase', '等上游响应头')}", flush=True)
+                exc = sys.exc_info()[1]
+                if exc is None or isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
+                    print(f"🔌 {req_prefix}客户端断开: 已用时 {elapsed:.1f} 秒, 阶段={stream_state.get('phase', '等上游响应头')}", flush=True)
+                else:
+                    exc_type = type(exc).__name__
+                    exc_repr = repr(exc)
+                    print(f"🔥 {req_prefix}网关异常终止: type={exc_type}, repr={exc_repr}, 已用时 {elapsed:.1f} 秒, 阶段={stream_state.get('phase', '等上游响应头')}", flush=True)
         except Exception as e:
-            logger.warning("Client disconnect diagnostic failed: %s", e)
+            logger.warning("Stream termination diagnostic failed: %s", e)
         await _settle_reminder_claims(lease_keeper, pending_reminder_claims, stream_state["terminal"])
 
 

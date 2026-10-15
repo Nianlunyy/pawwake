@@ -18,6 +18,7 @@ import sys
 import unittest
 from unittest.mock import AsyncMock, patch
 
+import httpx
 from fastapi import Request
 from starlette.datastructures import Headers
 
@@ -792,6 +793,91 @@ class TestCacheDiag(unittest.TestCase):
         self.assertIn("client_sys=none", out3)
         self.assertIn("db_history=0", out3)
         print("✅ 用例14 验证通过：db_history 与两个客户端不同的 client_sys 正确计算并输出")
+
+    def test_case_15_read_timeout_gateway_error_not_client_disconnect(self):
+        """用例⑮：上游 ReadTimeout 等网关异常终止，必须打 🔥 网关异常终止，不打 🔌 客户端断开，且异常照常向外传播"""
+        req_body = {
+            "model": "google/gemini-2.5-flash",
+            "messages": [{"role": "user", "content": "测试网关读超时"}],
+            "stream": True,
+            "req_id": "test15",
+        }
+        request = _make_mock_request(req_body)
+
+        async def mock_timeout_send(req, stream=True):
+            raise httpx.ReadTimeout("")
+
+        async def run_flow():
+            resp = await chat_routes._chat_completions_inner(request)
+            chunks = []
+            async for chunk in resp.body_iterator:
+                chunks.append(chunk)
+            return chunks
+
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            with patch("httpx.AsyncClient.send", side_effect=mock_timeout_send):
+                with patch.object(shared, "API_KEY", "test-key"):
+                    with patch.object(shared, "DATABASE_ENABLED", False):
+                        with patch.object(shared, "CACHE_PARTITION_ENABLED", False):
+                            with self.assertRaises(httpx.ReadTimeout):
+                                asyncio.run(run_flow())
+
+        out = buf.getvalue()
+        print(f"用例15 网关读超时输出:\n{out}")
+        self.assertIn("🔥 req=test15 网关异常终止: type=ReadTimeout", out)
+        self.assertIn("ReadTimeout('')", out)
+        self.assertIn("阶段=等上游响应头", out)
+        self.assertNotIn("🔌", out)
+        print("✅ 用例15 验证通过：ReadTimeout 产生 🔥 网关异常终止，未产生 🔌，且异常正常外抛")
+
+    def test_case_16_429_exhausted_no_disconnect_no_gateway_error(self):
+        """用例⑯：429 重试耗尽、错误已送达，既无 🔌 也无 🔥"""
+        req_body = {
+            "model": "google/gemini-2.5-flash",
+            "messages": [{"role": "user", "content": "429重试耗尽测试"}],
+            "stream": True,
+            "req_id": "test16",
+        }
+        request = _make_mock_request(req_body)
+
+        attempt = 0
+        async def mock_429_send(req, stream=True):
+            nonlocal attempt
+            attempt += 1
+            return _MockStreamResponse(
+                429,
+                headers={"retry-after": "0"},
+                sse_lines=['{"error": {"code": 429, "message": "Resource exhausted"}}'],
+            )
+
+        async def run_flow():
+            resp = await chat_routes._chat_completions_inner(request)
+            chunks = []
+            async for chunk in resp.body_iterator:
+                chunks.append(chunk)
+            return resp, chunks
+
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            with patch("httpx.AsyncClient.send", side_effect=mock_429_send):
+                with patch.object(shared, "API_KEY", "test-key"):
+                    with patch.object(shared, "DATABASE_ENABLED", False):
+                        with patch.object(shared, "CACHE_PARTITION_ENABLED", False):
+                            with patch.object(shared, "is_vertex_endpoint", return_value=True):
+                                with patch.object(shared, "get_vertex_access_token", return_value="mock-token"):
+                                    resp, chunks = asyncio.run(run_flow())
+
+        out = buf.getvalue()
+        print(f"用例16 429耗尽输出:\n{out}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(attempt, 3)  # 初次 + 2次重试
+        self.assertIn("⏳ req=test16 上游 429", out)
+        self.assertIn("❌ 上游错误内容: {\"error\": {\"code\": 429, \"message\": \"Resource exhausted\"}}", out)
+        self.assertNotIn("🔌", out)
+        self.assertNotIn("🔥", out)
+        self.assertGreater(len(chunks), 0)
+        print("✅ 用例16 验证通过：429 重试耗尽且错误透传完毕后，既无 🔌 也无 🔥")
 
 
 def _make_mock_request(body_dict, headers_dict=None):
