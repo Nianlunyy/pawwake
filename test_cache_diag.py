@@ -303,9 +303,10 @@ class TestCacheDiag(unittest.TestCase):
         out = buf.getvalue()
         print(f"端到端生产函数调用输出:\n{out}")
         self.assertEqual(resp.status_code, 200)
-        self.assertIn("🧩 前缀对比:", out)
+        self.assertRegex(out, r"📡 req=\w{6} 请求:")
+        self.assertRegex(out, r"🧩 req=\w{6} 前缀对比:")
         self.assertIn("无上一请求", out)
-        self.assertIn("🧮 缓存: cached=60 / prompt=120 (50%)", out)
+        self.assertRegex(out, r"🧮 req=\w{6} 缓存: cached=60 / prompt=120 \(50%\)")
 
         # 验证即使诊断逻辑内部抛异常，主请求绝对不受影响
         async def mock_receive_2():
@@ -328,6 +329,275 @@ class TestCacheDiag(unittest.TestCase):
         # 请求仍顺利返回 200，绝不因日志崩溃
         self.assertEqual(resp_2.status_code, 200)
         print("✅ 诊断异常拦截验证通过：内部爆炸时生产请求照常返回 200")
+
+    def test_case_7_stream_immediate_200(self):
+        """用例⑦（阶段a）：流式立即200，验证📡/⏱尝试#1/📨/⏱首字节/🏁/🧮/📊均正常输出且无🔌"""
+        req_body = {
+            "model": "google/gemini-2.5-flash",
+            "messages": [{"role": "user", "content": "你好"}],
+            "stream": True,
+            "req_id": "test01",
+        }
+        request = _make_mock_request(req_body)
+
+        sse_lines = [
+            'data: {"choices": [{"index": 0, "delta": {"role": "assistant"}}]}',
+            'data: {"choices": [{"index": 0, "delta": {"content": "你好呀！"}}]}',
+            'data: {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 100, "cached_tokens": 50, "completion_tokens": 10, "total_tokens": 110}}',
+            'data: [DONE]',
+        ]
+
+        async def mock_client_send(req, stream=True):
+            return _MockStreamResponse(200, sse_lines=sse_lines)
+
+        async def run_flow():
+            resp = await chat_routes._chat_completions_inner(request)
+            chunks = []
+            async for chunk in resp.body_iterator:
+                chunks.append(chunk)
+            return resp, chunks
+
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            with patch("httpx.AsyncClient.send", side_effect=mock_client_send):
+                with patch.object(shared, "API_KEY", "test-key"):
+                    with patch.object(shared, "DATABASE_ENABLED", True):
+                        with patch.object(shared, "CACHE_PARTITION_ENABLED", False):
+                            with patch("db.conversations.save_token_usage", new_callable=AsyncMock):
+                                resp, chunks = asyncio.run(run_flow())
+
+        out = buf.getvalue()
+        print(f"用例7 立即200 输出:\n{out}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("📡 req=test01 请求:", out)
+        self.assertRegex(out, r"⏱ req=test01 尝试#1: 发出→响应头 \d+\.\d+s status=200")
+        self.assertIn("📨 req=test01 上游响应: status=200", out)
+        self.assertRegex(out, r"⏱ req=test01 首字节 \d+\.\d+s")
+        self.assertIn("🏁 req=test01 finish_reason: stop", out)
+        self.assertIn("🧮 req=test01 缓存: cached=50 / prompt=100 (50%)", out)
+        self.assertIn("📊 req=test01 Stream Token: 100 + 10 = 110", out)
+        self.assertNotIn("🔌 req=test01 客户端断开", out)
+
+    def test_case_8_stream_429_then_200(self):
+        """用例⑧（阶段b）：先429再200重试，验证尝试#1(429) -> ⏳上游429 -> 尝试#2(200) -> 响应头/首字节正常"""
+        req_body = {
+            "model": "google/gemini-2.5-flash",
+            "messages": [{"role": "user", "content": "测试重试"}],
+            "stream": True,
+            "req_id": "test02",
+        }
+        request = _make_mock_request(req_body)
+
+        call_count = 0
+        sse_lines = [
+            'data: {"choices": [{"index": 0, "delta": {"content": "重试成功输出"}}]}',
+            'data: {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 80, "cached_tokens": 0, "completion_tokens": 5, "total_tokens": 85}}',
+            'data: [DONE]',
+        ]
+
+        async def mock_client_send(req, stream=True):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return _MockStreamResponse(429, headers={"retry-after": "0.01"})
+            return _MockStreamResponse(200, sse_lines=sse_lines)
+
+        async def run_flow():
+            resp = await chat_routes._chat_completions_inner(request)
+            chunks = []
+            async for chunk in resp.body_iterator:
+                chunks.append(chunk)
+            return resp, chunks
+
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            with patch("httpx.AsyncClient.send", side_effect=mock_client_send):
+                with patch.object(shared, "API_KEY", "test-key"):
+                    with patch.object(shared, "DATABASE_ENABLED", False):
+                        with patch.object(shared, "CACHE_PARTITION_ENABLED", False):
+                            with patch.object(shared, "is_vertex_endpoint", return_value=True):
+                                with patch.object(shared, "get_vertex_access_token", return_value="mock-token-xyz"):
+                                    resp, chunks = asyncio.run(run_flow())
+
+        out = buf.getvalue()
+        print(f"用例8 先429再200 输出:\n{out}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(call_count, 2)
+        self.assertRegex(out, r"⏱ req=test02 尝试#1: 发出→响应头 \d+\.\d+s status=429")
+        self.assertRegex(out, r"⏳ req=test02 上游 429，\d+\.\d+s 后第 1 次重试")
+        self.assertRegex(out, r"⏱ req=test02 尝试#2: 发出→响应头 \d+\.\d+s status=200")
+        self.assertIn("📨 req=test02 上游响应: status=200", out)
+        self.assertRegex(out, r"⏱ req=test02 首字节 \d+\.\d+s")
+        self.assertNotIn("🔌 req=test02 客户端断开", out)
+
+    def test_case_9_stream_hanging_client_disconnect(self):
+        """用例⑨（阶段c）：上游一直不返回，客户端取消生成器，验证必须有 🔌 行且阶段=等上游响应头"""
+        req_body = {
+            "model": "google/gemini-2.5-flash",
+            "messages": [{"role": "user", "content": "挂起测试"}],
+            "stream": True,
+            "req_id": "test03",
+        }
+        request = _make_mock_request(req_body)
+
+        async def mock_hanging_send(req, stream=True):
+            await asyncio.sleep(100.0)
+
+        async def run_flow():
+            resp = await chat_routes._chat_completions_inner(request)
+            async def consume():
+                async for _ in resp.body_iterator:
+                    pass
+            task = asyncio.create_task(consume())
+            await asyncio.sleep(0.04)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            with patch("httpx.AsyncClient.send", side_effect=mock_hanging_send):
+                with patch.object(shared, "API_KEY", "test-key"):
+                    with patch.object(shared, "DATABASE_ENABLED", False):
+                        with patch.object(shared, "CACHE_PARTITION_ENABLED", False):
+                            asyncio.run(run_flow())
+
+        out = buf.getvalue()
+        print(f"用例9 客户端断开输出:\n{out}")
+        self.assertIn("📡 req=test03 请求:", out)
+        self.assertRegex(out, r"🔌 req=test03 客户端断开: 已用时 \d+\.\d+ 秒, 阶段=等上游响应头")
+        self.assertNotIn("阶段=接收中", out)
+        self.assertNotIn("阶段=兜底", out)
+
+    def test_case_10_slow_warning_60s(self):
+        """用例⑩：单次尝试等待超时打 60s 告警日志，但不中止请求"""
+        req_body = {
+            "model": "google/gemini-2.5-flash",
+            "messages": [{"role": "user", "content": "慢响应测试"}],
+            "stream": True,
+            "req_id": "test04",
+        }
+        request = _make_mock_request(req_body)
+
+        sse_lines = [
+            'data: {"choices": [{"index": 0, "delta": {"content": "迟到的正文"}}]}',
+            'data: {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}',
+            'data: [DONE]',
+        ]
+
+        async def mock_slow_send(req, stream=True):
+            await asyncio.sleep(0.06)  # 超过 0.03s 阈值
+            return _MockStreamResponse(200, sse_lines=sse_lines)
+
+        async def run_flow():
+            resp = await chat_routes._chat_completions_inner(request)
+            chunks = []
+            async for chunk in resp.body_iterator:
+                chunks.append(chunk)
+            return resp, chunks
+
+        buf = io.StringIO()
+        with patch.dict("os.environ", {"UPSTREAM_SLOW_WARN_TIMEOUT": "0.03"}):
+            with patch("sys.stdout", buf):
+                with patch("httpx.AsyncClient.send", side_effect=mock_slow_send):
+                    with patch.object(shared, "API_KEY", "test-key"):
+                        with patch.object(shared, "DATABASE_ENABLED", False):
+                            with patch.object(shared, "CACHE_PARTITION_ENABLED", False):
+                                resp, chunks = asyncio.run(run_flow())
+
+        out = buf.getvalue()
+        print(f"用例10 慢响应告警输出:\n{out}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("⏱ req=test04 尝试#1 已等待 60s 仍无响应", out)
+        self.assertRegex(out, r"⏱ req=test04 尝试#1: 发出→响应头 \d+\.\d+s status=200")
+        self.assertRegex(out, r"⏱ req=test04 首字节 \d+\.\d+s")
+        self.assertNotIn("🔌 req=test04 客户端断开", out)
+
+    def test_case_11_disconnect_during_receiving(self):
+        """用例⑪：接收中阶段客户端断开，验证阶段=接收中"""
+        req_body = {
+            "model": "google/gemini-2.5-flash",
+            "messages": [{"role": "user", "content": "接收中断开测试"}],
+            "stream": True,
+            "req_id": "test05",
+        }
+        request = _make_mock_request(req_body)
+
+        async def run_flow():
+            sse_lines = [
+                'data: {"choices": [{"index": 0, "delta": {"content": "第一块"}}]}',
+                'data: {"choices": [{"index": 0, "delta": {"content": "第二块"}}]}',
+            ]
+            resp_mock = _MockStreamResponse(200, sse_lines=sse_lines, chunk_delay=0.08)
+
+            async def mock_send(req, stream=True):
+                return resp_mock
+
+            with patch("httpx.AsyncClient.send", side_effect=mock_send):
+                resp = await chat_routes._chat_completions_inner(request)
+                iterator = resp.body_iterator
+                # 读出首字节后客户端断开连接 (aclose)
+                async for chunk in iterator:
+                    break
+                await iterator.aclose()
+
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            with patch.object(shared, "API_KEY", "test-key"):
+                with patch.object(shared, "DATABASE_ENABLED", False):
+                    with patch.object(shared, "CACHE_PARTITION_ENABLED", False):
+                        asyncio.run(run_flow())
+
+        out = buf.getvalue()
+        print(f"用例11 接收中断开输出:\n{out}")
+        self.assertIn("📡 req=test05 请求:", out)
+        self.assertRegex(out, r"⏱ req=test05 首字节 \d+\.\d+s")
+        self.assertRegex(out, r"🔌 req=test05 客户端断开: 已用时 \d+\.\d+ 秒, 阶段=接收中")
+
+
+def _make_mock_request(body_dict, headers_dict=None):
+    hdrs = [(b"content-type", b"application/json")]
+    if headers_dict:
+        for k, v in headers_dict.items():
+            hdrs.append((k.lower().encode("utf-8"), v.encode("utf-8")))
+
+    async def mock_receive():
+        return {
+            "type": "http.request",
+            "body": json.dumps(body_dict).encode("utf-8"),
+            "more_body": False,
+        }
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": hdrs,
+    }
+    return Request(scope, receive=mock_receive)
+
+
+class _MockStreamResponse:
+    def __init__(self, status_code=200, headers=None, sse_lines=None, chunk_delay=0.0):
+        self.status_code = status_code
+        self.headers = headers or {"content-type": "text/event-stream"}
+        self.sse_lines = sse_lines or []
+        self.chunk_delay = chunk_delay
+        self.closed = False
+
+    async def aiter_bytes(self):
+        for line in self.sse_lines:
+            if self.chunk_delay > 0:
+                await asyncio.sleep(self.chunk_delay)
+            yield (line + "\n\n").encode("utf-8")
+
+    async def aread(self):
+        return b""
+
+    async def aclose(self):
+        self.closed = True
 
 
 if __name__ == "__main__":

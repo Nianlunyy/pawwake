@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 import random
 import re
 import time
@@ -319,7 +320,7 @@ def _compute_tools_hash(tools) -> str:
     return hashlib.sha256(tools_str.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
-def diagnose_cache_prefix(session_id: str, body: dict) -> dict:
+def diagnose_cache_prefix(session_id: str, body: dict, req_id: str = "") -> dict:
     """对即将发往模型的 messages 和 tools 计算哈希并与上一请求对比。整个包在 try/except 里。"""
     try:
         if not isinstance(body, dict):
@@ -331,6 +332,8 @@ def diagnose_cache_prefix(session_id: str, body: dict) -> dict:
             messages = []
         model = str(body.get("model") or "")
         tools = body.get("tools")
+        rid = req_id or str(body.get("req_id") or "")
+        req_prefix = f"req={rid} " if rid else ""
 
         curr_hash_list, curr_char_lens, curr_meta = _compute_message_hashes(messages)
         curr_tools_hash = _compute_tools_hash(tools)
@@ -353,7 +356,7 @@ def diagnose_cache_prefix(session_id: str, body: dict) -> dict:
 
         if prev_record is None:
             round_num = 1
-            print(f"🧩 前缀对比: round={round_num} model={model} | 无上一请求", flush=True)
+            print(f"🧩 {req_prefix}前缀对比: round={round_num} model={model} | 无上一请求", flush=True)
             result_meta["round"] = round_num
         else:
             round_num = prev_record.get("round", 1) + 1
@@ -402,7 +405,7 @@ def diagnose_cache_prefix(session_id: str, body: dict) -> dict:
                 result_meta["diff_idx"] = None
 
             print(
-                f"🧩 前缀对比: round={round_num} model={model} 距上次={elapsed_str}秒 | tools同={tools_match_str} | "
+                f"🧩 {req_prefix}前缀对比: round={round_num} model={model} 距上次={elapsed_str}秒 | tools同={tools_match_str} | "
                 f"共同前缀 {k}/{n} 条（约 {common_chars} 字符，占本次 {pct_str}）| {diff_str}",
                 flush=True,
             )
@@ -427,11 +430,14 @@ def diagnose_cache_prefix(session_id: str, body: dict) -> dict:
         return {}
 
 
-def log_cache_usage(usage: dict):
+def log_cache_usage(usage: dict, req_id: str = ""):
     """收到 usage 后打印缓存统计。没有字段按 0。整个包在 try/except 里。"""
     try:
         cached_tokens = 0
         prompt_tokens = 0
+        rid = req_id or (usage.get("req_id") if isinstance(usage, dict) else "")
+        req_prefix = f"req={rid} " if rid else ""
+
         if isinstance(usage, dict):
             pt = usage.get("prompt_tokens")
             if pt is not None and isinstance(pt, (int, float)):
@@ -469,13 +475,15 @@ def log_cache_usage(usage: dict):
         else:
             pct_str = "0%"
 
-        print(f"🧮 缓存: cached={cached_tokens} / prompt={prompt_tokens} ({pct_str})", flush=True)
+        print(f"🧮 {req_prefix}缓存: cached={cached_tokens} / prompt={prompt_tokens} ({pct_str})", flush=True)
     except Exception as e:
         logger.warning("Cache usage diagnostic failed: %s", e)
 
 
 async def _chat_completions_inner(request: Request, pending_reminder_claims: list = None):
     body = await request.json()
+    req_id = str(body.get("req_id") or request.headers.get("X-Request-ID") or uuid.uuid4().hex[:6])[:6]
+    body["req_id"] = req_id
     messages = body.get("messages", [])
     model = body.get("model") or shared.DEFAULT_MODEL
     if not model:
@@ -727,7 +735,8 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
             body["reasoning_effort"] = shared.REASONING_EFFORT
             print(f"🧠 注入推理参数: reasoning_effort={shared.REASONING_EFFORT}")
 
-    print(f"📡 请求: model={model}, stream={is_stream}, memory={'on' if shared.MEMORY_ENABLED else 'off'}", flush=True)
+    req_prefix = f"req={req_id} " if req_id else ""
+    print(f"📡 {req_prefix}请求: model={model}, stream={is_stream}, memory={'on' if shared.MEMORY_ENABLED else 'off'}", flush=True)
 
     # 调试：打印请求体中的推理相关字段
     debug_keys = {k: v for k, v in body.items() if k in ('reasoning_effort', 'google', 'reasoning')}
@@ -751,7 +760,7 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
 
     # 前缀诊断日志（仅主聊天请求，不改变任何行为，严格异常拦截）
     try:
-        diagnose_cache_prefix(session_id, body)
+        diagnose_cache_prefix(session_id, body, req_id=req_id)
     except Exception as e:
         logger.warning("Cache prefix diagnostic failed: %s", e)
 
@@ -769,6 +778,7 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
             extraction_round_count,
             pending_memory_ids,
             pending_reminder_claims,
+            req_id=req_id,
         )
         return _streaming_response(stream, pending_reminder_claims)
     else:
@@ -784,7 +794,7 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
                     print(f"🔬 原始响应完整结构: {json.dumps(resp_data.get('choices', [{}])[0].get('message', {}), ensure_ascii=False)[:2000]}")
                     print(f"🔍 完整usage原始数据(排查缓存字段用): {json.dumps(resp_data.get('usage', {}), ensure_ascii=False)}")
                     try:
-                        log_cache_usage(resp_data.get("usage", {}))
+                        log_cache_usage(resp_data.get("usage", {}), req_id=req_id)
                     except Exception as e:
                         logger.warning("Cache usage diagnostic failed: %s", e)
                     assistant_msg = ""
@@ -839,14 +849,40 @@ def _parse_retry_after(v):
         return None  # 日期串等格式：回退默认退避
 
 
-async def _send_stream_with_429_retry(client, url, headers, body, max_retries=2):
+async def _send_stream_with_429_retry(client, url, headers, body, max_retries=2, req_id: str = ""):
     """仅上游 429 时，在向客户端输出任何字节之前退避重试。
     返回 (最后一次 response, 已重试次数)，调用方负责 aclose。"""
     delays = (2.0, 4.0)
     attempt = 0
+    rid = req_id or (str(body.get("req_id") or "") if isinstance(body, dict) else "")
+    req_prefix = f"req={rid} " if rid else ""
+    warn_timeout = float(os.getenv("UPSTREAM_SLOW_WARN_TIMEOUT", "60.0"))
     while True:
+        attempt_num = attempt + 1
         req = client.build_request("POST", url, headers=headers, json=body)
-        response = await client.send(req, stream=True)
+
+        async def _warn_slow():
+            try:
+                await asyncio.sleep(warn_timeout)
+                print(f"⏱ {req_prefix}尝试#{attempt_num} 已等待 60s 仍无响应", flush=True)
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.warning("Warn slow upstream diagnostic failed: %s", e)
+
+        warn_task = asyncio.create_task(_warn_slow())
+        t_start = time.monotonic()
+        try:
+            response = await client.send(req, stream=True)
+        finally:
+            warn_task.cancel()
+
+        header_wait = time.monotonic() - t_start
+        try:
+            print(f"⏱ {req_prefix}尝试#{attempt_num}: 发出→响应头 {header_wait:.1f}s status={response.status_code}", flush=True)
+        except Exception as e:
+            logger.warning("Header wait diagnostic failed: %s", e)
+
         if response.status_code != 429 or attempt >= max_retries:
             return response, attempt
         try:
@@ -856,15 +892,17 @@ async def _send_stream_with_429_retry(client, url, headers, body, max_retries=2)
             await response.aclose()
         wait = min(ra if ra is not None else delays[attempt] + random.uniform(0, 1), 8.0)
         attempt += 1
-        print(f"⏳ 上游 429，{wait:.1f}s 后第 {attempt} 次重试")
+        print(f"⏳ {req_prefix}上游 429，{wait:.1f}s 后第 {attempt} 次重试")
         await asyncio.sleep(wait)
 
 
-async def _post_chat_completion_with_429_retry(client, url, api_key, body, tag="兜底", max_retries=2):
+async def _post_chat_completion_with_429_retry(client, url, api_key, body, tag="兜底", max_retries=2, req_id: str = ""):
     """针对兜底阶段非流式请求的 429 退避重试（仅上游 429 时触发）。
     返回最后一次 response。"""
     delays = (2.0, 4.0)
     attempt = 0
+    rid = req_id or (str(body.get("req_id") or "") if isinstance(body, dict) else "")
+    req_prefix = f"req={rid} " if rid else ""
     while True:
         resp = await shared.post_chat_completion(client, url, api_key, body)
         if resp.status_code != 429 or attempt >= max_retries:
@@ -874,7 +912,7 @@ async def _post_chat_completion_with_429_retry(client, url, api_key, body, tag="
         ra = _parse_retry_after(resp.headers.get("retry-after"))
         wait = min(ra if ra is not None else delays[attempt] + random.uniform(0, 1), 8.0)
         attempt += 1
-        print(f"⏳ [{tag}] 上游 429，{wait:.1f}s 后第 {attempt} 次重试", flush=True)
+        print(f"⏳ {req_prefix}[{tag}] 上游 429，{wait:.1f}s 后第 {attempt} 次重试", flush=True)
         await asyncio.sleep(wait)
 # =========================================================================
 # [Gemini/Vertex AI 专用] 上游 429 服务端退避重试 END
@@ -894,9 +932,13 @@ async def stream_and_capture(
     extraction_round_count: int = None,
     pending_memory_ids: list = None,
     pending_reminder_claims: list = None,
+    req_id: str = "",
 ):
     """流式发送期间延长提醒处理时限；结束时标记送达或交回等待重试。"""
-    stream_state = {"terminal": False}
+    rid = req_id or (str(body.get("req_id") or "") if isinstance(body, dict) else "")
+    req_prefix = f"req={rid} " if rid else ""
+    req_start_time = time.monotonic()
+    stream_state = {"terminal": False, "phase": "等上游响应头", "completed": False}
     lease_keeper = _start_reminder_lease_keeper(pending_reminder_claims)
     try:
         async for chunk in _stream_and_capture_inner(
@@ -913,9 +955,16 @@ async def stream_and_capture(
             pending_memory_ids,
             pending_reminder_claims,
             stream_state,
+            req_id=rid,
         ):
             yield chunk
     finally:
+        try:
+            if not stream_state.get("completed"):
+                elapsed = time.monotonic() - req_start_time
+                print(f"🔌 {req_prefix}客户端断开: 已用时 {elapsed:.1f} 秒, 阶段={stream_state.get('phase', '等上游响应头')}", flush=True)
+        except Exception as e:
+            logger.warning("Client disconnect diagnostic failed: %s", e)
         await _settle_reminder_claims(lease_keeper, pending_reminder_claims, stream_state["terminal"])
 
 
@@ -933,6 +982,7 @@ async def _stream_and_capture_inner(
     pending_memory_ids: list = None,
     pending_reminder_claims: list = None,
     stream_state: dict = None,
+    req_id: str = "",
 ):
     """流式响应 + 捕获完整回复（原始字节透传，确保SSE格式和thinking数据完整）"""
     full_response = []
@@ -946,6 +996,10 @@ async def _stream_and_capture_inner(
     saw_terminal = False  # 见到 data: [DONE] 或 finish_reason 才算 SSE 完整结束
     captured_finish_reason = None  # 保留最终 finish_reason 供兜底逻辑判断
     held_done_bytes = None  # malformed 时拦截 [DONE]，等兜底完成后再放行
+    rid = req_id or (str(body.get("req_id") or "") if isinstance(body, dict) else "")
+    req_prefix = f"req={rid} " if rid else ""
+    req_start_time = time.monotonic()
+    saw_first_content = False
 
     def _mark_terminal():
         nonlocal saw_terminal
@@ -961,7 +1015,12 @@ async def _stream_and_capture_inner(
         except Exception as e:
             print(f"⚠️ 动态生成 Vertex Token 失败: {e}")
             from fastapi import HTTPException
+            if stream_state is not None:
+                stream_state["completed"] = True
             raise HTTPException(status_code=502, detail=f"Vertex AI 认证令牌获取失败: {str(e)}")
+
+    if stream_state is not None:
+        stream_state["phase"] = "等上游响应头"
 
     async with httpx.AsyncClient(timeout=300) as client:
         # =========================================================================
@@ -970,7 +1029,10 @@ async def _stream_and_capture_inner(
         response, retried = await _send_stream_with_429_retry(
             client, shared.API_BASE_URL, headers, body,
             max_retries=2 if shared.is_vertex_endpoint() else 0,
+            req_id=rid,
         )
+        if stream_state is not None:
+            stream_state["phase"] = "接收中"
         try:
             if retried and response.status_code == 200:
                 print(f"✅ 429 重试成功（第 {retried} 次）")
@@ -979,7 +1041,7 @@ async def _stream_and_capture_inner(
         # =========================================================================
             # 打印上游响应头（排查thinking问题用）
             upstream_ct = response.headers.get("content-type", "")
-            print(f"📨 上游响应: status={response.status_code}, content-type={upstream_ct}", flush=True)
+            print(f"📨 {req_prefix}上游响应: status={response.status_code}, content-type={upstream_ct}", flush=True)
 
             # 上游非200时，提前打印messages结构方便debug
             if response.status_code != 200:
@@ -1021,7 +1083,7 @@ async def _stream_and_capture_inner(
                                 if not logged_stream_usage:
                                     logged_stream_usage = True
                                     try:
-                                        log_cache_usage(stream_usage)
+                                        log_cache_usage(stream_usage, req_id=rid)
                                     except Exception as e:
                                         logger.warning("Cache usage diagnostic failed: %s", e)
 
@@ -1029,7 +1091,7 @@ async def _stream_and_capture_inner(
                             choice = first_choice = choices[0] if choices else {}
                             finish_reason = first_choice.get("finish_reason")
                             if finish_reason:
-                                print(f"🏁 finish_reason: {finish_reason}")
+                                print(f"🏁 {req_prefix}finish_reason: {finish_reason}")
                                 captured_finish_reason = finish_reason
                                 _mark_terminal()
                                 # malformed_function_call: 拦截这个 finish 信号，不透传给客户端
@@ -1042,6 +1104,13 @@ async def _stream_and_capture_inner(
 
                             # === 监工排查专用日志 ===
                             if content and not is_thinking_chunk:
+                                if not saw_first_content:
+                                    saw_first_content = True
+                                    try:
+                                        ttft = time.monotonic() - req_start_time
+                                        print(f"⏱ {req_prefix}首字节 {ttft:.1f}s", flush=True)
+                                    except Exception as e:
+                                        logger.warning("TTFT diagnostic failed: %s", e)
                                 print(f"🟢 [排查] 收到正文块: {content[:30]!r}")
                             # =======================
 
@@ -1107,6 +1176,8 @@ async def _stream_and_capture_inner(
         if error_body_parts:
             error_text = b"".join(error_body_parts).decode("utf-8", errors="ignore")[:500]
             print(f"❌ 上游错误内容: {error_text}", flush=True)
+        if stream_state is not None:
+            stream_state["completed"] = True
         return
 
     # =========================================================================
@@ -1129,6 +1200,7 @@ async def _stream_and_capture_inner(
     is_empty_reply = (not assistant_msg and not assistant_tool_calls)
 
     if is_malformed or is_empty_reply:
+        phase = "兜底"
         _reason = "malformed_function_call" if is_malformed else "空正文且无 tool_calls"
         usage_str = "已收到" if (saw_stream_usage or bool(stream_usage)) else "未收到"
         if not captured_finish_reason:
@@ -1220,6 +1292,7 @@ async def _stream_and_capture_inner(
                                 retry_client, shared.API_BASE_URL, shared.API_KEY, retry_body,
                                 tag="工具挽救",
                                 max_retries=2 if shared.is_vertex_endpoint() else 0,
+                                req_id=rid,
                             )
                         )
                         async for ping in _drain_keepalive_during(retry_task):
@@ -1265,6 +1338,13 @@ async def _stream_and_capture_inner(
                                     keepalive_task.cancel()
                                 r_content_preview = r_content[:200] + ("..." if len(r_content) > 200 else "")
                                 print(f"🩹 兜底成功 (直接输出正文): 补发 {len(r_content)} 字符 | 上游usage: {usage_str} | 内容: {r_content_preview}", flush=True)
+                                if not saw_first_content:
+                                    saw_first_content = True
+                                    try:
+                                        ttft = time.monotonic() - req_start_time
+                                        print(f"⏱ {req_prefix}首字节 {ttft:.1f}s", flush=True)
+                                    except Exception as e:
+                                        logger.warning("TTFT diagnostic failed: %s", e)
                                 c_payload = json.dumps(
                                     {"choices": [{"index": 0, "delta": {"role": "assistant", "content": r_content}}]},
                                     ensure_ascii=False,
@@ -1298,6 +1378,7 @@ async def _stream_and_capture_inner(
                                 retry_client, shared.API_BASE_URL, shared.API_KEY, text_body,
                                 tag="降级纯文本",
                                 max_retries=2 if shared.is_vertex_endpoint() else 0,
+                                req_id=rid,
                             )
                         )
                         async for ping in _drain_keepalive_during(text_task):
@@ -1317,6 +1398,13 @@ async def _stream_and_capture_inner(
                             if text_content:
                                 text_preview = text_content[:200] + ("..." if len(text_content) > 200 else "")
                                 print(f"🩹 降级纯文本成功: 补发 {len(text_content)} 字符 | 上游usage: {usage_str} | 内容: {text_preview}", flush=True)
+                                if not saw_first_content:
+                                    saw_first_content = True
+                                    try:
+                                        ttft = time.monotonic() - req_start_time
+                                        print(f"⏱ {req_prefix}首字节 {ttft:.1f}s", flush=True)
+                                    except Exception as e:
+                                        logger.warning("TTFT diagnostic failed: %s", e)
                                 c_payload = json.dumps(
                                     {"choices": [{"index": 0, "delta": {"role": "assistant", "content": text_content}}]},
                                     ensure_ascii=False,
@@ -1351,6 +1439,7 @@ async def _stream_and_capture_inner(
     if (is_malformed or is_empty_reply) and not assistant_msg and not assistant_tool_calls:
         if stream_state is not None:
             stream_state["terminal"] = False
+            stream_state["completed"] = True
         return
     # =========================================================================
     # [Gemini/Vertex AI 专用] 工具调用异常挽救与空回复无感兜底 END
@@ -1381,12 +1470,12 @@ async def _stream_and_capture_inner(
         if not logged_stream_usage:
             logged_stream_usage = True
             try:
-                log_cache_usage(stream_usage)
+                log_cache_usage(stream_usage, req_id=rid)
             except Exception as e:
                 logger.warning("Cache usage diagnostic failed: %s", e)
         if shared.DATABASE_ENABLED and tt > 0 and not skip_conversation_log:
             asyncio.create_task(db_conversations.save_token_usage(session_id, model, pt, ct, tt))
-            print(f"📊 Stream Token: {pt} + {ct} = {tt}")
+            print(f"📊 {req_prefix}Stream Token: {pt} + {ct} = {tt}")
 
     if shared.conversation_persistence_enabled() and (user_message or tool_messages):
         asyncio.create_task(
@@ -1397,4 +1486,7 @@ async def _stream_and_capture_inner(
                                         tool_messages=tool_messages, assistant_tool_calls=assistant_tool_calls,
                                         assistant_reasoning=assistant_reasoning)
         )
+
+    if stream_state is not None:
+        stream_state["completed"] = True
 
