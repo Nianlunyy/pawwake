@@ -29,6 +29,44 @@ logger = logging.getLogger(__name__)
 
 FALLBACK_PHASE1_TIMEOUT = 60
 FALLBACK_PHASE2_TIMEOUT = 90
+UPSTREAM_KEEPALIVE_INTERVAL = float(os.getenv("UPSTREAM_KEEPALIVE_INTERVAL", "15.0"))
+UPSTREAM_WAIT_CAP = float(os.getenv("UPSTREAM_WAIT_CAP", "240.0"))
+
+
+def _format_seconds(val: float) -> str:
+    try:
+        if isinstance(val, (int, float)):
+            if val >= 0.95 and abs(val - round(val)) < 0.05:
+                return str(int(round(val)))
+            r1 = round(val, 1)
+            if abs(val - r1) < 0.02:
+                return f"{r1:g}"
+            r2 = round(val, 2)
+            return f"{r2:g}"
+    except Exception:
+        pass
+    return str(val)
+
+
+def _get_keepalive_interval() -> float:
+    try:
+        env_val = os.getenv("UPSTREAM_KEEPALIVE_INTERVAL")
+        if env_val is not None:
+            return float(env_val)
+    except Exception:
+        pass
+    return float(UPSTREAM_KEEPALIVE_INTERVAL)
+
+
+def _get_wait_cap() -> float:
+    try:
+        env_val = os.getenv("UPSTREAM_WAIT_CAP")
+        if env_val is not None:
+            return float(env_val)
+    except Exception:
+        pass
+    return float(UPSTREAM_WAIT_CAP)
+
 
 
 class _ReminderLeaseKeeper:
@@ -1067,14 +1105,82 @@ async def _stream_and_capture_inner(
         # =========================================================================
         # [Gemini/Vertex AI 专用] 上游 429 重试调用 START
         # =========================================================================
-        response, retried = await _send_stream_with_429_retry(
-            client, shared.API_BASE_URL, headers, body,
-            max_retries=2 if shared.is_vertex_endpoint() else 0,
-            req_id=rid,
+        keepalive_interval = _get_keepalive_interval()
+        wait_cap = _get_wait_cap()
+        t_wait_start = time.monotonic()
+        keepalive_count = 0
+        cap_exceeded = False
+
+        upstream_task = asyncio.create_task(
+            _send_stream_with_429_retry(
+                client, shared.API_BASE_URL, headers, body,
+                max_retries=2 if shared.is_vertex_endpoint() else 0,
+                req_id=rid,
+            )
         )
-        if stream_state is not None:
-            stream_state["phase"] = "接收中"
+        response = None
         try:
+            while not upstream_task.done():
+                now = time.monotonic()
+                time_until_cap = (t_wait_start + wait_cap) - now
+                if time_until_cap <= 0:
+                    cap_exceeded = True
+                    break
+
+                time_until_keepalive = (t_wait_start + (keepalive_count + 1) * keepalive_interval) - now
+                if time_until_keepalive <= 0:
+                    keepalive_count += 1
+                    if keepalive_count == 1:
+                        try:
+                            n_sec = _format_seconds(keepalive_interval)
+                            print(f"📡 {req_prefix}等上游响应头已 {n_sec} 秒，开始发保活", flush=True)
+                        except Exception as e:
+                            logger.warning("Keepalive diagnostic failed: %s", e)
+                    yield b": keep-alive\n\n"
+                    continue
+
+                wait_timeout = min(time_until_keepalive, time_until_cap)
+                done, _ = await asyncio.wait([upstream_task], timeout=wait_timeout)
+                if upstream_task.done():
+                    break
+
+            if cap_exceeded:
+                upstream_task.cancel()
+                try:
+                    await upstream_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+                try:
+                    cap_str = _format_seconds(wait_cap)
+                    print(f"⏱ {req_prefix}等待超上限 {cap_str} 秒，已取消", flush=True)
+                except Exception as e:
+                    logger.warning("Wait cap diagnostic failed: %s", e)
+
+                error_msg = f"上游 {cap_str} 秒无响应"
+                err_payload = json.dumps(
+                    {"error": {"message": error_msg, "type": "fallback_failed", "code": 502}},
+                    ensure_ascii=False,
+                )
+                yield f"data: {err_payload}\n\n".encode("utf-8")
+                yield b"data: [DONE]\n\n"
+
+                if stream_state is not None:
+                    stream_state["terminal"] = False
+                    stream_state["completed"] = True
+                return
+
+            response, retried = await upstream_task
+            header_wait = time.monotonic() - t_wait_start
+            if keepalive_count > 0:
+                try:
+                    n_sec = _format_seconds(header_wait)
+                    print(f"📡 {req_prefix}保活共 {keepalive_count} 次，响应头在 {n_sec} 秒到达", flush=True)
+                except Exception as e:
+                    logger.warning("Keepalive arrived diagnostic failed: %s", e)
+
+            if stream_state is not None:
+                stream_state["phase"] = "接收中"
             if retried and response.status_code == 200:
                 print(f"✅ 429 重试成功（第 {retried} 次）")
         # =========================================================================
@@ -1205,7 +1311,14 @@ async def _stream_and_capture_inner(
                 yield line_buffer.encode("utf-8")
             stream_succeeded = response.status_code == 200
         finally:
-            await response.aclose()
+            if not upstream_task.done():
+                upstream_task.cancel()
+                try:
+                    await upstream_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if response is not None:
+                await response.aclose()
 
     assistant_msg = "".join(full_response)
     assistant_reasoning = "".join(full_reasoning) if full_reasoning else None
