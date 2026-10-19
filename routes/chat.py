@@ -859,7 +859,7 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
         lease_keeper = _start_reminder_lease_keeper(pending_reminder_claims)
         try:
             async with httpx.AsyncClient(timeout=300) as client:
-                response = await client.post(shared.API_BASE_URL, headers=headers, json=body)
+                response = await _post_chat_completion_with_429_retry(client, shared.API_BASE_URL, shared.API_KEY, body, tag="非流式", max_retries=2 if shared.is_vertex_endpoint() else 0, req_id=req_id)
 
                 if response.status_code == 200:
                     resp_data = response.json()
