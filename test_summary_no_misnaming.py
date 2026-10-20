@@ -4,8 +4,8 @@ Verifies:
 a) generate_summary 与 fold_summary_parts 构造出的实际提示词均含新增噪声过滤规则：
    "称呼说错、认错人，以及由此产生的道歉与澄清，属于噪声，整件事不写入摘要。"
 b) generate_summary 构造出的实际提示词含正向封闭的人称规则：
-   "摘要中指代她一律写\"阿狸\"，自称一律写\"我\"。"
-c) 提示词全文严格不含 "陈工" 与 "乌龙"。
+   "摘要中指代她只写\"阿狸\"或\"狸宝\"，自称一律写\"我\"。"
+c) 提示词全文严格不含特定误称与口误事件词。
 """
 
 import asyncio
@@ -72,19 +72,22 @@ class TestSummaryNoMisnaming(unittest.TestCase):
         fold_prompt = _capture_fold_summary_prompt()
 
         rule_noise = "称呼说错、认错人，以及由此产生的道歉与澄清，属于噪声，整件事不写入摘要。"
-        rule_person = '摘要中指代她一律写"阿狸"，自称一律写"我"。'
+        rule_person = '摘要中指代她只写"阿狸"或"狸宝"，自称一律写"我"。'
 
-        # 断言 a: 含新增的噪声过滤规则（摘要提示词与折叠提示词均须包含）
-        with self.subTest("断言 a: 含新增的噪声过滤规则"):
+        # 断言 a（摘要）: generate_summary 提示词含新增噪声过滤规则
+        with self.subTest("断言 a（摘要）: generate_summary 含新增噪声过滤规则"):
             self.assertIn(
                 rule_noise,
                 gen_prompt,
-                "断言 a 失败: generate_summary 提示词未包含新增的噪声过滤规则",
+                "断言 a（摘要）失败: generate_summary 提示词未包含新增的噪声过滤规则",
             )
+
+        # 断言 a（折叠）: fold_summary_parts 提示词含新增噪声过滤规则
+        with self.subTest("断言 a（折叠）: fold_summary_parts 含新增噪声过滤规则"):
             self.assertIn(
                 rule_noise,
                 fold_prompt,
-                "断言 a 失败: fold_summary_parts 提示词未包含新增的噪声过滤规则",
+                "断言 a（折叠）失败: fold_summary_parts 提示词未包含新增的噪声过滤规则",
             )
 
         # 断言 b: 含正向封闭的人称规则
@@ -95,9 +98,9 @@ class TestSummaryNoMisnaming(unittest.TestCase):
                 "断言 b 失败: generate_summary 提示词未包含正向封闭的人称映射规则",
             )
 
-        # 断言 c: 整段提示词不含禁词"陈工"与"乌龙"
-        with self.subTest("断言 c: 整段提示词不含'陈工'与'乌龙'"):
-            forbidden_words = ["陈工", "乌龙"]
+        # 断言 c: 整段提示词不含特定误称与口误事件词
+        with self.subTest("断言 c: 整段提示词不含特定误称与口误词"):
+            forbidden_words = ["\u9648\u5de5", "\u4e4c\u9f99"]
             for word in forbidden_words:
                 self.assertNotIn(
                     word,
