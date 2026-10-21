@@ -786,20 +786,49 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
         print(f"⚡ 强制开启流式传输（FORCE_STREAM=true）")
 
     # 注入推理参数（解决客户端走网关时不带reasoning参数的问题）
-    if shared.REASONING_EFFORT and not skip_conversation_log:
+    effective_effort = shared.REASONING_EFFORT
+    effort_source = "default"
+    req_prefix = f"req={req_id} " if req_id else ""
+    try:
+        raw_header = request.headers.get("X-Thinking-Level")
+        if raw_header is not None:
+            cleaned_header = raw_header.strip().lower()
+            if cleaned_header in {"minimal", "low", "medium", "high"}:
+                effective_effort = cleaned_header
+                effort_source = "header"
+            else:
+                try:
+                    logger.warning(f"⚠️ {req_prefix}忽略非法 X-Thinking-Level 头值: {raw_header!r}，沿用默认: {shared.REASONING_EFFORT}")
+                except Exception:
+                    pass
+    except Exception as e:
+        effective_effort = shared.REASONING_EFFORT
+        effort_source = "default"
+        try:
+            logger.warning(f"⚠️ {req_prefix}读取 X-Thinking-Level 头异常: {e}，沿用默认")
+        except Exception:
+            pass
+
+    if effective_effort and not skip_conversation_log:
         body.pop("reasoning_effort", None)
         body.pop("google", None)
         if shared.is_vertex_endpoint():
             body["google"] = {
                 "thinking_config": {
-                    "thinking_level": shared.REASONING_EFFORT,
+                    "thinking_level": effective_effort,
                     "include_thoughts": True
                 }
             }
-            print(f"🧠 注入推理参数(Gemini): thinking_level={shared.REASONING_EFFORT}, include_thoughts=True")
+            try:
+                print(f"🧠 {req_prefix}注入推理参数(Gemini): thinking_level={effective_effort}, include_thoughts=True (source={effort_source})")
+            except Exception:
+                pass
         else:
-            body["reasoning_effort"] = shared.REASONING_EFFORT
-            print(f"🧠 注入推理参数: reasoning_effort={shared.REASONING_EFFORT}")
+            body["reasoning_effort"] = effective_effort
+            try:
+                print(f"🧠 {req_prefix}注入推理参数: reasoning_effort={effective_effort} (source={effort_source})")
+            except Exception:
+                pass
 
     req_prefix = f"req={req_id} " if req_id else ""
     print(f"📡 {req_prefix}请求: model={model}, stream={is_stream}, memory={'on' if shared.MEMORY_ENABLED else 'off'}", flush=True)
