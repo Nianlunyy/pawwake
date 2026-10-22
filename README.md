@@ -4,7 +4,7 @@
   <img src="https://raw.githubusercontent.com/DasterProkio/awesome-ai-companion/main/assets/featured-in-awesome-ai-companion.png" alt="Featured in Awesome AI Companion" height="24">
 </a>
 
-**4.1.9 · Madeleine**
+**4.1.10 · Madeleine**
 
 *Follow the pawprints back.*
 
@@ -104,7 +104,7 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 
 从 4.0 升级时，先补齐 `DASHBOARD_PASSWORD` 和 `SESSION_SECRET` 再重新部署；缺少任一项时 Dashboard 会返回 503，程序 API 仍可继续用 `X-Gateway-Key` 访问。
 
-> ⚠️ Render 免费层的服务在无活动时会休眠，第一次访问需要等几十秒唤醒，之后就正常了。其他支持 Docker 部署的平台（Zeabur、Railway、Fly.io 等）也可以，流程类似。
+> ⚠️ Render 免费层的服务在无活动时会休眠，第一次访问需要等几十秒唤醒，之后就正常了。其他支持 Docker 部署的平台（Railway、Fly.io 等）也可以，流程类似。
 
 **4. 连接客户端**
 
@@ -402,6 +402,11 @@ A: 打开 `https://你的网关地址/dashboard`，在「导出备份」页面�
 A: 能。这个项目的第一个部署者就是不会写代码的——代码是 AI 写的，部署是她自己看文档搞定的。
 
 ## 📋 更新日志
+
+### v4.1.10 · Madeleine（2026-10-22）
+
+- **修复鉴权绕过（CVE-2026-48710）** — 旧版依赖带的 Starlette 会被畸形 Host 请求头骗过，把受保护的接口当成公开路径放行。鉴权改按实际请求路径判断，同时锁定 FastAPI 0.143.0、Starlette 1.8.0、Jinja2 3.1.6。依赖有变，升级后需重新部署或重新安装依赖才生效，所有部署都建议升级。
+- **Dashboard 转义加固** — 会话 ID 不再写进按钮的行内脚本，记忆列表统一用同一个转义函数。
 
 ### v4.1.9 · Madeleine（2026-10-11）
 

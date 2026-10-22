@@ -198,7 +198,7 @@ function renderTable(mems, startIndex) {
         const titleDisplay = m.title || '';
         const mergedFrom = m.merged_from || [];
         const candidateInfo = m.candidate_reasons && m.candidate_reasons.length
-            ? '<small class="form-hint">候选：' + escHtml(m.candidate_reasons.join('；')) + '</small>'
+            ? '<small class="form-hint">候选：' + escapeHtml(m.candidate_reasons.join('；')) + '</small>'
             : '';
         
         // 层级下拉选择器
@@ -250,11 +250,11 @@ function renderTable(mems, startIndex) {
             '<td class="col-check"><input type="checkbox" class="mem-check" value="' + m.id + '" onchange="updateFloatingBar()"></td>' +
             '<td class="col-id">' + (startIndex + i + 1) + mergeInfo + versionInfo + '</td>' +
             '<td class="col-layer">' + layerSelect + '</td>' +
-            '<td class="col-title"><input type="text" class="title-input" id="t_' + m.id + '" value="' + escHtml(titleDisplay) + '" placeholder="无标题">' + candidateInfo + '</td>' +
-            '<td class="col-content"><textarea class="content-textarea" id="c_' + m.id + '">' + escHtml(m.content) + '</textarea></td>' +
+            '<td class="col-title"><input type="text" class="title-input" id="t_' + m.id + '" value="' + escapeHtml(titleDisplay) + '" placeholder="无标题">' + candidateInfo + '</td>' +
+            '<td class="col-content"><textarea class="content-textarea" id="c_' + m.id + '">' + escapeHtml(m.content) + '</textarea></td>' +
             '<td class="col-importance"><input type="number" class="importance-input" id="i_' + m.id + '" value="' + m.importance + '" min="1" max="10"></td>' +
             '<td class="col-time">' + fmtTime(m.event_date || m.created_at) +
-                (m.remind_at ? '<div class="reminder-tag" title="到期后自动注入一次">⏰ ' + escHtml(m.remind_at.slice(0, 16)) + (m.reminder_delivered_at ? '（已提醒）' : '') + '</div>' : '') +
+                (m.remind_at ? '<div class="reminder-tag" title="到期后自动注入一次">⏰ ' + escapeHtml(m.remind_at.slice(0, 16)) + (m.reminder_delivered_at ? '（已提醒）' : '') + '</div>' : '') +
             '</td>' +
             '<td class="col-actions"><div class="row-actions">' +
                 '<button class="btn btn-primary btn-sm" onclick="saveMem(' + m.id + ')">保存</button>' +
@@ -267,7 +267,7 @@ function renderTable(mems, startIndex) {
     }).join('');
 }
 
-function escHtml(s) {
+function escapeHtml(s) {
     if (!s) return '';
     return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
@@ -693,7 +693,7 @@ async function showMergeSource(id) {
         let html = '<h3>合并来源</h3>';
         html += '<p style="color:var(--text-light);margin-bottom:16px;">以下 ' + sources.length + ' 条碎片被合并成了这条事件记忆：</p>';
         sources.forEach((src, i) => {
-            html += '<div class="source-item"><b>第' + (i + 1) + '条</b><br>' + escHtml(src.content) + '</div>';
+            html += '<div class="source-item"><b>第' + (i + 1) + '条</b><br>' + escapeHtml(src.content) + '</div>';
         });
         html += '<div class="modal-actions"><button class="btn btn-secondary" onclick="closeMergeSourceModal()">关闭</button></div>';
         
@@ -741,7 +741,7 @@ async function showVersionChain(id) {
         chain.forEach((memory, index) => {
             const status = memory.is_active === false ? '已取代' : '活跃';
             html += '<div class="source-item"><b>版本 ' + (index + 1) + ' · ' + status + '</b><br>' +
-                escHtml(memory.content) + '</div>';
+                escapeHtml(memory.content) + '</div>';
         });
         html += '<div class="modal-actions"><button class="btn btn-secondary" onclick="closeMergeSourceModal()">关闭</button></div>';
         document.getElementById('mergeSourceContent').innerHTML = html;
@@ -1430,7 +1430,7 @@ async function repairBrokenReferences(count) {
         const resp = await fetch('/api/memories/repair-broken-references', { method: 'POST' });
         const data = await resp.json();
         if (data.error) {
-            el.innerHTML = '<div class="msg msg-error">❌ ' + escHtml(data.error) + '</div>';
+            el.innerHTML = '<div class="msg msg-error">❌ ' + escapeHtml(data.error) + '</div>';
             return;
         }
         const type = data.repaired > 0 ? 'success' : 'info';
@@ -1439,7 +1439,7 @@ async function repairBrokenReferences(count) {
             : '没有需要修复的断裂引用。';
         el.innerHTML = '<div class="msg msg-' + type + '">' + text + '</div>';
     } catch(e) {
-        el.innerHTML = '<div class="msg msg-error">❌ 修复失败：' + escHtml(e.message) + '</div>';
+        el.innerHTML = '<div class="msg msg-error">❌ 修复失败：' + escapeHtml(e.message) + '</div>';
     }
 }
 
@@ -1700,7 +1700,7 @@ function renderConvList(conversations, isSearch = false, trash = convTrashMode) 
             <input type="checkbox" class="conv-checkbox" value="${escapeHtml(sid)}" 
                    onchange="updateConvSelectionCount()" 
                    style="margin-right: 10px; margin-top: 4px; cursor: pointer; flex-shrink: 0;">
-            <div style="flex: 1; min-width: 0; cursor: pointer;" onclick="openConvDetail('${escapeHtml(sid)}', ${trash})">
+            <div data-session-id="${escapeHtml(sid)}" style="flex: 1; min-width: 0; cursor: pointer;" onclick="openConvDetail(this.dataset.sessionId, ${trash})">
                 <div style="display: flex; justify-content: space-between; align-items: flex-start;">
                     <div style="flex: 1; min-width: 0;">
                         <div style="font-weight: 500; margin-bottom: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${title}</div>
@@ -1792,9 +1792,9 @@ async function loadConvMessages(sessionId, append = false, trash = convDetailTra
         if (!append) {
             html += `<div style="margin-bottom: 12px; display: flex; gap: 8px; justify-content: flex-end;">
                 ${trash
-                    ? `<button class="btn btn-sm" onclick="restoreConversation('${escapeHtml(sessionId)}')">恢复整段删除</button>
-                       <button class="btn btn-sm" onclick="permanentlyDeleteConversation('${escapeHtml(sessionId)}')" style="color: var(--error);">${ICONS.trash(13)} 永久删除回收站内容</button>`
-                    : `<button class="btn btn-sm" onclick="deleteConversation('${escapeHtml(sessionId)}')">${ICONS.trash(13)} 删除对话</button>`}
+                    ? `<button class="btn btn-sm" data-session-id="${escapeHtml(sessionId)}" onclick="restoreConversation(this.dataset.sessionId)">恢复整段删除</button>
+                       <button class="btn btn-sm" data-session-id="${escapeHtml(sessionId)}" onclick="permanentlyDeleteConversation(this.dataset.sessionId)" style="color: var(--error);">${ICONS.trash(13)} 永久删除回收站内容</button>`
+                    : `<button class="btn btn-sm" data-session-id="${escapeHtml(sessionId)}" onclick="deleteConversation(this.dataset.sessionId)">${ICONS.trash(13)} 删除对话</button>`}
             </div>`;
         }
         
@@ -1832,7 +1832,7 @@ async function loadConvMessages(sessionId, append = false, trash = convDetailTra
         // 加载更多按钮
         if (convDetailLoadedCount < total) {
             html += `<div style="text-align: center; padding: 16px 0;">
-                <button class="btn btn-primary" onclick="loadConvMessages('${escapeHtml(sessionId)}', true, ${trash})">
+                <button class="btn btn-primary" data-session-id="${escapeHtml(sessionId)}" onclick="loadConvMessages(this.dataset.sessionId, true, ${trash})">
                     加载更多（还有 ${total - convDetailLoadedCount} 条）
                 </button>
             </div>`;
@@ -2146,13 +2146,6 @@ async function batchMergeSessions() {
     }
 }
 
-// 工具函数
-function escapeHtml(str) {
-    const div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
-}
-
 function formatConvTime(isoStr) {
     try {
         const d = new Date(isoStr);
@@ -2208,7 +2201,7 @@ function renderThreadStatus(status) {
     
     el.innerHTML = `
         <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px;">
-            <div><strong>活跃对话线</strong><br><span style="font-size: 18px; color: var(--primary);">${status.active_session_id || '未设置'}</span></div>
+            <div><strong>活跃对话线</strong><br><span style="font-size: 18px; color: var(--primary);">${escapeHtml(status.active_session_id || '未设置')}</span></div>
             <div><strong>轮转周期</strong><br>每 ${status.partition_x} 轮</div>
             <div><strong>摘要长度</strong><br>${status.summary_length} 字</div>
             <div><strong>A区起始轮</strong><br>第 ${status.a_start_round} 轮</div>
@@ -2226,28 +2219,30 @@ function renderThreadList(threads) {
     let html = '';
     for (const t of threads) {
         const isActive = t.is_active;
+        const sessionId = escapeHtml(t.session_id);
+        const messageCount = Number(t.message_count) || 0;
         const tokens = t.chat_tokens > 0 ? (t.chat_tokens >= 1000 ? (t.chat_tokens / 1000).toFixed(1) + 'K' : t.chat_tokens) : '0';
-        const summaryPreview = t.summary ? (t.summary.substring(0, 80) + (t.summary.length > 80 ? '...' : '')) : '（无摘要）';
+        const summaryPreview = escapeHtml(t.summary ? (t.summary.substring(0, 80) + (t.summary.length > 80 ? '...' : '')) : '（无摘要）');
         const updatedStr = t.updated_at ? formatConvTime(t.updated_at) : '';
         
         html += `
         <div style="border: 1px solid ${isActive ? 'var(--primary)' : 'var(--border)'}; border-radius: 8px; padding: 14px; margin-bottom: 8px; ${isActive ? 'background: var(--bg-card); box-shadow: 0 0 0 1px var(--primary);' : ''}">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
                 <div style="display: flex; align-items: center; gap: 8px;">
-                    <span style="font-weight: 600; font-size: 15px;">${t.session_id}</span>
+                    <span style="font-weight: 600; font-size: 15px;">${sessionId}</span>
                     ${isActive ? '<span style="background: var(--primary); color: white; font-size: 11px; padding: 2px 8px; border-radius: 10px;">活跃</span>' : ''}
                 </div>
                 <div style="display: flex; gap: 6px;">
-                    <button class="btn btn-sm" onclick="renameThread('${t.session_id}')">改名</button>
-                    <button class="btn btn-sm" onclick="openSummaryModal('${t.session_id}')">摘要</button>
-                    ${!isActive ? `<button class="btn btn-sm btn-primary" onclick="switchThread('${t.session_id}')">切换到此</button>` : ''}
-                    ${!isActive ? `<button class="btn btn-sm" onclick="deleteThread('${t.session_id}', ${t.message_count || 0})" style="color: var(--error);">删除</button>` : ''}
+                    <button class="btn btn-sm" data-session-id="${sessionId}" onclick="renameThread(this.dataset.sessionId)">改名</button>
+                    <button class="btn btn-sm" data-session-id="${sessionId}" onclick="openSummaryModal(this.dataset.sessionId)">摘要</button>
+                    ${!isActive ? `<button class="btn btn-sm btn-primary" data-session-id="${sessionId}" onclick="switchThread(this.dataset.sessionId)">切换到此</button>` : ''}
+                    ${!isActive ? `<button class="btn btn-sm" data-session-id="${sessionId}" data-message-count="${messageCount}" onclick="deleteThread(this.dataset.sessionId, Number(this.dataset.messageCount))" style="color: var(--error);">删除</button>` : ''}
                 </div>
             </div>
             <div style="color: var(--text-muted); font-size: 13px; line-height: 1.5;">
                 <div>${summaryPreview}</div>
                 <div style="margin-top: 6px; display: flex; gap: 16px;">
-                    <span>${t.message_count} 条消息</span>
+                    <span>${messageCount} 条消息</span>
                     <span>${tokens}</span>
                     <span>摘要 ${t.summary_length} 字</span>
                     ${updatedStr ? `<span>更新于 ${updatedStr}</span>` : ''}
@@ -2265,7 +2260,8 @@ function updateCopyFromSelect(threads) {
     sel.innerHTML = '<option value="">不继承，从零开始</option>';
     for (const t of threads) {
         if (t.summary_length > 0) {
-            sel.innerHTML += `<option value="${t.session_id}">${t.session_id} (${t.summary_length}字)</option>`;
+            const sessionId = escapeHtml(t.session_id);
+            sel.innerHTML += `<option value="${sessionId}">${sessionId} (${t.summary_length}字)</option>`;
         }
     }
 }
