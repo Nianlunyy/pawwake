@@ -70,7 +70,7 @@ def require_database_enabled():
 
 async def gateway_auth_middleware(request: Request, call_next):
     """API 使用请求头鉴权，Dashboard 使用独立的签名 Cookie。"""
-    path = request.url.path
+    path = request.scope["path"]
 
     # 公开路径不需要鉴权（根路径精确匹配）
     if path == "/":
