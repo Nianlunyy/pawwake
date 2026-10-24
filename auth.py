@@ -20,6 +20,39 @@ PUBLIC_PATHS = ("/", "/static/", "/health", "/favicon.ico")
 DASHBOARD_PATH_PREFIXES = ("/api/", "/import/", "/export/")
 DASHBOARD_WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
+_warned_no_secret = False
+
+
+def _warn_missing_secret_once():
+    """未设置密钥时启动或首次请求打印一次不含值的警告日志。"""
+    global _warned_no_secret
+    if not _warned_no_secret:
+        _warned_no_secret = True
+        print("⚠️  GATEWAY_SECRET 未设置！网关保护端点将拒绝所有未授权请求！")
+        print("⚠️  请在环境变量中设置 GATEWAY_SECRET 以启用 API 鉴权")
+
+
+def get_gateway_secrets() -> list[str]:
+    """支持逗号分隔的多个 Key：按逗号拆分、strip、丢弃空项。"""
+    raw = getattr(shared, "GATEWAY_SECRET", "") or ""
+    return [k.strip() for k in raw.split(",") if k.strip()]
+
+
+def verify_gateway_key(provided_key: str) -> bool:
+    """X-Gateway-Key 与每一项都用 secrets.compare_digest 比较，且不因命中而提前跳出（遍历全部再汇总）。"""
+    keys = get_gateway_secrets()
+    if not keys or not provided_key:
+        return False
+    matched = False
+    for expected in keys:
+        if secrets.compare_digest(provided_key, expected):
+            matched = True
+    return matched
+
+
+if not get_gateway_secrets():
+    _warn_missing_secret_once()
+
 
 def dashboard_auth_ready() -> bool:
     return bool(shared.DASHBOARD_PASSWORD and len(shared.SESSION_SECRET) >= 32)
@@ -88,22 +121,17 @@ async def gateway_auth_middleware(request: Request, call_next):
 
     # 程序调用只接受请求头，不让主密钥进入 URL、浏览器历史或前端脚本。
     provided_key = request.headers.get("X-Gateway-Key", "")
-    if shared.GATEWAY_SECRET and secrets.compare_digest(provided_key, shared.GATEWAY_SECRET):
+    if verify_gateway_key(provided_key):
         return await call_next(request)
 
     # 显式记忆写入只接受网关密钥，Dashboard Cookie 不授予这个外部写入口。
     if path == "/api/memories" and request.method == "POST":
-        if not shared.GATEWAY_SECRET:
-            return JSONResponse(
-                status_code=503,
-                content={"error": "GATEWAY_SECRET is required for this endpoint."},
-            )
         return JSONResponse(
             status_code=401,
             content={"error": "Unauthorized. Provide X-Gateway-Key header."},
         )
 
-    if is_dashboard_path(path) and (shared.GATEWAY_SECRET or shared.DASHBOARD_PASSWORD or shared.SESSION_SECRET):
+    if is_dashboard_path(path) and (get_gateway_secrets() or shared.DASHBOARD_PASSWORD or shared.SESSION_SECRET):
         if not dashboard_auth_ready():
             return JSONResponse(
                 status_code=503,
@@ -123,13 +151,9 @@ async def gateway_auth_middleware(request: Request, call_next):
             content={"error": "Dashboard login required."},
         )
 
-    # 未设置密钥时保留旧部署行为，但明确提示公网部署风险。
-    if not shared.GATEWAY_SECRET:
-        if not hasattr(gateway_auth_middleware, "_warned"):
-            print("⚠️  GATEWAY_SECRET 未设置！API 端点不受保护！")
-            print("⚠️  请在环境变量中设置 GATEWAY_SECRET 以启用 API 鉴权")
-            gateway_auth_middleware._warned = True
-        return await call_next(request)
+    # 未设置密钥时网关保护路径一律拒绝（返回 401），并确保警告已打印。
+    if not get_gateway_secrets():
+        _warn_missing_secret_once()
 
     return JSONResponse(
         status_code=401,
