@@ -84,6 +84,13 @@ def _diagnose_incomplete(finish_reason, completion_tokens, reasoning_tokens) -> 
     )
 
 
+def _format_preview_300(content: str) -> str:
+    """内容预览上限 300 字符，超出标注 '…(已截断，共 N 字)'"""
+    if len(content) > 300:
+        return content[:300] + f"…(已截断，共 {len(content)} 字)"
+    return content
+
+
 def _diagnose_json_error(e: json.JSONDecodeError, content: str) -> str:
     """提取 JSONDecodeError 出错行附近内容及光标指示，方便完全定位报错根源。"""
     lines = content.splitlines()
@@ -451,7 +458,7 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
             if reasoning_tokens is not None:
                 usage_part += f"（其中推理 {reasoning_tokens}）"
             print(
-                f"📝 记忆模型原始返回（{len(text)} 字符，finish_reason={finish_reason}{usage_part}）:\n{text[:500]}",
+                f"📝 记忆模型原始返回（{len(text)} 字符，finish_reason={finish_reason}{usage_part}）:\n{_format_preview_300(text)}",
                 flush=True,
             )
 
@@ -481,7 +488,7 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
                         print(_diagnose_json_error(e, match.group()))
                         if finish_reason == "length":
                             print("⚠️ 本次输出被 max_tokens 截断（finish_reason=length），解析失败多半源于截断，推理 token 占用见上方原始返回行")
-                        print(f"📝 完整原始返回（共 {len(text)} 字符）:\n{text}", flush=True)
+                        print(f"📝 原始返回（共 {len(text)} 字符）:\n{_format_preview_300(text)}", flush=True)
                         return []
                 else:
                     # 不要补上收尾的 ]：断掉的可能是半个字符串，
@@ -490,7 +497,7 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
                         f"⚠️  记忆提取结果中未找到完整 JSON 数组（共 {raw_len} 字符），本轮跳过\n"
                         f"    {_diagnose_incomplete(finish_reason, completion_tokens, reasoning_tokens)}"
                     )
-                    print(f"📝 完整原始返回（共 {len(text)} 字符）:\n{text}", flush=True)
+                    print(f"📝 原始返回（共 {len(text)} 字符）:\n{_format_preview_300(text)}", flush=True)
                     return []
 
             if not isinstance(memories, list):
@@ -554,7 +561,7 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
         if finish_reason == "length":
             print("⚠️ 本次输出被 max_tokens 截断（finish_reason=length），解析失败多半源于截断，推理 token 占用见上方原始返回行")
         if response is not None:
-            print(f"📝 响应体前 2000 字符（共 {len(response.text)} 字符）:\n{body}", flush=True)
+            print(f"📝 响应体预览（共 {len(response.text)} 字符）:\n{_format_preview_300(body)}", flush=True)
         else:
             print("📝 响应体不可用", flush=True)
         return []

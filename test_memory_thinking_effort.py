@@ -174,7 +174,7 @@ class TestMemoryThinkingEffort(unittest.TestCase):
             "⚠️ 本次输出被 max_tokens 截断（finish_reason=length），解析失败多半源于截断，推理 token 占用见上方原始返回行",
             out,
         )
-        self.assertIn("完整原始返回", out)
+        self.assertIn("原始返回", out)
         print(f"✅ 用例c(source_refs截断诊断): 成功拦截截断异常，返回 [] 并打印截断诊断告警")
 
     def test_case_d_normal_response_with_various_efforts(self):
@@ -248,7 +248,7 @@ class TestMemoryThinkingEffort(unittest.TestCase):
         self.assertEqual(result, [])
         self.assertIn("⚠️  记忆提取结果解析失败", out)
         self.assertIn("<html>502", out)
-        self.assertIn("响应体前 2000 字符", out)
+        self.assertIn("响应体预览", out)
         self.assertNotIn(sentinel, out)
         self.assertNotIn("本次输出被 max_tokens 截断", out)
         print(f"✅ 用例e(response.json异常拦截): 成功截获 502 HTML 响应体，日志含 <html>502 且排除哨兵输入句")

@@ -14,6 +14,7 @@ Module map:
 """
 
 import os
+import re
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
@@ -37,6 +38,11 @@ from routes.partition import router as partition_router
 # ============================================================
 # 应用生命周期管理
 # ============================================================
+
+def sanitize_exception_message(msg: str) -> str:
+    """脱敏形如 scheme://user:pass@host 的 URL 里的用户名密码。"""
+    return re.sub(r'([a-zA-Z][a-zA-Z0-9+.-]*://)([^/\s@]+@)', r'\1***@', str(msg))
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -126,7 +132,9 @@ async def lifespan(app: FastAPI):
         if shared.CACHE_PARTITION_ENABLED:
             print(f"🔒 分区缓存已启用: X={shared.CACHE_PARTITION_X}, 摘要模型={shared.CACHE_SUMMARY_MODEL or '（未配置，纯轮转模式）'}")
     except Exception as e:
-        print(f"⚠️  数据库初始化失败: {e}")
+        err_type = type(e).__name__
+        sanitized_msg = sanitize_exception_message(str(e))
+        print(f"⚠️  数据库初始化失败: {err_type}: {sanitized_msg}")
         if shared.CACHE_PARTITION_ENABLED:
             print("⚠️  分区缓存需要数据库；聊天请求将返回 503，避免丢失历史")
         else:

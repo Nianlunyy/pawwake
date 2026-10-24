@@ -166,8 +166,8 @@ class TestMemoryExtractBudget(unittest.TestCase):
         self.assertEqual(result, [])
         self.assertIn("记忆提取结果解析失败", output)
         self.assertIn("错误行及上下文", output)
-        self.assertIn("完整原始返回", output)
-        print(f"✅ 用例5(畸形JSON行上下文诊断): 成功定位行号与完整原始返回，输出片段:\n{output.strip()[:300]}...")
+        self.assertIn("原始返回", output)
+        print(f"✅ 用例5(畸形JSON行上下文诊断): 成功定位行号与原始返回，输出片段:\n{output.strip()[:300]}...")
 
 
 if __name__ == "__main__":

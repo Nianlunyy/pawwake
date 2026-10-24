@@ -768,7 +768,7 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
         try:
             fresh_token = shared.get_vertex_access_token()
             headers["Authorization"] = f"Bearer {fresh_token}"
-            print(f"🔑 Vertex Token 已注入, 前缀: {fresh_token[:20]}..., 长度: {len(fresh_token)}")
+            print(f"🔑 Vertex Token 已注入, 长度: {len(fresh_token)}")
         except Exception as e:
             print(f"⚠️ 动态生成 Vertex Token 失败: {e}")
             from fastapi import HTTPException
@@ -892,7 +892,9 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
 
                 if response.status_code == 200:
                     resp_data = response.json()
-                    print(f"🔬 原始响应完整结构: {json.dumps(resp_data.get('choices', [{}])[0].get('message', {}), ensure_ascii=False)[:2000]}")
+                    raw_msg = json.dumps(resp_data.get('choices', [{}])[0].get('message', {}), ensure_ascii=False)
+                    msg_preview = raw_msg[:80] + ("..." if len(raw_msg) > 80 else "")
+                    print(f"🔬 原始响应完整结构（共 {len(raw_msg)} 字符）: {msg_preview}")
                     print(f"🔍 完整usage原始数据(排查缓存字段用): {json.dumps(resp_data.get('usage', {}), ensure_ascii=False)}")
                     try:
                         log_cache_usage(resp_data.get("usage", {}), req_id=req_id)
@@ -1119,7 +1121,7 @@ async def _stream_and_capture_inner(
         try:
             fresh_token = shared.get_vertex_access_token()
             headers["Authorization"] = f"Bearer {fresh_token}"
-            print(f"🔑 Vertex Token 已注入, 前缀: {fresh_token[:20]}..., 长度: {len(fresh_token)}")
+            print(f"🔑 Vertex Token 已注入, 长度: {len(fresh_token)}")
         except Exception as e:
             print(f"⚠️ 动态生成 Vertex Token 失败: {e}")
             from fastapi import HTTPException
