@@ -41,7 +41,7 @@ from routes.partition import router as partition_router
 
 def sanitize_exception_message(msg: str) -> str:
     """脱敏形如 scheme://user:pass@host 的 URL 里的用户名密码。"""
-    return re.sub(r'([a-zA-Z][a-zA-Z0-9+.-]*://)([^/\s@]+@)', r'\1***@', str(msg))
+    return re.sub(r'([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s]*@', r'\1***@', str(msg))
 
 
 @asynccontextmanager

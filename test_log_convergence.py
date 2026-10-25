@@ -142,7 +142,7 @@ class TestLogConvergence(unittest.TestCase):
         self.assertNotIn("x" * 350, out)
 
     def test_sanitize_exception_message(self):
-        """验证异常脱敏函数对三种输入（带密码URL、不带密码URL、普通文本）的处理"""
+        """验证异常脱敏函数对多种输入（带密码URL、特殊密码URL、不带密码URL、普通文本）的处理"""
         # 1. 带密码的 postgres URL
         url_with_pass = "failed to connect to postgresql://myuser:super_secret_pw@db.neon.tech:5432/main_db?sslmode=require"
         sanitized_1 = sanitize_exception_message(url_with_pass)
@@ -150,10 +150,25 @@ class TestLogConvergence(unittest.TestCase):
         self.assertNotIn("super_secret_pw", sanitized_1)
         self.assertNotIn("myuser", sanitized_1)
 
+        # 1b. 补测：密码中含 @ 字符的 URL
+        url_at_pass = "postgresql://user:p@ss@host:5432/db"
+        sanitized_at = sanitize_exception_message(url_at_pass)
+        self.assertEqual(sanitized_at, "postgresql://***@host:5432/db")
+
+        # 1c. 补测：query 参数中含 @ 字符的 URL
+        url_query_at = "postgresql://user:pw@host/db?x=a@b"
+        sanitized_query_at = sanitize_exception_message(url_query_at)
+        self.assertEqual(sanitized_query_at, "postgresql://***@host/db?x=a@b")
+
         # 2. 不带密码的 postgres URL
         url_no_pass = "failed to connect to postgresql://localhost:5432/main_db"
         sanitized_2 = sanitize_exception_message(url_no_pass)
         self.assertEqual(sanitized_2, "failed to connect to postgresql://localhost:5432/main_db")
+
+        # 2b. 补测：标准不带密码 URL
+        url_no_auth = "postgresql://localhost:5432/db"
+        sanitized_no_auth = sanitize_exception_message(url_no_auth)
+        self.assertEqual(sanitized_no_auth, "postgresql://localhost:5432/db")
 
         # 3. 普通文本
         plain_text = "Connection refused by peer (errno 111)"
