@@ -206,6 +206,15 @@ class TestGatewayAuth(unittest.TestCase):
             resp_none = asyncio.run(auth.gateway_auth_middleware(req_none, _dummy_call_next))
             self.assertEqual(resp_none.status_code, 401)
 
+    def test_case_7_non_ascii_header_returns_401_not_500(self):
+        """⑦ 请求头 X-Gateway-Key 含非 ASCII 字符（如 'é'），断言返回 401 而非 500"""
+        with patch.object(shared, "GATEWAY_SECRET", "valid-secret"):
+            req = _make_request("/v1/models", headers={"X-Gateway-Key": "é"})
+            resp = asyncio.run(auth.gateway_auth_middleware(req, _dummy_call_next))
+            self.assertEqual(resp.status_code, 401)
+            self.assertEqual(resp.body, b'{"error":"Unauthorized. Provide X-Gateway-Key header."}')
+
+
 
 if __name__ == "__main__":
     unittest.main()

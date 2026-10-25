@@ -43,9 +43,10 @@ def verify_gateway_key(provided_key: str) -> bool:
     keys = get_gateway_secrets()
     if not keys or not provided_key:
         return False
+    provided_bytes = provided_key.encode("utf-8")
     matched = False
     for expected in keys:
-        if secrets.compare_digest(provided_key, expected):
+        if secrets.compare_digest(provided_bytes, expected.encode("utf-8")):
             matched = True
     return matched
 
