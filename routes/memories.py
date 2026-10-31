@@ -64,7 +64,7 @@ async def export_memories():
                     mem[key] = str(mem[key])
 
         return {
-            "schema_version": 5,
+            "schema_version": 6,
             "source_database_id": database_instance_id,
             "total": len(memories),
             "exported_at": str(datetime.now()),
@@ -193,6 +193,7 @@ async def api_create_memory(request: Request):
                 "source_session": source_session,
                 "external_id": external_id,
                 "is_active": True,
+                "is_pinned": False,
             },
         }
     except Exception:
@@ -238,7 +239,11 @@ async def _run_memory_search(q: str, limit: int):
     if not q.strip():
         return {"error": "搜索关键词不能为空", "results": []}
     try:
-        results, mode = await db_memories.search_memories_with_mode(q.strip(), limit)
+        search_output = await db_memories.search_memories(
+            q.strip(), limit, include_mode=True
+        )
+        results = search_output["results"]
+        mode = search_output["mode"]
         tz_offset = timezone(timedelta(hours=shared.TIMEZONE_HOURS))
         out = []
         for r in results:
@@ -284,17 +289,26 @@ async def api_search_memories_post(request: Request):
 
 @router.put("/api/memories/{memory_id}")
 async def api_update_memory(memory_id: int, request: Request):
-    """更新单条记忆（支持 content / importance / title / layer）"""
+    """更新单条记忆（支持 content / importance / title / layer / is_pinned）"""
     if not shared.MEMORY_ENABLED:
         return {"error": "记忆系统未启用"}
     data = await request.json()
-    await db_memories.update_memory_with_layer(
-        memory_id,
-        content=data.get("content"),
-        importance=data.get("importance"),
-        title=data.get("title"),
-        layer=data.get("layer"),
-    )
+    is_pinned = data.get("is_pinned")
+    if is_pinned is not None and not isinstance(is_pinned, bool):
+        return JSONResponse(status_code=400, content={"error": "is_pinned 必须是布尔值"})
+    try:
+        updated = await db_memories.update_memory_with_layer(
+            memory_id,
+            content=data.get("content"),
+            importance=data.get("importance"),
+            title=data.get("title"),
+            layer=data.get("layer"),
+            is_pinned=is_pinned,
+        )
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    if not updated:
+        return JSONResponse(status_code=404, content={"error": "记忆不存在或已归档"})
     return {"status": "ok", "id": memory_id}
 
 
@@ -333,15 +347,23 @@ async def api_batch_update(request: Request):
     updates = data.get("updates", [])
     if not updates:
         return {"error": "没有要更新的记忆"}
-    for item in updates:
-        await db_memories.update_memory_with_layer(
-            item["id"],
-            content=item.get("content"),
-            importance=item.get("importance"),
-            title=item.get("title"),
-            layer=item.get("layer"),
+    updated = 0
+    try:
+        for item in updates:
+            await db_memories.update_memory_with_layer(
+                item["id"],
+                content=item.get("content"),
+                importance=item.get("importance"),
+                title=item.get("title"),
+                layer=item.get("layer"),
+            )
+            updated += 1
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"前 {updated} 条已保存，第 {updated + 1} 条失败：{exc}"},
         )
-    return {"status": "ok", "updated": len(updates)}
+    return {"status": "ok", "updated": updated}
 
 
 @router.post("/api/memories/batch-delete")
@@ -378,7 +400,10 @@ async def api_batch_restore(request: Request):
     ids = data.get("ids", [])
     if not ids:
         return {"error": "未选择记忆"}
-    restored = await db_memories.restore_archived_memories_batch(ids)
+    try:
+        restored = await db_memories.restore_archived_memories_batch(ids)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
     return {"status": "ok", "restored": restored}
 
 
@@ -430,6 +455,12 @@ async def api_manual_consolidate(request: Request):
         if any(memory_id not in memories_by_id for memory_id in memory_ids):
             return JSONResponse(status_code=400, content={"error": "只能整理仍然活跃的记忆"})
         memories = [memories_by_id[memory_id] for memory_id in memory_ids]
+        pinned = [memory["id"] for memory in memories if memory.get("is_pinned") is True]
+        if pinned:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"常驻记忆 {pinned} 不能整理，请先取消常驻"},
+            )
         blocked = [
             memory["id"] for memory in memories
             if memory.get("remind_at") is not None and memory.get("reminder_delivered_at") is None
@@ -628,6 +659,8 @@ async def api_restore_memory(memory_id: int):
                 content={"error": "该记忆属于版本链，请使用撤销取代"},
             )
         return {"status": "ok", "id": memory_id}
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
     except Exception:
         return shared._api_failure("恢复记忆失败")
 
@@ -648,6 +681,8 @@ async def api_undo_memory_supersession(memory_id: int):
                 content={"error": "该记忆没有可撤销的取代关系"},
             )
         return result
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
     except Exception:
         return shared._api_failure("撤销取代失败")
 
@@ -737,7 +772,7 @@ async def import_memories(request: Request):
 
         # v2+ 版本化备份；跨库导入不能沿用本地 conversations.id 来源。
         schema_version = data.get("schema_version")
-        if schema_version in (2, 3, 4, 5):
+        if schema_version in (2, 3, 4, 5, 6):
             try:
                 database_instance_id = (
                     await db_core.get_gateway_config("database_instance_id")

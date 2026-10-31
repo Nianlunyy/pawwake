@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 import auth
+import recall_rerank
 import shared
 from db import core as db_core
 from db import search as db_search
@@ -18,7 +19,7 @@ from routes.memories import start_memory_embedding_backfill
 
 router = APIRouter()
 settings_router = APIRouter()
-_MASKED_KEYS = {"API_KEY", "EMBEDDING_API_KEY", "MEMORY_API_KEY"}
+_MASKED_KEYS = {"API_KEY", "EMBEDDING_API_KEY", "MEMORY_API_KEY", "RERANK_API_KEY"}
 logger = logging.getLogger(__name__)
 
 @router.get("/dashboard/login", response_class=HTMLResponse)
@@ -239,6 +240,7 @@ async def get_settings():
             key: parser(db[key]) if db.get(key) else getattr(shared, key)
             for key, parser in shared.SETTINGS_TYPES.items()
         }
+        settings["MEMORY_PHRASES"] = "\n".join(settings["MEMORY_PHRASES"])
         for key in _MASKED_KEYS:
             settings[key] = _mask_key(settings[key])
         settings["MEMORY_MODEL"] = db.get("MEMORY_MODEL") or os.environ.get("MEMORY_MODEL", "")
@@ -271,6 +273,45 @@ async def save_settings(request: Request):
     """保存高级设置（写入数据库 + 热更新运行时变量，立即生效无需重启）"""
     try:
         data = await request.json()
+        rerank_model = data.get("RERANK_MODEL", shared.RERANK_MODEL)
+        if not isinstance(rerank_model, str):
+            return {"error": "重排模型须为文字"}
+        memory_rerank_on = shared._parse_bool(
+            data.get("MEMORY_RERANK_ENABLED", shared.MEMORY_RERANK_ENABLED)
+        )
+        conversation_rerank_on = shared._parse_bool(
+            data.get(
+                "CONVERSATION_RERANK_ENABLED",
+                shared.CONVERSATION_RERANK_ENABLED,
+            )
+        )
+        if (memory_rerank_on or conversation_rerank_on) and not rerank_model.strip():
+            return {"error": "启用重排需填写模型"}
+        rerank_base_url = data.get("RERANK_BASE_URL", shared.RERANK_BASE_URL)
+        rerank_api_key = data.get("RERANK_API_KEY", shared.RERANK_API_KEY)
+        if not isinstance(rerank_base_url, str) or not isinstance(rerank_api_key, str):
+            return {"error": "重排专用地址和钥匙须为文字"}
+        rerank_base_url = rerank_base_url.strip()
+        rerank_key_is_masked = _is_masked(rerank_api_key)
+        rerank_api_key = (
+            shared.RERANK_API_KEY
+            if rerank_key_is_masked
+            else rerank_api_key.strip()
+        )
+        if bool(rerank_base_url) != bool(rerank_api_key):
+            return {"error": "重排专用地址和钥匙须同时填写或同时留空"}
+        if (
+            rerank_key_is_masked
+            and rerank_base_url != shared.RERANK_BASE_URL.strip()
+        ):
+            return {"error": "修改重排专用地址时须重新填写重排 API Key"}
+        if memory_rerank_on or conversation_rerank_on:
+            api_base_url = data.get("API_BASE_URL", shared.API_BASE_URL)
+            if not isinstance(api_base_url, str):
+                return {"error": "API Base URL 须为文字"}
+            effective_base_url = rerank_base_url or api_base_url.strip()
+            if urlsplit(effective_base_url).hostname not in recall_rerank.ENDPOINTS:
+                return {"error": "重排只支持 OpenRouter、Zenmux 和 TypeSafe"}
         updated = []
         skipped = []
         if data.pop("redetect_embedding", False) is True:
@@ -354,6 +395,8 @@ async def save_settings(request: Request):
                 updated.append(key)
                 if key in _MASKED_KEYS:
                     print(f"[settings] {key} 已更新")
+                elif key == "MEMORY_PHRASES":
+                    print(f"[settings] {key} 已更新 {len(typed_value)} 项")
                 else:
                     print(f"[settings] {key} = {typed_value}")
 

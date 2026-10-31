@@ -29,6 +29,10 @@ def is_dashboard_path(path: str) -> bool:
     return path == "/dashboard" or path.startswith("/dashboard/") or path.startswith(DASHBOARD_PATH_PREFIXES)
 
 
+def is_mcp_path(path: str) -> bool:
+    return path == "/mcp" or path.startswith("/mcp/")
+
+
 def make_dashboard_session() -> str:
     expires_at = int(time.time()) + shared.DASHBOARD_SESSION_SECONDS
     payload = str(expires_at).encode("ascii")
@@ -90,6 +94,28 @@ async def gateway_auth_middleware(request: Request, call_next):
     provided_key = request.headers.get("X-Gateway-Key", "")
     if shared.GATEWAY_SECRET and secrets.compare_digest(provided_key, shared.GATEWAY_SECRET):
         return await call_next(request)
+
+    # MCP clients commonly support Bearer but not custom headers. This alternate spelling
+    # stays scoped to /mcp and uses the same secret as X-Gateway-Key.
+    if is_mcp_path(path):
+        if not shared.GATEWAY_SECRET:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "GATEWAY_SECRET is required for this endpoint."},
+            )
+        scheme, separator, token = request.headers.get("Authorization", "").partition(" ")
+        if (
+            separator
+            and scheme.lower() == "bearer"
+            and secrets.compare_digest(token.strip(), shared.GATEWAY_SECRET)
+        ):
+            return await call_next(request)
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error": "Unauthorized. Provide X-Gateway-Key or Authorization: Bearer."
+            },
+        )
 
     # 显式记忆写入只接受网关密钥，Dashboard Cookie 不授予这个外部写入口。
     if path == "/api/memories" and request.method == "POST":

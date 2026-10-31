@@ -24,6 +24,26 @@ logger = logging.getLogger(__name__)
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 HAS_PGVECTOR = False  # 在init_tables时检测
+HAS_CONVERSATION_BIGRAM_INDEX = False
+
+_CONVERSATION_BIGRAM_FUNCTION_SQL = r"""
+    CREATE OR REPLACE FUNCTION pawwake_text_bigrams_v1(input TEXT)
+    RETURNS TEXT[]
+    LANGUAGE sql
+    IMMUTABLE PARALLEL SAFE STRICT
+    AS $$
+        SELECT COALESCE(
+            array_agg(DISTINCT pair ORDER BY pair),
+            ARRAY[]::TEXT[]
+        )
+        FROM (
+            SELECT ch || lead(ch) OVER (ORDER BY ord) AS pair
+            FROM regexp_split_to_table(lower(input), '')
+                 WITH ORDINALITY AS chars(ch, ord)
+        ) AS pairs
+        WHERE pair IS NOT NULL
+    $$;
+"""
 
 
 # ============================================================
@@ -79,8 +99,35 @@ async def close_pool():
 # 表结构初始化
 # ============================================================
 
+async def _ensure_conversation_bigram_index(pool: asyncpg.Pool) -> bool:
+    """安装二字切分函数，并在不阻塞写入的情况下建表达式索引。"""
+    global HAS_CONVERSATION_BIGRAM_INDEX
+    HAS_CONVERSATION_BIGRAM_INDEX = False
+    index_name = "idx_conversations_content_bigrams_v1"
+    async with pool.acquire() as conn:
+        await conn.execute(_CONVERSATION_BIGRAM_FUNCTION_SQL)
+        index_valid = await conn.fetchval(
+            """SELECT indisvalid FROM pg_index
+               WHERE indexrelid = to_regclass($1)""",
+            index_name,
+        )
+        if index_valid is False:
+            await conn.execute(
+                f"DROP INDEX CONCURRENTLY IF EXISTS {index_name}"
+            )
+        await conn.execute(f"""
+            CREATE INDEX CONCURRENTLY IF NOT EXISTS {index_name}
+            ON conversations USING GIN (pawwake_text_bigrams_v1(content));
+        """)
+        HAS_CONVERSATION_BIGRAM_INDEX = bool(await conn.fetchval(
+            """SELECT indisvalid FROM pg_index
+               WHERE indexrelid = to_regclass($1)""",
+            index_name,
+        ))
+    return HAS_CONVERSATION_BIGRAM_INDEX
+
 async def init_tables():
-    global HAS_PGVECTOR
+    global HAS_PGVECTOR, HAS_CONVERSATION_BIGRAM_INDEX
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute("""
@@ -234,6 +281,11 @@ async def init_tables():
             ALTER TABLE memories ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;
         """)
 
+        # is_pinned: 活跃时绕过检索门限，固定注入动态记忆区。
+        await conn.execute("""
+            ALTER TABLE memories ADD COLUMN IF NOT EXISTS is_pinned BOOLEAN DEFAULT FALSE;
+        """)
+
         # merged_from: 合并来源的碎片ID列表
         await conn.execute("""
             ALTER TABLE memories ADD COLUMN IF NOT EXISTS merged_from INTEGER[] DEFAULT NULL;
@@ -306,6 +358,11 @@ async def init_tables():
             CREATE INDEX IF NOT EXISTS idx_memories_active ON memories (is_active);
         """)
         await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memories_active_pinned
+            ON memories (id)
+            WHERE is_active = TRUE AND is_pinned = TRUE;
+        """)
+        await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_memories_event_date ON memories (event_date);
         """)
         await conn.execute("""
@@ -350,6 +407,13 @@ async def init_tables():
             await conn.execute("""
                 ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding_json TEXT;
             """)
+
+    try:
+        if not await _ensure_conversation_bigram_index(pool):
+            logger.warning("对话二字索引未就绪，专名搜索将回退到原文查找")
+    except Exception as exc:
+        HAS_CONVERSATION_BIGRAM_INDEX = False
+        logger.warning("对话二字索引初始化失败，专名搜索将回退到原文查找: %s", exc)
 
     print("✅ 数据库表结构已就绪")
 

@@ -13,6 +13,44 @@ logger = logging.getLogger(__name__)
 
 _EXTRACTION_RELEVANT_LIMIT = 10
 _EXTRACTION_RECENT_LIMIT = 10
+_MEMORY_PHRASE_BONUS = 0.15
+PINNED_MEMORY_BUDGET_CHARS = 4000
+
+
+async def _check_pinned_budget(
+    conn,
+    memory_id: int,
+    *,
+    content=None,
+    is_pinned=None,
+    is_active=None,
+):
+    """Serialize active-pinned writes and reject a result over the fixed budget."""
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtext('pawwake_pinned_memory_budget'))"
+    )
+    row = await conn.fetchrow(
+        """SELECT id, content, is_pinned, is_active
+           FROM memories WHERE id = $1 FOR UPDATE""",
+        memory_id,
+    )
+    if not row:
+        raise ValueError("记忆不存在")
+    target_content = row["content"] if content is None else content
+    target_pinned = row["is_pinned"] if is_pinned is None else is_pinned
+    target_active = row["is_active"] if is_active is None else is_active
+    if target_pinned and target_active:
+        used = await conn.fetchval(
+            """SELECT COALESCE(SUM(char_length(content)), 0)
+               FROM memories
+               WHERE is_pinned = TRUE AND is_active = TRUE AND id <> $1""",
+            memory_id,
+        )
+        if used + len(target_content) > PINNED_MEMORY_BUDGET_CHARS:
+            raise ValueError(
+                f"活跃常驻记忆超过 {PINNED_MEMORY_BUDGET_CHARS} 字预算"
+            )
+    return row
 
 # ============================================================
 # 记忆操作
@@ -88,7 +126,7 @@ async def save_extracted_memory(
             if requested_id in allowed_ids:
                 predecessor = await conn.fetchrow(
                     """
-                    SELECT id, is_active, superseded_by, layer
+                    SELECT id, is_active, superseded_by, layer, is_pinned
                     FROM memories
                     WHERE id = $1
                     FOR UPDATE
@@ -100,12 +138,13 @@ async def save_extracted_memory(
                     predecessor
                     and predecessor["is_active"] is True
                     and predecessor["superseded_by"] is None
-                    and predecessor_layer != 1
+                    and (predecessor_layer != 1 or predecessor["is_pinned"] is True)
                 ):
-                    # 后台提取只允许接管碎片层；事件/核心记忆不在这里静默归档，
+                    # 后台提取只允许接管普通碎片；事件、核心和常驻记忆不在这里静默归档，
                     # 新事实照常按碎片保存，旧行保持 active，冲突留给整理流程处理。
                     print(
-                        f"🛡️ 记忆 {requested_id}（layer {predecessor_layer}）拒绝后台自动取代，"
+                        f"🛡️ 记忆 {requested_id}（layer {predecessor_layer}"
+                        f"{'，常驻' if predecessor['is_pinned'] else ''}）拒绝后台自动取代，"
                         f"新事实已按碎片保存为 {new_id}，旧记忆保持活跃"
                     )
                 elif (
@@ -149,7 +188,7 @@ async def get_memory_by_external_id(external_id: str):
         row = await conn.fetchrow(
             """
             SELECT id, content, importance, title, layer, event_date,
-                   source_session, external_id, is_active, created_at
+                   source_session, external_id, is_active, is_pinned, created_at
             FROM memories
             WHERE external_id = $1
             """,
@@ -305,17 +344,49 @@ async def _source_covered_memory_ids(source_message_ids) -> list[int]:
     return [int(row["id"]) for row in rows]
 
 
+def _memory_search_output(results, include_mode: bool, mode: str):
+    if not include_mode:
+        return results
+    return {"results": results, "mode": mode}
+
+
+def _keywords_with_phrases(query: str):
+    """Keep ordinary keywords and append matching configured proper nouns."""
+    keywords = list(db_search.extract_search_keywords(query))
+    lowered_query = query.lower()
+    phrases = [
+        phrase for phrase in shared.MEMORY_PHRASES
+        if phrase.lower() in lowered_query
+    ]
+    seen = {keyword.lower() for keyword in keywords}
+    for phrase in phrases:
+        if phrase.lower() not in seen:
+            keywords.append(phrase)
+            seen.add(phrase.lower())
+    return keywords, phrases
+
+
+def _phrase_bonus(phrases: list[str], content: str) -> float:
+    if not phrases:
+        return 0.0
+    lowered_content = content.lower()
+    matched = sum(phrase.lower() in lowered_content for phrase in phrases)
+    return _MEMORY_PHRASE_BONUS * matched / len(phrases)
+
+
 async def search_memories(
     query: str,
     limit: int = 10,
     exclude_ids=None,
     recalled_message_ids=None,
+    include_mode: bool = False,
 ):
     """
     搜索相关记忆
 
     MEMORY_VECTOR_ENABLED=true 时走混合搜索（关键词 + 向量）
     否则走纯关键词搜索
+    include_mode=True 时统一返回 results + mode；默认保留裸列表契约
     """
     covered_ids = (
         await _source_covered_memory_ids(recalled_message_ids)
@@ -326,13 +397,18 @@ async def search_memories(
     if covered_ids:
         print(f"🧹 原文已完整覆盖，跳过 {len(covered_ids)} 条碎片记忆")
     if shared.MEMORY_VECTOR_ENABLED:
-        return await search_memories_hybrid(query, limit, exclude_ids=excluded_ids)
+        return await search_memories_hybrid(
+            query,
+            limit,
+            exclude_ids=excluded_ids,
+            include_mode=include_mode,
+        )
 
     # ---- 纯关键词搜索 ----
-    keywords = db_search.extract_search_keywords(query)
+    keywords, _ = _keywords_with_phrases(query)
 
     if not keywords:
-        return []
+        return _memory_search_output([], include_mode, "keyword")
 
     pool = await db_core.get_pool()
     async with pool.acquire() as conn:
@@ -367,7 +443,7 @@ async def search_memories(
         )
         sql = f"""
             SELECT
-                id, content, importance, created_at, event_date,
+                id, content, importance, created_at, event_date, is_pinned,
                 ({hit_count_expr}) AS hit_count,
                 ({recency_days_expr}) AS effective_days,
                 (
@@ -404,7 +480,7 @@ async def search_memories(
         else:
             print(f"🔍 搜索 '{query}' → 关键词 {keywords[:8]} → 无结果" + (f"（{filtered} 条被分数阈值过滤）" if filtered else ""))
 
-        return results
+        return _memory_search_output(results, include_mode, "keyword")
 
 
 def _effective_days_ago(event_date, created_at, now_utc):
@@ -433,21 +509,22 @@ def _anchored_semantic_normalize(scores: dict, threshold: float) -> dict:
 async def search_memories_hybrid(
     query: str,
     limit: int = 10,
-    return_mode: bool = False,
     exclude_ids=None,
+    include_mode: bool = False,
 ):
     """
     记忆混合搜索：关键词 + 向量，归一化后四维加权
 
     权重：MEMORY_HW_KEYWORD + MEMORY_HW_SEMANTIC + MEMORY_HW_IMPORTANCE + MEMORY_HW_RECENCY
+    include_mode=True 时统一返回 results + mode；默认保留裸列表契约
     """
     excluded_ids = _normalize_excluded_ids(exclude_ids)
-    keywords = db_search.extract_search_keywords(query)
+    keywords, phrases = _keywords_with_phrases(query)
     query_embedding = await db_search.get_query_embedding(query) if shared.EMBEDDING_API_KEY else []
     search_mode = "hybrid" if query_embedding else "keyword"
 
     if not keywords and not query_embedding:
-        return ([], search_mode) if return_mode else []
+        return _memory_search_output([], include_mode, search_mode)
 
     pool = await db_core.get_pool()
     async with pool.acquire() as conn:
@@ -497,7 +574,7 @@ async def search_memories_hybrid(
                 ), kw_idf AS (
                     SELECT {idf_cols} FROM kw_df
                 )
-                SELECT id, content, importance, created_at, event_date,
+                SELECT id, content, importance, created_at, event_date, is_pinned,
                        ({hit_count_expr}) AS hit_count,
                        ({weighted_expr}) / NULLIF({weight_total_expr}, 0) AS kw_score
                 FROM memories CROSS JOIN kw_idf
@@ -513,6 +590,7 @@ async def search_memories_hybrid(
                     'importance': r['importance'],
                     'created_at': r['created_at'],
                     'event_date': r['event_date'],
+                    'is_pinned': r['is_pinned'],
                     'hit_count': r['hit_count'],
                     'kw_score': float(r['kw_score']),
                     'similarity': 0.0,
@@ -524,7 +602,7 @@ async def search_memories_hybrid(
             if db_core.HAS_PGVECTOR:
                 vec_str = '[' + ','.join(str(f) for f in query_embedding) + ']'
                 sem_rows = await conn.fetch("""
-                    SELECT id, content, importance, created_at, event_date,
+                    SELECT id, content, importance, created_at, event_date, is_pinned,
                            1 - (embedding <=> $1::vector) as similarity
                     FROM memories
                     WHERE embedding IS NOT NULL AND is_active = TRUE
@@ -545,7 +623,7 @@ async def search_memories_hybrid(
             else:
                 # Python端计算cosine
                 all_mem = await conn.fetch("""
-                    SELECT id, content, importance, created_at, event_date, embedding_json
+                    SELECT id, content, importance, created_at, event_date, is_pinned, embedding_json
                     FROM memories
                     WHERE embedding_json IS NOT NULL AND is_active = TRUE
                       AND NOT (id = ANY($1::int[]))
@@ -576,6 +654,7 @@ async def search_memories_hybrid(
                         'importance': r['importance'],
                         'created_at': r['created_at'],
                         'event_date': r['event_date'],
+                        'is_pinned': r['is_pinned'],
                         'hit_count': 0,
                         'kw_score': 0.0,
                         'similarity': sim,
@@ -592,7 +671,7 @@ async def search_memories_hybrid(
 
         if not candidates:
             print(f"🔍 混合搜索 '{query}' → 两路均无结果")
-            return ([], search_mode) if return_mode else []
+            return _memory_search_output([], include_mode, search_mode)
 
         # ---- 归一化 + 加权 ----
         # 关键词轴直接用 IDF 覆盖率（0~1），不做批内拉伸，泛词池不会被顶满
@@ -614,7 +693,8 @@ async def search_memories_hybrid(
             score = (shared.MEMORY_HW_KEYWORD * kw +
                      shared.MEMORY_HW_SEMANTIC * sem +
                      shared.MEMORY_HW_IMPORTANCE * imp +
-                     shared.MEMORY_HW_RECENCY * rec)
+                     shared.MEMORY_HW_RECENCY * rec +
+                     _phrase_bonus(phrases, info['content']))
 
             final.append({
                 'id': mid,
@@ -622,6 +702,7 @@ async def search_memories_hybrid(
                 'importance': info['importance'],
                 'created_at': info['created_at'],
                 'event_date': info.get('event_date'),
+                'is_pinned': info.get('is_pinned', False),
                 'hit_count': info['hit_count'],
                 'similarity': info['similarity'],
                 'score': score,
@@ -655,14 +736,7 @@ async def search_memories_hybrid(
             print(f"🔍 混合搜索 '{query}' → 无结果" + (f"（{filtered} 条被过滤）" if filtered else ""))
 
         output = [dict(r) for r in results]
-        return (output, search_mode) if return_mode else output
-
-
-async def search_memories_with_mode(query: str, limit: int = 10):
-    """搜索记忆，并报告本次实际使用了混合搜索还是关键词搜索。"""
-    if shared.MEMORY_VECTOR_ENABLED:
-        return await search_memories_hybrid(query, limit, return_mode=True)
-    return await search_memories(query, limit), "keyword"
+        return _memory_search_output(output, include_mode, search_mode)
 
 
 async def get_extraction_candidates(
@@ -880,17 +954,20 @@ async def backfill_memory_embeddings(batch_size: int = 20):
     return total_updated
 
 
-async def get_recent_memories(limit: int = 20):
+async def get_recent_memories(limit: int = 20, include_archived: bool = False):
     pool = await db_core.get_pool()
     async with pool.acquire() as conn:
-        return await conn.fetch(
-            """SELECT id, content, importance, created_at
+        rows = await conn.fetch(
+            """SELECT id, content, importance, source_session, created_at,
+                      layer, title, is_active, is_pinned, event_date,
+                      remind_at, reminder_delivered_at
                FROM memories
-               WHERE is_active = TRUE
-               ORDER BY created_at DESC
-               LIMIT $1""",
+               WHERE ($2::boolean OR is_active = TRUE)
+               ORDER BY id DESC LIMIT $1""",
             limit,
+            include_archived,
         )
+        return [dict(row) for row in rows]
 
 
 async def get_all_memories_count():
@@ -909,7 +986,7 @@ async def get_all_memories():
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT id, content, importance, source_session, created_at,
-                   layer, title, is_active, merged_from, event_date, superseded_by,
+                   layer, title, is_active, is_pinned, merged_from, event_date, superseded_by,
                    remind_at, reminder_delivered_at,
                    source_message_ids, source_content_intact
             FROM memories ORDER BY id
@@ -1049,6 +1126,16 @@ async def import_memories_v2(
                 raise ValueError(
                     f"记忆 {mem['backup_id']} 的 superseded_by 引用了备份中不存在的 {successor}，备份不完整"
                 )
+    if schema_version >= 6:
+        pinned_chars = sum(
+            len(mem["content"])
+            for mem in memories
+            if mem.get("is_active", True) and mem.get("is_pinned") is True
+        )
+        if pinned_chars > PINNED_MEMORY_BUDGET_CHARS:
+            raise ValueError(
+                f"活跃常驻记忆共 {pinned_chars} 字，超过 {PINNED_MEMORY_BUDGET_CHARS} 字预算"
+            )
 
     pool = await db_core.get_pool()
     imported = 0
@@ -1057,6 +1144,10 @@ async def import_memories_v2(
     degraded = []
     async with pool.acquire() as conn:
         async with conn.transaction():
+            if schema_version >= 6:
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext('pawwake_pinned_memory_budget'))"
+                )
             # ---- 第一遍：插入并建立 旧 backup_id → 新库 id 映射 ----
             id_map = {}
             for mem in memories:
@@ -1076,6 +1167,20 @@ async def import_memories_v2(
                     })
                     skipped += 1
                     continue
+                if (
+                    schema_version >= 6
+                    and mem.get("is_active", True)
+                    and mem.get("is_pinned") is True
+                ):
+                    used = await conn.fetchval(
+                        """SELECT COALESCE(SUM(char_length(content)), 0)
+                           FROM memories
+                           WHERE is_active = TRUE AND is_pinned = TRUE"""
+                    )
+                    if used + len(content) > PINNED_MEMORY_BUDGET_CHARS:
+                        raise ValueError(
+                            f"导入后活跃常驻记忆超过 {PINNED_MEMORY_BUDGET_CHARS} 字预算"
+                        )
                 source_message_ids = None
                 if schema_version >= 5 and preserve_source_message_ids:
                     raw_source_ids = mem.get("source_message_ids")
@@ -1100,9 +1205,9 @@ async def import_memories_v2(
                     INSERT INTO memories (content, importance, source_session, created_at,
                                           layer, title, is_active, event_date,
                                           remind_at, reminder_delivered_at,
-                                          source_message_ids, source_content_intact)
+                                          source_message_ids, source_content_intact, is_pinned)
                     VALUES ($1, $2, $3, COALESCE($4, NOW()), $5, $6, $7, $8,
-                            $9, $10, $11, $12)
+                            $9, $10, $11, $12, $13)
                     RETURNING id
                 """,
                     content,
@@ -1118,6 +1223,7 @@ async def import_memories_v2(
                     _parse_backup_datetime(mem.get("reminder_delivered_at")),
                     source_message_ids,
                     bool(source_message_ids and mem.get("source_content_intact") is True),
+                    bool(schema_version >= 6 and mem.get("is_pinned") is True),
                 )
                 id_map[bid] = int(row["id"])
                 imported += 1
@@ -1237,7 +1343,7 @@ async def get_all_memories_detail(limit: int = None, layer: int = None,
 
         rows = await conn.fetch(f"""
             SELECT id, content, importance, source_session, created_at,
-                   layer, title, is_active, merged_from, event_date, superseded_by,
+                   layer, title, is_active, is_pinned, merged_from, event_date, superseded_by,
                    remind_at, reminder_delivered_at
             FROM memories
             {where_clause}
@@ -1245,6 +1351,21 @@ async def get_all_memories_detail(limit: int = None, layer: int = None,
             {limit_clause}
         """, *params)
         return [dict(r) for r in rows]
+
+
+async def get_active_pinned_memories():
+    """Return every active pinned memory in stable order."""
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, content, importance, source_session, created_at,
+                   layer, title, is_active, is_pinned, event_date,
+                   remind_at, reminder_delivered_at
+            FROM memories
+            WHERE is_active = TRUE AND is_pinned = TRUE
+            ORDER BY id
+        """)
+        return [dict(row) for row in rows]
 
 
 async def get_core_candidate_memories(min_merged_sources: int, min_importance: int,
@@ -1334,15 +1455,40 @@ async def restore_archived_memories_batch(memory_ids: list):
     """批量恢复普通归档记忆；版本前驱必须走显式撤销。"""
     pool = await db_core.get_pool()
     async with pool.acquire() as conn:
-        result = await conn.execute(
-            """UPDATE memories
-               SET is_active = TRUE
-               WHERE id = ANY($1::int[])
-                 AND is_active = FALSE
-                 AND superseded_by IS NULL""",
-            memory_ids,
-        )
-        return int(result.split()[-1]) if result else 0
+        async with conn.transaction():
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext('pawwake_pinned_memory_budget'))"
+            )
+            rows = await conn.fetch(
+                """SELECT id, content, is_pinned
+                   FROM memories
+                   WHERE id = ANY($1::int[])
+                     AND is_active = FALSE
+                     AND superseded_by IS NULL
+                   FOR UPDATE""",
+                memory_ids,
+            )
+            pinned_chars = sum(
+                len(row["content"]) for row in rows if row["is_pinned"] is True
+            )
+            used = await conn.fetchval(
+                """SELECT COALESCE(SUM(char_length(content)), 0)
+                   FROM memories
+                   WHERE is_pinned = TRUE AND is_active = TRUE"""
+            )
+            if used + pinned_chars > PINNED_MEMORY_BUDGET_CHARS:
+                raise ValueError(
+                    f"恢复后活跃常驻记忆超过 {PINNED_MEMORY_BUDGET_CHARS} 字预算"
+                )
+            result = await conn.execute(
+                """UPDATE memories
+                   SET is_active = TRUE
+                   WHERE id = ANY($1::int[])
+                     AND is_active = FALSE
+                     AND superseded_by IS NULL""",
+                memory_ids,
+            )
+            return int(result.split()[-1]) if result else 0
 
 
 async def restore_archived_memory(memory_id: int):
@@ -1350,6 +1496,9 @@ async def restore_archived_memory(memory_id: int):
     pool = await db_core.get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext('pawwake_pinned_memory_budget'))"
+            )
             row = await conn.fetchrow(
                 """
                 SELECT id, is_active, superseded_by
@@ -1364,6 +1513,7 @@ async def restore_archived_memory(memory_id: int):
             if row["superseded_by"] is not None:
                 return {"status": "superseded"}
             if row["is_active"] is False:
+                await _check_pinned_budget(conn, memory_id, is_active=True)
                 await conn.execute(
                     "UPDATE memories SET is_active = TRUE WHERE id = $1",
                     memory_id,
@@ -1376,6 +1526,9 @@ async def undo_memory_supersession(memory_id: int):
     pool = await db_core.get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext('pawwake_pinned_memory_budget'))"
+            )
             row = await conn.fetchrow(
                 """
                 SELECT id, superseded_by
@@ -1389,6 +1542,7 @@ async def undo_memory_supersession(memory_id: int):
                 return {"status": "not_found"}
             if row["superseded_by"] is None:
                 return {"status": "not_superseded"}
+            await _check_pinned_budget(conn, memory_id, is_active=True)
             await conn.execute(
                 """
                 UPDATE memories
@@ -1417,6 +1571,7 @@ async def get_organizable_memories_by_date(event_date):
                 ((created_at AT TIME ZONE 'UTC') + make_interval(hours => $2))::date
             ) = $1
             AND NOT (remind_at IS NOT NULL AND reminder_delivered_at IS NULL)
+            AND is_pinned = FALSE
             ORDER BY created_at, id
         """, event_date, shared.TIMEZONE_HOURS)
         return [dict(r) for r in rows]
@@ -1456,7 +1611,7 @@ async def merge_memories(memory_ids: list, new_title: str, new_content: str,
             # 锁住全部来源行，在同一事务、同一连接里复验、插入、归档：
             # 后台此刻给某条来源写提醒会等在锁上，提交后它看到的是已归档行，set_memory_reminder 落空、按 new 保住提醒
             rows = await conn.fetch("""
-                SELECT id, layer, is_active, remind_at, reminder_delivered_at,
+                SELECT id, layer, is_active, is_pinned, remind_at, reminder_delivered_at,
                        source_message_ids
                 FROM memories
                 WHERE id = ANY($1::int[])
@@ -1470,6 +1625,9 @@ async def merge_memories(memory_ids: list, new_title: str, new_content: str,
             )
             if unavailable:
                 raise ValueError(f"记忆 {unavailable} 不存在或已失效，不能合并")
+            pinned = sorted(int(row["id"]) for row in rows if row["is_pinned"] is True)
+            if pinned:
+                raise ValueError(f"常驻记忆 {pinned} 不能合并，请先取消常驻")
             # 带未送达提醒的记忆不能被合并归档，否则提醒随之消失；先等送达或清除提醒
             blocked = sorted(
                 int(r["id"]) for r in rows
@@ -1608,7 +1766,8 @@ async def check_duplicate_memory(new_content: str, threshold: float = 0.7) -> di
 
 async def update_memory_with_layer(memory_id: int, content: str = None,
                                     importance: int = None, title: str = None,
-                                    layer: int = None, is_active: bool = None):
+                                    layer: int = None, is_active: bool = None,
+                                    is_pinned: bool = None):
     """更新记忆（支持三层架构新字段）"""
     updates = []
     params = []
@@ -1644,15 +1803,31 @@ async def update_memory_with_layer(memory_id: int, content: str = None,
         params.append(is_active)
         param_idx += 1
 
+    if is_pinned is not None:
+        updates.append(f"is_pinned = ${param_idx}")
+        params.append(is_pinned)
+        param_idx += 1
+
     if not updates:
         return
 
     pool = await db_core.get_pool()
     async with pool.acquire() as conn:
-        await conn.execute(
-            f"UPDATE memories SET {', '.join(updates)} WHERE id = $1",
-            memory_id, *params
-        )
+        async with conn.transaction():
+            if content is not None or is_active is not None or is_pinned is not None:
+                await _check_pinned_budget(
+                    conn,
+                    memory_id,
+                    content=content,
+                    is_active=is_active,
+                    is_pinned=is_pinned,
+                )
+            result = await conn.execute(
+                f"UPDATE memories SET {', '.join(updates)} WHERE id = $1"
+                + (" AND is_active = TRUE" if is_pinned is True else ""),
+                memory_id, *params
+            )
+            return result == "UPDATE 1"
 
 
 async def get_layer_statistics():
@@ -1709,6 +1884,7 @@ async def cleanup_old_fragments(days: int = 30):
                 FROM memories AS memory
                 WHERE memory.layer = 1
                   AND memory.is_active = FALSE
+                  AND memory.is_pinned = FALSE
                   AND memory.created_at < $1
                   AND memory.superseded_by IS NULL
                   AND NOT EXISTS (

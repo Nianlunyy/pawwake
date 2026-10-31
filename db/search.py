@@ -117,13 +117,22 @@ def jieba_tokenize_for_tsv(text: str) -> str:
     )
 
 
-def _conversation_query_terms(query: str) -> tuple[list[str], bool]:
-    """对话关键词统一词表；TF-IDF 失效时只保留连续未知中文词组。"""
+def _conversation_query_terms(query: str) -> tuple[list[str], list[str]]:
+    """返回普通分词和需要核对原文的完整词组。"""
     keywords = sorted(extract_search_keywords(query))
+    lowered_query = query.lower()
+    phrases = [
+        phrase for phrase in shared.MEMORY_PHRASES
+        if phrase.lower() in lowered_query
+    ]
+    if phrases:
+        phrase_keys = {phrase.lower() for phrase in phrases}
+        ordinary = [keyword for keyword in keywords if keyword.lower() not in phrase_keys]
+        return ordinary, sorted(set(phrases))
     if keywords:
-        return keywords, False
+        return keywords, []
 
-    phrases = []
+    fallback_phrases = []
     current = []
     for raw_word in jieba.cut(query, cut_all=False):
         word = raw_word.strip()
@@ -135,11 +144,11 @@ def _conversation_query_terms(query: str) -> tuple[list[str], bool]:
             current.append(word)
             continue
         if len(current) >= 2:
-            phrases.append("".join(current))
+            fallback_phrases.append("".join(current))
         current = []
     if len(current) >= 2:
-        phrases.append("".join(current))
-    return sorted(set(phrases)), True
+        fallback_phrases.append("".join(current))
+    return [], sorted(set(fallback_phrases))
 
 
 def _quote_tsquery_lexeme(token: str) -> str:
@@ -148,8 +157,8 @@ def _quote_tsquery_lexeme(token: str) -> str:
 
 def build_tsquery(query: str) -> str:
     """把对话搜索词编码成 tsquery；未知中文词组改走精确子串后备。"""
-    tokens, exact_phrase_fallback = _conversation_query_terms(query)
-    if exact_phrase_fallback:
+    tokens, exact_phrases = _conversation_query_terms(query)
+    if exact_phrases:
         return ""
     escaped = [_quote_tsquery_lexeme(token) for token in tokens]
     return " & ".join(escaped)
@@ -648,7 +657,8 @@ def _keyword_weights(tokens, total, dfs):
     return [tokens[index] for index in kept], weights, sum(weights)
 
 
-def _keyword_score_ctes(kw, first: int, where_sql: str, use_tsv: bool):
+def _keyword_score_ctes(kw, first: int, where_sql: str, use_tsv: bool,
+                        exact_terms=()):
     """Build the shared per-message keyword score used by ranking and fragments."""
     kept, weights, denominator = kw
     if not kept:
@@ -657,6 +667,74 @@ def _keyword_score_ctes(kw, first: int, where_sql: str, use_tsv: bool):
             "hits AS (SELECT c.id, c.session_id, c.created_at, 0::float8 AS score "
             "FROM conversations c WHERE false)"
         ), []
+    exact_keys = {term.lower() for term in exact_terms}
+    exact_flags = [term.lower() in exact_keys for term in kept]
+    kept_exact_terms = [
+        term for term, exact in zip(kept, exact_flags) if exact
+    ]
+    if any(exact_flags):
+        if use_tsv:
+            terms = (
+                f"kwt AS MATERIALIZED (SELECT t.term, t.weight, t.exact, "
+                f"CASE WHEN t.exact THEN NULL "
+                f"ELSE to_tsquery('simple', t.term) END AS query "
+                f"FROM unnest(${first}::text[], ${first + 1}::float8[], "
+                f"${first + 2}::boolean[]) AS t(term, weight, exact))"
+            )
+            ordinary_match = "c.content_tsv @@ k.query"
+        else:
+            terms = (
+                f"kwt AS MATERIALIZED (SELECT t.term, t.weight, t.exact "
+                f"FROM unnest(${first}::text[], ${first + 1}::float8[], "
+                f"${first + 2}::boolean[]) AS t(term, weight, exact))"
+            )
+            ordinary_match = "c.content ILIKE '%' || k.term || '%'"
+        branches = [
+            f"SELECT c.id, c.session_id, c.created_at, k.weight "
+            f"FROM conversations c JOIN kwt k "
+            f"ON NOT k.exact AND {ordinary_match} WHERE {where_sql}"
+        ]
+        exact_match = "strpos(lower(c.content), lower(k.term)) > 0"
+        if db_core.HAS_CONVERSATION_BIGRAM_INDEX:
+            if any(len(term) >= 2 for term in kept_exact_terms):
+                branches.append(
+                    f"SELECT c.id, c.session_id, c.created_at, k.weight "
+                    f"FROM conversations c JOIN kwt k ON k.exact "
+                    f"AND char_length(k.term) >= 2 "
+                    f"AND pawwake_text_bigrams_v1(c.content) "
+                    f"@> pawwake_text_bigrams_v1(k.term) "
+                    f"AND {exact_match} WHERE {where_sql}"
+                )
+            if any(len(term) < 2 for term in kept_exact_terms):
+                branches.append(
+                    f"SELECT c.id, c.session_id, c.created_at, k.weight "
+                    f"FROM conversations c JOIN kwt k ON k.exact "
+                    f"AND char_length(k.term) < 2 AND {exact_match} "
+                    f"WHERE {where_sql}"
+                )
+        else:
+            branches.append(
+                f"SELECT c.id, c.session_id, c.created_at, k.weight "
+                f"FROM conversations c JOIN kwt k ON k.exact "
+                f"AND {exact_match} WHERE {where_sql}"
+            )
+        hits = (
+            f"raw_hits AS ({' UNION ALL '.join(branches)}),\n"
+            f"hits AS (SELECT id, session_id, created_at, "
+            f"SUM(weight) / NULLIF(${first + 3}::float8, 0) AS score "
+            f"FROM raw_hits GROUP BY id, session_id, created_at)"
+        )
+        encoded_terms = [
+            term if exact else _quote_tsquery_lexeme(term)
+            for term, exact in zip(kept, exact_flags)
+        ] if use_tsv else list(kept)
+        return f"{terms},\n{hits}", [
+            encoded_terms,
+            [float(weight) for weight in weights],
+            exact_flags,
+            float(denominator),
+        ]
+
     if use_tsv:
         terms = (
             f"kwt AS MATERIALIZED (SELECT t.term, t.weight, "
@@ -690,34 +768,42 @@ def _keyword_score_ctes(kw, first: int, where_sql: str, use_tsv: bool):
     ]
 
 
-async def _keyword_weights_for(conn, tokens: list[str], use_tsv: bool):
+async def _keyword_weights_for(conn, tokens: list[str], use_tsv: bool,
+                               exact_terms=()):
     """Calculate IDF over active searchable conversation messages."""
     if not tokens:
         return [], [], 0.0
+    exact_keys = {term.lower() for term in exact_terms}
     if use_tsv:
         searchable = "deleted_at IS NULL AND content_tsv IS NOT NULL"
-        matches = [
-            f"content_tsv @@ to_tsquery('simple', ${index + 1})"
-            for index in range(len(tokens))
-        ]
     else:
         searchable = (
             "deleted_at IS NULL AND content IS NOT NULL "
             "AND content !~ '^\\s*$'"
         )
-        matches = [
-            f"content ILIKE '%' || ${index + 1} || '%'"
-            for index in range(len(tokens))
-        ]
+    matches = []
+    query_terms = []
+    for index, token in enumerate(tokens):
+        param = f"${index + 1}"
+        if token.lower() in exact_keys:
+            exact_match = f"strpos(lower(content), lower({param})) > 0"
+            if db_core.HAS_CONVERSATION_BIGRAM_INDEX and len(token) >= 2:
+                exact_match = (
+                    f"pawwake_text_bigrams_v1(content) "
+                    f"@> pawwake_text_bigrams_v1({param}) AND {exact_match}"
+                )
+            matches.append(exact_match)
+            query_terms.append(token)
+        elif use_tsv:
+            matches.append(f"content_tsv @@ to_tsquery('simple', {param})")
+            query_terms.append(_quote_tsquery_lexeme(token))
+        else:
+            matches.append(f"content ILIKE '%' || {param} || '%'")
+            query_terms.append(token)
     df_columns = ", ".join(
         f"(SELECT COUNT(*) FROM conversations WHERE {searchable} "
         f"AND {match}) AS df_{index}"
         for index, match in enumerate(matches)
-    )
-    query_terms = (
-        [_quote_tsquery_lexeme(token) for token in tokens]
-        if use_tsv
-        else tokens
     )
     rows = await conn.fetch(
         f"""SELECT (SELECT COUNT(*) FROM conversations
@@ -738,18 +824,26 @@ async def _keyword_weights_for(conn, tokens: list[str], use_tsv: bool):
 async def _keyword_session_scores(conn, kw, pool_size: int,
                                   exclude_session_ids: list,
                                   include_session_before: tuple | None = None,
-                                  use_tsv: bool = True):
+                                  use_tsv: bool = True,
+                                  exact_terms=()):
     if not kw[0]:
         return {}
 
+    exact_keys = {term.lower() for term in exact_terms}
+    kept_exact_terms = [
+        term for term in kw[0] if term.lower() in exact_keys
+    ]
     exclusion_sql, exclusion_params = _session_exclusion_sql(
-        exclude_session_ids, 4, include_session_before
+        exclude_session_ids,
+        5 if kept_exact_terms else 4,
+        include_session_before,
     )
     ctes, params = _keyword_score_ctes(
         kw,
         1,
         f"c.deleted_at IS NULL {exclusion_sql}",
         use_tsv,
+        kept_exact_terms,
     )
     params.extend(exclusion_params)
     params.append(pool_size)
@@ -909,7 +1003,8 @@ async def search_chat_fragments(
     max_matches_per_session = min(5, max(1, int(max_matches_per_session)))
     context = min(5, max(0, int(context)))
 
-    keyword_terms, exact_phrase_fallback = _conversation_query_terms(query)
+    ordinary_terms, exact_terms = _conversation_query_terms(query)
+    keyword_terms = sorted(set(ordinary_terms + exact_terms))
     query_embedding = (
         await get_query_embedding(query)
         if mode == "hybrid" and shared.EMBEDDING_API_KEY
@@ -918,8 +1013,10 @@ async def search_chat_fragments(
     pool_size = max(_CONVERSATION_CANDIDATE_POOL, max_sessions * 3)
     pool = await db_core.get_pool()
     async with pool.acquire() as conn:
-        use_tsv = await _conversation_tsv_ready(conn) and not exact_phrase_fallback
-        keyword_weights = await _keyword_weights_for(conn, keyword_terms, use_tsv)
+        use_tsv = await _conversation_tsv_ready(conn)
+        keyword_weights = await _keyword_weights_for(
+            conn, keyword_terms, use_tsv, exact_terms
+        )
         keyword_scores = await _keyword_session_scores(
             conn,
             keyword_weights,
@@ -927,6 +1024,7 @@ async def search_chat_fragments(
             exclude_session_ids,
             include_session_before=include_session_before,
             use_tsv=use_tsv,
+            exact_terms=exact_terms,
         )
         semantic_scores = (
             await _semantic_session_scores(
@@ -993,6 +1091,7 @@ async def search_chat_fragments(
                 2,
                 "c.session_id = ANY($1::text[]) AND c.deleted_at IS NULL",
                 use_tsv,
+                exact_terms,
             )
             params = [batch_session_ids, *keyword_args]
             if db_core.HAS_PGVECTOR and vector_text:

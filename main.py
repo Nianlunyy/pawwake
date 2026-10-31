@@ -5,6 +5,7 @@ Module map:
   auth.py                header and Dashboard cookie authentication
   partition_engine.py    partitioned context assembly and summaries
   memory_pipeline.py     memory injection, recall, and extraction
+  mcp_server.py          official MCP transport and memory tools
   routes/chat.py         health and OpenAI-compatible chat
   routes/dashboard.py    Dashboard pages, models, and settings
   routes/memories.py     memory CRUD, import, consolidation, and backfill
@@ -32,13 +33,14 @@ from routes.memories import maintenance_router as memories_maintenance_router
 from routes.memories import router as memories_router
 from routes.conversations import router as conversations_router
 from routes.partition import router as partition_router
+from mcp_server import http_app as mcp_http_app, server as mcp_server
 
 # ============================================================
 # 应用生命周期管理
 # ============================================================
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def gateway_lifespan(app: FastAPI):
     """初始化持久化配置；记忆关闭时仍保留 Dashboard 与对话线状态。"""
     if "MEMORY_EXTRACT_ENABLED" in os.environ:
         print(
@@ -136,10 +138,28 @@ async def lifespan(app: FastAPI):
     await db_core.close_pool()
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with mcp_server.session_manager.run():
+        async with gateway_lifespan(app):
+            yield
 
 
-app = FastAPI(title="Pawwake", version="4.1.10", lifespan=lifespan)
+
+app = FastAPI(title="Pawwake", version="4.2.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/mcp", mcp_http_app, name="mcp")
+
+
+async def normalize_mcp_path(request, call_next):
+    """Serve /mcp directly so auth headers never cross a redirect."""
+    if request.scope.get("path") == "/mcp":
+        request.scope["path"] = "/mcp/"
+        request.scope["raw_path"] = b"/mcp/"
+    return await call_next(request)
+
+
+app.middleware("http")(normalize_mcp_path)
 app.middleware("http")(auth.gateway_auth_middleware)
 
 # Centralized router registration. Preserve this order in route snapshots.

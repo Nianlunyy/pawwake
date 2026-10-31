@@ -4,7 +4,7 @@
   <img src="https://raw.githubusercontent.com/DasterProkio/awesome-ai-companion/main/assets/featured-in-awesome-ai-companion.png" alt="Featured in Awesome AI Companion" height="24">
 </a>
 
-**4.1.10 · Madeleine**
+**4.2.0 · Madeleine**
 
 *Follow the pawprints back.*
 
@@ -22,12 +22,13 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 
 - **自定义人设** — 可用 `system_prompt.txt` 提供默认人设，也可在 Dashboard 热更新运行时人设
 - **长期记忆** — 自动从对话中提取关键信息，下次聊天时自动回忆相关内容
-- **三层记忆架构** — 碎片（自动提取的原始记忆）→ 事件（整理合并后的完整事件）→ 核心（手动标记的重要记忆），支持 AI 生成可编辑的整理草稿、核心候选、手动合并、撤回合并和查看来源
+- **三层记忆架构 + 常驻标记** — 碎片（自动提取的原始记忆）→ 事件（整理合并后的完整事件）→ 核心（手动标记的重要记忆），支持 AI 生成可编辑的整理草稿、核心候选、手动合并、撤回合并和查看来源；任意一层的记忆都可以设为常驻，绕过检索门限稳定注入，活跃常驻正文总计最多 4000 字，并占用现有记忆注入名额
+- **MCP 记忆工具** — 通过 `/mcp` 向支持 MCP 的前端提供添加、搜索、列出、更新、软删除、恢复、常驻和取消常驻八个工具
 - **分区缓存** — 自动管理对话上下文，通过 A/B 区轮转 + 摘要压缩，利用 prompt caching 大幅节省 token 费用。兼容 tool 调用消息
 - **对话线管理** — 固定 session ID 实现跨平台对话衔接，支持多对话线切换、摘要编辑
 - **对话记录** — 浏览、搜索、批量管理历史对话，支持 session 合并
 - **Token 统计** — 自动记录每次对话的 token 消耗，按 session 汇总显示
-- **双通道鉴权** — 程序 API 只接受请求头中的 `GATEWAY_SECRET`；Dashboard 使用独立密码登录和 HttpOnly 会话 Cookie，主密钥不会进入浏览器
+- **双通道鉴权** — 程序 API 使用请求头中的 `GATEWAY_SECRET`；`/mcp` 同时兼容 `X-Gateway-Key` 和 Bearer 写法，Dashboard 使用独立密码登录和 HttpOnly 会话 Cookie
 - **预置记忆** — 把你想让 AI "一开始就知道"的事情批量导入
 - **兼容性强** — 支持所有 OpenAI 格式的客户端和 API 服务商
 - **记忆向量搜索（可选）** — 关键词 + 语义向量四维混合搜索，说"过年"能搜到"春节"。支持 OpenAI 兼容的 Embedding API
@@ -160,9 +161,18 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 
 **5. 管理记忆（可选）**
 
-打开 `https://你的网关地址/dashboard` 可以查看所有记忆，支持搜索、编辑内容、调整权重、单条删除和批量删除，以及导入/导出备份。
+打开 `https://你的网关地址/dashboard` 可以查看所有记忆，支持搜索、编辑内容、调整权重、设为或取消常驻、单条删除和批量删除，以及导入/导出备份。
 
-> 💡 Dashboard 登录与程序 API 分开。浏览器只使用 Dashboard 密码和 `HttpOnly + Secure + SameSite=Strict` 会话 Cookie；客户端请求通过 `X-Gateway-Key: 你的密钥` 鉴权。不要把任何密钥放进 URL。
+> 💡 Dashboard 登录与程序 API 分开。浏览器只使用 Dashboard 密码和 `HttpOnly + Secure + SameSite=Strict` 会话 Cookie；普通程序 API 通过 `X-Gateway-Key: 你的密钥` 鉴权。不要把任何密钥放进 URL。
+
+**6. 连接 MCP 记忆工具（可选）**
+
+在支持远程 MCP 的前端中填写 `https://你的网关地址/mcp`。鉴权可任选一种写法，两者使用同一个 `GATEWAY_SECRET`：
+
+- `X-Gateway-Key: 你的密钥`
+- `Authorization: Bearer 你的密钥`
+
+前端会从该地址发现 `add_memory`、`search_memories`、`list_recent_memories`、`update_memory`、`delete_memory`、`restore_memory`、`pin_memory`、`unpin_memory` 八个工具。`delete_memory` 只把记忆移入归档并立即停止召回，之后可以恢复；永久删除仍只留在 Dashboard。工具通过模型请求原生的 `tools` 字段工作，不会写进人设、摘要、分区历史或当前用户消息。
 
 ### 第三阶段：分区缓存（省 token 费）
 
@@ -221,6 +231,8 @@ pawwake/
 ├── auth.py                    # 网关请求头与 Dashboard Cookie 鉴权
 ├── partition_engine.py        # 分区上下文、轮转与摘要
 ├── memory_pipeline.py         # 记忆注入、对话召回与后台提取
+├── mcp_server.py              # 官方 MCP 传输与八个记忆工具
+├── recall_rerank.py           # 记忆与对话注入的召回重排
 ├── memory_extractor.py        # AI 记忆提取器
 ├── memory_consolidator.py     # 自动整理预览与核心候选
 ├── routes/                    # 按领域拆分的 HTTP 路由
@@ -256,6 +268,7 @@ pawwake/
 |------|------|------|
 | `/` | GET | 健康检查，查看网关状态 |
 | `/v1/chat/completions` | POST | 核心转发接口（OpenAI 兼容） |
+| `/mcp` | MCP Streamable HTTP | 八个记忆工具；接受 `X-Gateway-Key` 或同密钥 Bearer |
 | `/api/memories` | POST | 显式写入单条记忆；需 `X-Gateway-Key`，支持 `external_id` 幂等重试 |
 | `/v1/models` | GET | 模型列表 |
 | `/dashboard/login` | GET/POST | Dashboard 独立密码登录 |
@@ -271,7 +284,7 @@ pawwake/
 | `/api/memories/check-duplicate` | POST | 记忆去重检查 |
 | `/api/memories/cleanup-fragments` | POST | 清理 N 天前的归档碎片 |
 | `/api/memories/layer-stats` | GET | 获取各层记忆统计 |
-| `/api/memories/{id}` | PUT | 更新记忆（支持 content / importance / title / layer） |
+| `/api/memories/{id}` | PUT | 更新记忆（支持 content / importance / title / layer / is_pinned） |
 | `/api/memories/{id}` | DELETE | 删除记忆（`?soft=true` 软删除） |
 | `/api/memories/{id}/promote` | POST | 升级为核心记忆 |
 | `/api/memories/{id}/restore` | POST | 恢复已归档的记忆 |
@@ -361,6 +374,20 @@ pawwake/
 
 分区模式只允许召回当前 session 中已经滑出原文上下文的旧前缀；仍在 A/B 区的消息继续排除，避免重复注入。其他 session 照常参与检索，并按 `CONVERSATION_SEEN_TTL_HOURS` 保存每个成功注入的稳定 `fragment_id` 及其独立时间戳。TTL 内不会重复注入同一片段，过期后会自动放行；`0` 关闭 seen 去重。普通非流式请求仅在上游返回 200 后标记；流式请求仅在 200 响应自然结束后标记，客户端取消或上游失败不会吞掉片段。非分区模式不会自动注入。
 
+**召回重排（可选）：**
+
+记忆和对话注入各有一个开关，默认关闭，共用一个判断模型，推荐 Jev，也可以换 OpenRouter 上其他走 Decisions 接口的判断模型。开启的那一路每轮先搜 20 条交给模型逐条判断，最多注入 3 条且不超过各自的注入上限；模型判定全都不对题时这一轮不注入，超时、接口报错或回包不合规时沿用原搜索结果。只影响自动注入，raw API、Dashboard 搜索和 MCP 搜索工具不重排。
+
+重排支持 OpenRouter、Zenmux 和 TypeSafe 官方接口。默认用基础连接的 `API_BASE_URL` 和 `API_KEY`。
+
+| 环境变量 | 说明 | 默认值 |
+|---------|------|--------|
+| `MEMORY_RERANK_ENABLED` | 记忆注入重排开关 | `false` |
+| `CONVERSATION_RERANK_ENABLED` | 对话召回注入重排开关 | `false` |
+| `RERANK_MODEL` | 两路共用的重排模型；任一开关开启时必填，两个都关时保留不调用 | 无 |
+| `RERANK_BASE_URL` | 重排专用地址，须与 `RERANK_API_KEY` 同时填写或同时留空；留空用 `API_BASE_URL` | 无 |
+| `RERANK_API_KEY` | 重排专用钥匙，须与 `RERANK_BASE_URL` 同时填写或同时留空；留空用 `API_KEY` | 无 |
+
 raw API 不保存 seen 状态。调用方需要把上次返回的 `fragment_ids` 作为下次的 `exclude_fragment_ids` 传回，也可以用 `exclude_session_ids` 排除整条对话线。POST 示例：
 
 ```json
@@ -402,6 +429,13 @@ A: 打开 `https://你的网关地址/dashboard`，在「导出备份」页面�
 A: 能。这个项目的第一个部署者就是不会写代码的——代码是 AI 写的，部署是她自己看文档搞定的。
 
 ## 📋 更新日志
+
+### v4.2.0 · Madeleine（2026-10-31）
+
+- **常驻记忆** — 可在 Dashboard 或 MCP 把长期有效的记忆设为常驻，每轮都注入，不受检索门限影响；活跃常驻正文总计最多 4000 字，占用 `MAX_MEMORIES_INJECT` 名额。常驻记忆不会被后台提取自动取代，也不参与整理合并和清理。
+- **MCP 记忆工具** — 新增 `/mcp`，支持远程 MCP 的前端可以直接添加、搜索、列出、更新、删除、恢复记忆，以及设为或取消常驻。鉴权用同一个 `GATEWAY_SECRET`，可写成 `X-Gateway-Key` 或 Bearer。新增官方 MCP 依赖并锁定全部依赖版本，升级后需重新部署或重新安装依赖才生效。
+- **专有名词表** — Dashboard 新增专有名词表，一行一个。问句提到专名时，记忆搜索把它当整词搜，并给原文含该词的记忆加分；对话召回按原文精确查找含该词的消息。不修改 jieba 词典。首次启动会自动为对话记录建索引，记录多时这次启动会慢一些；建不成时专名查找退回逐条扫描原文。
+- **召回重排（可选）** — 记忆和对话注入各一个开关，共用一个判断模型（推荐 Jev）。开启后每路先搜 20 条交给模型判断，最多注入 3 条；全都不对题时这一轮不注入，超时或出错时沿用原搜索结果。默认关闭，支持 OpenRouter、Zenmux 和 TypeSafe 官方接口，可单独填重排专用的地址和钥匙；每开一路，有候选的轮次最多多一次付费调用。
 
 ### v4.1.10 · Madeleine（2026-10-22）
 
