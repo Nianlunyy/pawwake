@@ -374,6 +374,18 @@ pawwake/
 
 分区模式只允许召回当前 session 中已经滑出原文上下文的旧前缀；仍在 A/B 区的消息继续排除，避免重复注入。其他 session 照常参与检索，并按 `CONVERSATION_SEEN_TTL_HOURS` 保存每个成功注入的稳定 `fragment_id` 及其独立时间戳。TTL 内不会重复注入同一片段，过期后会自动放行；`0` 关闭 seen 去重。普通非流式请求仅在上游返回 200 后标记；流式请求仅在 200 响应自然结束后标记，客户端取消或上游失败不会吞掉片段。非分区模式不会自动注入。
 
+raw API 不保存 seen 状态。调用方需要把上次返回的 `fragment_ids` 作为下次的 `exclude_fragment_ids` 传回，也可以用 `exclude_session_ids` 排除整条对话线。POST 示例：
+
+```json
+{
+  "q": "上次聊到的旅行计划",
+  "mode": "hybrid",
+  "max_sessions": 3,
+  "exclude_session_ids": ["current-thread"],
+  "exclude_fragment_ids": ["v1:0123456789abcdef0123456789abcdef"]
+}
+```
+
 **召回重排（可选）：**
 
 记忆和对话注入各有一个开关，默认关闭，共用一个判断模型，推荐 Jev，也可以换 OpenRouter 上其他走 Decisions 接口的判断模型。开启的那一路每轮先搜 20 条交给模型逐条判断，最多注入 3 条且不超过各自的注入上限；模型判定全都不对题时这一轮不注入，超时、接口报错或回包不合规时沿用原搜索结果。只影响自动注入，raw API、Dashboard 搜索和 MCP 搜索工具不重排。
@@ -387,18 +399,6 @@ pawwake/
 | `RERANK_MODEL` | 两路共用的重排模型；任一开关开启时必填，两个都关时保留不调用 | 无 |
 | `RERANK_BASE_URL` | 重排专用地址，须与 `RERANK_API_KEY` 同时填写或同时留空；留空用 `API_BASE_URL` | 无 |
 | `RERANK_API_KEY` | 重排专用钥匙，须与 `RERANK_BASE_URL` 同时填写或同时留空；留空用 `API_KEY` | 无 |
-
-raw API 不保存 seen 状态。调用方需要把上次返回的 `fragment_ids` 作为下次的 `exclude_fragment_ids` 传回，也可以用 `exclude_session_ids` 排除整条对话线。POST 示例：
-
-```json
-{
-  "q": "上次聊到的旅行计划",
-  "mode": "hybrid",
-  "max_sessions": 3,
-  "exclude_session_ids": ["current-thread"],
-  "exclude_fragment_ids": ["v1:0123456789abcdef0123456789abcdef"]
-}
-```
 
 ## ❓ 常见问题
 
