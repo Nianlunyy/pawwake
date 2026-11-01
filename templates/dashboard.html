@@ -575,6 +575,36 @@
                     </div>
                 </div>
 
+                <!-- 召回重排 -->
+                <div class="card settings-card">
+                    <h3 class="settings-group-title">召回重排</h3>
+                    <div class="settings-field settings-toggle-row">
+                        <label>记忆重排</label>
+                        <label class="toggle"><input type="checkbox" id="set-MEMORY_RERANK_ENABLED"><span class="toggle-slider"></span></label>
+                    </div>
+                    <div class="settings-field settings-toggle-row">
+                        <label>对话重排</label>
+                        <label class="toggle"><input type="checkbox" id="set-CONVERSATION_RERANK_ENABLED"><span class="toggle-slider"></span></label>
+                    </div>
+                    <div>
+                        <div class="settings-field">
+                            <label>召回重排模型</label>
+                            <input type="text" id="set-RERANK_MODEL" class="input" placeholder="typesafe/jev-1.13" autocomplete="off">
+                            <small class="form-hint">模型名按照供应商页面上的填，同一个模型各家写法可能不同。</small>
+                        </div>
+                        <div class="settings-field">
+                            <label>重排 API Base URL</label>
+                            <input type="text" id="set-RERANK_BASE_URL" class="input" placeholder="留空时使用基础连接的 API Base URL" autocomplete="off">
+                        </div>
+                        <div class="settings-field">
+                            <label>重排 API Key</label>
+                            <input type="text" id="set-RERANK_API_KEY" class="input" placeholder="留空时使用基础连接的 API Key" autocomplete="off">
+                            <small class="form-hint" id="set-RERANK_API_KEY-hint"></small>
+                        </div>
+                        <small class="form-hint">专用地址和钥匙须同时填写或同时留空；两项都留空时使用基础连接。失败时沿用原搜索。两个开关都关闭时保留设置</small>
+                    </div>
+                </div>
+
                 <!-- 缓存分区 -->
                 <div class="card settings-card">
                     <h3 class="settings-group-title">缓存分区</h3>
@@ -677,6 +707,11 @@
                         <label>语义阈值 <span class="slider-val" id="val-MEMORY_SEMANTIC_THRESHOLD"></span></label>
                         <input type="range" id="set-MEMORY_SEMANTIC_THRESHOLD" min="0" max="1" step="0.05" oninput="updateSliderVal('MEMORY_SEMANTIC_THRESHOLD')">
                     </div>
+                    <div class="settings-field">
+                        <label>专有名词表（记忆与对话搜索）</label>
+                        <textarea id="set-MEMORY_PHRASES" class="textarea" rows="4" placeholder="一行一个专有名词"></textarea>
+                        <small class="form-hint">记忆搜索补整词，对话召回按原文精确查找；不修改 jieba 词典</small>
+                    </div>
                 </div>
 
                 <!-- 其他 -->
@@ -714,6 +749,6 @@
         </main>
     </div>
 
-    <script src="/static/js/dashboard.js?v=4.1.10"></script>
+    <script src="/static/js/dashboard.js?v=4.2.0"></script>
 </body>
 </html>

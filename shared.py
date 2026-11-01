@@ -7,6 +7,16 @@ from fastapi.templating import Jinja2Templates
 
 logger = logging.getLogger(__name__)
 
+
+def _parse_lines(value) -> list[str]:
+    """Parse newline-separated Dashboard text into unique non-empty entries."""
+    lines = []
+    for raw_line in str(value or "").splitlines():
+        line = raw_line.strip()
+        if line and line not in lines:
+            lines.append(line)
+    return lines
+
 # ============================================================
 # 配置项 —— 全部从环境变量读取，部署时在云平台面板里设置
 # ============================================================
@@ -138,6 +148,18 @@ MEMORY_HW_IMPORTANCE = float(os.getenv("MEMORY_HW_IMPORTANCE", "0.15"))
 MEMORY_HW_RECENCY = float(os.getenv("MEMORY_HW_RECENCY", "0.15"))
 MEMORY_SEMANTIC_THRESHOLD = float(os.getenv("MEMORY_SEMANTIC_THRESHOLD", "0.7"))
 
+# Dashboard 专名表：记忆与对话搜索共用，不动态修改 jieba 词典。
+MEMORY_PHRASES = []
+
+# 记忆与对话各自控制是否重排，共用一套 Jev 连接与模型。
+MEMORY_RERANK_ENABLED = os.getenv("MEMORY_RERANK_ENABLED", "false").lower() == "true"
+CONVERSATION_RERANK_ENABLED = os.getenv(
+    "CONVERSATION_RERANK_ENABLED", "false"
+).lower() == "true"
+RERANK_MODEL = os.getenv("RERANK_MODEL", "").strip()
+RERANK_BASE_URL = os.getenv("RERANK_BASE_URL", "").strip()
+RERANK_API_KEY = os.getenv("RERANK_API_KEY", "").strip()
+
 # 非分区模式没有稳定 session 历史，保留进程内提取计数。
 _nonpartition_round_counter = 0
 
@@ -189,8 +211,17 @@ SETTINGS_TYPES = {
     "MEMORY_HW_IMPORTANCE": float,
     "MEMORY_HW_RECENCY": float,
     "MEMORY_SEMANTIC_THRESHOLD": float,
+    "MEMORY_PHRASES": _parse_lines,
+    "MEMORY_RERANK_ENABLED": lambda value: _parse_bool(value),
+    "CONVERSATION_RERANK_ENABLED": lambda value: _parse_bool(value),
+    "RERANK_MODEL": lambda value: str(value).strip(),
+    "RERANK_BASE_URL": lambda value: str(value).strip(),
+    "RERANK_API_KEY": lambda value: str(value).strip(),
 }
-SETTINGS_ALLOW_EMPTY = {"CACHE_SUMMARY_MODEL", "DEFAULT_MODEL", "MEMORY_API_KEY"}
+SETTINGS_ALLOW_EMPTY = {
+    "CACHE_SUMMARY_MODEL", "DEFAULT_MODEL", "MEMORY_API_KEY", "MEMORY_PHRASES",
+    "RERANK_MODEL", "RERANK_BASE_URL", "RERANK_API_KEY",
+}
 
 
 def get_memory_api_key() -> str:

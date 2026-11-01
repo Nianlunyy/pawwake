@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import shared
 import memory_extractor
 import partition_engine
+import recall_rerank
 from db import core as db_core
 from db import search as db_search
 from db import conversations as db_conversations
@@ -60,21 +61,68 @@ async def _release_due_rows(due: list) -> None:
         print(f"⚠️ 提醒处理权交回失败，等处理时限结束后自动重试: {e}")
 
 
-async def _search_memories_or_empty(user_message: str) -> list:
-    """非分区路径的普通检索单独兜底：失败只影响普通记忆，不影响到期提醒的注入。签名与 4.1.0 相同，不带 exclude_ids。"""
+async def _search_memories_or_empty(
+    user_message: str,
+    limit: int,
+    exclude_ids: list = None,
+    recalled_message_ids: list = None,
+) -> list:
+    """非分区路径的普通检索单独兜底：失败只影响普通记忆。"""
+    if limit <= 0:
+        return []
     try:
-        return await db_memories.search_memories(user_message, limit=shared.MAX_MEMORIES_INJECT) or []
+        return await _search_memories_for_injection(
+            user_message, limit, exclude_ids, recalled_message_ids
+        )
     except Exception as e:
         print(f"⚠️  记忆检索失败: {e}")
         return []
 
 
-def _merge_due_reminders(due: list, memories: list) -> list:
-    """到期提醒排最前，不受关键词/语义门和 seen 去重影响；与搜索结果按 id 去重。"""
-    if not due:
-        return list(memories or [])
-    due_ids = {mem["id"] for mem in due}
-    return list(due) + [mem for mem in (memories or []) if mem.get("id") not in due_ids]
+async def _search_memories_for_injection(
+    user_message: str,
+    limit: int,
+    exclude_ids: list = None,
+    recalled_message_ids: list = None,
+) -> list:
+    if limit <= 0:
+        return []
+
+    async def search(search_limit: int):
+        kwargs = {"limit": search_limit, "exclude_ids": exclude_ids}
+        if recalled_message_ids is not None:
+            kwargs["recalled_message_ids"] = recalled_message_ids
+        return await db_memories.search_memories(user_message, **kwargs) or []
+
+    model = shared.RERANK_MODEL
+    if shared.MEMORY_RERANK_ENABLED and model:
+        candidates = await search(recall_rerank.POOL)
+        if not candidates:
+            return []
+        picked = await recall_rerank.rerank(
+            model, user_message, candidates, "memory"
+        )
+        if picked is not None:
+            return picked[:min(recall_rerank.KEEP, limit)]
+    return await search(limit)
+
+
+async def _get_pinned_memories_or_empty() -> list:
+    try:
+        return await db_memories.get_active_pinned_memories()
+    except Exception as e:
+        print(f"⚠️ 常驻记忆读取失败: {e}")
+        return []
+
+
+def _without_ids(memories: list, excluded_ids: set) -> list:
+    return [mem for mem in (memories or []) if mem.get("id") not in excluded_ids]
+
+
+def _memory_lines(memories: list) -> str:
+    return "\n".join(
+        f"- {_memory_date_prefix(mem)}{mem['content']}" for mem in memories
+    )
 
 
 def _memory_date_prefix(mem: dict) -> str:
@@ -106,24 +154,34 @@ async def build_system_prompt_with_memories(
     if not shared.memory_injection_enabled():
         return base_prompt
 
-    # 到期提醒先占用；普通检索失败不影响提醒注入
+    # 到期提醒先占用；常驻与普通检索各自失败时不拖掉其余注入。
     due = await _claim_due_reminders()
-    memories = _merge_due_reminders(due, await _search_memories_or_empty(user_message))
-    if not memories:
+    due_ids = {mem["id"] for mem in due}
+    pinned = _without_ids(await _get_pinned_memories_or_empty(), due_ids)
+    remaining = max(0, shared.MAX_MEMORIES_INJECT - len(pinned))
+    searched = _without_ids(
+        await _search_memories_or_empty(
+            user_message,
+            remaining,
+            list(due_ids | {mem["id"] for mem in pinned}),
+        ),
+        due_ids | {mem["id"] for mem in pinned},
+    )
+    if not due and not pinned and not searched:
         return base_prompt
 
     try:
-        # 格式化记忆文本（带日期，帮助模型判断新旧）
-        # event_date 优先：整理产物的 created_at 是整理当天，真实发生日存在 event_date 里。
-        # event_date 本身就是本地日期，不做时区换算
-        memory_lines = []
-        for mem in memories:
-            memory_lines.append(f"- {_memory_date_prefix(mem)}{mem['content']}")
-        memory_text = "\n".join(memory_lines)
+        sections = []
+        if due:
+            sections.append("【到期提醒】\n" + _memory_lines(due))
+        if pinned:
+            sections.append("【常驻记忆】\n" + _memory_lines(pinned))
+        if searched:
+            sections.append("【从过往对话中检索到的相关记忆】\n" + _memory_lines(searched))
+        memory_text = "\n\n".join(sections)
 
         enhanced_prompt = f"""{base_prompt}
 
-【从过往对话中检索到的相关记忆】
 {memory_text}
 
 # 记忆应用
@@ -142,7 +200,7 @@ async def build_system_prompt_with_memories(
 
         # 提醒文本已经进 prompt，才交给本次请求负责
         _commit_reminder_claims(pending_reminder_claims, due)
-        print(f"📚 注入了 {len(memories)} 条相关记忆")
+        print(f"📚 注入了 {len(due)} 条提醒、{len(pinned)} 条常驻、{len(searched)} 条相关记忆")
         return enhanced_prompt
 
     except Exception as e:
@@ -161,8 +219,12 @@ async def build_memory_text(
     if not shared.memory_injection_enabled():
         return ""
 
-    # 到期提醒先占用，不受 seen 去重和检索门限影响；普通检索失败不影响提醒注入
+    # 到期提醒与常驻不受 seen 去重和检索门限影响。
     due = await _claim_due_reminders()
+    due_ids = {mem["id"] for mem in due}
+    pinned = _without_ids(await _get_pinned_memories_or_empty(), due_ids)
+    pinned_ids = {mem["id"] for mem in pinned}
+    remaining = max(0, shared.MAX_MEMORIES_INJECT - len(pinned))
     try:
         excluded_ids = []
         if session_id and shared.MEMORY_SEEN_TTL_HOURS > 0:
@@ -170,25 +232,24 @@ async def build_memory_text(
                 session_id,
                 shared.MEMORY_SEEN_TTL_HOURS,
             )
-        searched = await db_memories.search_memories(
-            user_message,
-            limit=shared.MAX_MEMORIES_INJECT,
-            exclude_ids=excluded_ids,
-            recalled_message_ids=recalled_message_ids,
-        ) or []
+        if remaining > 0:
+            searched = await _search_memories_for_injection(
+                user_message,
+                remaining,
+                list(set(excluded_ids) | due_ids | pinned_ids),
+                recalled_message_ids,
+            )
+        else:
+            searched = []
     except Exception as e:
         print(f"⚠️ 记忆检索失败: {e}")
         searched = []
 
-    memories = _merge_due_reminders(due, searched)
-    if not memories:
+    searched = _without_ids(searched, due_ids | pinned_ids)
+    if not due and not pinned and not searched:
         return ""
 
     try:
-        memory_lines = []
-        for mem in memories:
-            memory_lines.append(f"- {_memory_date_prefix(mem)}{mem['content']}")
-
         if injected_ids is not None:
             injected_ids.extend(
                 mem["id"]
@@ -196,15 +257,30 @@ async def build_memory_text(
                 if isinstance(mem.get("id"), int) and not isinstance(mem.get("id"), bool)
             )
 
-        text = (
-            "<retrieved_memories>\n"
-            "以下是网关从过往对话中自动检索的相关记忆，供参考，非用户本次输入：\n"
-            + "\n".join(memory_lines)
-            + "\n</retrieved_memories>"
-        )
+        blocks = []
+        if due:
+            blocks.append(
+                "<due_reminders>\n以下是已经到期的提醒，供本轮优先处理：\n"
+                + _memory_lines(due)
+                + "\n</due_reminders>"
+            )
+        if pinned:
+            blocks.append(
+                "<pinned_memories>\n以下是用户设为常驻的记忆，供持续保持一致：\n"
+                + _memory_lines(pinned)
+                + "\n</pinned_memories>"
+            )
+        if searched:
+            blocks.append(
+                "<retrieved_memories>\n"
+                "以下是网关从过往对话中自动检索的相关记忆，供参考，非用户本次输入：\n"
+                + _memory_lines(searched)
+                + "\n</retrieved_memories>"
+            )
+        text = "\n\n".join(blocks)
         # 提醒文本已经构造成功，才交给本次请求负责
         _commit_reminder_claims(pending_reminder_claims, due)
-        print(f"📚 注入了 {len(memories)} 条相关记忆")
+        print(f"📚 注入了 {len(due)} 条提醒、{len(pinned)} 条常驻、{len(searched)} 条相关记忆")
         return text
     except Exception as e:
         print(f"⚠️ 记忆格式化失败: {e}")
@@ -246,6 +322,84 @@ def _out_of_context_prefix_cutoff(history: list, a_start_round: int):
     return last["created_at"], last["id"]
 
 
+def _conversation_candidates(results: list, limit: int) -> list[dict]:
+    role_labels = {"user": "用户", "assistant": "AI", "tool": "工具"}
+    per_session = [
+        list(zip(
+            result.get("fragments", []),
+            result.get("fragment_ids", []),
+            result.get(
+                "fragment_message_ids",
+                [[] for _ in result.get("fragments", [])],
+            ),
+        ))
+        for result in results
+    ]
+    candidates = []
+    for match_index in range(max((len(items) for items in per_session), default=0)):
+        for result, items in zip(results, per_session):
+            if match_index >= len(items):
+                continue
+            fragment, fragment_id, message_ids = items[match_index]
+            lines = []
+            first_date = "?"
+            for message in fragment:
+                date_prefix = ""
+                if message.get("created_at"):
+                    message_date = _format_recall_timestamp(message["created_at"])
+                    if first_date == "?":
+                        first_date = message_date
+                    date_prefix = f"[{message_date}] "
+                role = role_labels.get(message.get("role"), message.get("role", "消息"))
+                lines.append(f"{date_prefix}{role}: {message.get('content', '')}")
+            if lines and fragment_id:
+                candidates.append({
+                    "session_id": result.get("session_id", ""),
+                    "fragment_id": fragment_id,
+                    "message_ids": message_ids,
+                    "date": first_date,
+                    "text": "\n".join(lines),
+                })
+            if len(candidates) >= limit:
+                return candidates
+    return candidates
+
+
+async def _search_conversations_for_injection(
+    user_message: str,
+    session_id: str,
+    state: dict,
+    cutoff,
+) -> list[dict]:
+    async def search(limit: int):
+        results, _ = await db_search.search_chat_fragments(
+            user_message,
+            max_sessions=limit,
+            max_matches_per_session=limit,
+            context=1,
+            mode="hybrid",
+            exclude_session_ids=[session_id],
+            exclude_fragment_ids=state.get("seen_fragment_ids", []),
+            include_session_before=(session_id, *cutoff) if cutoff else None,
+            disjoint_fragments=True,
+            include_message_ids=True,
+        )
+        return _conversation_candidates(results, limit)
+
+    limit = shared.MAX_CONVERSATIONS_INJECT
+    model = shared.RERANK_MODEL
+    if shared.CONVERSATION_RERANK_ENABLED and model:
+        candidates = await search(recall_rerank.POOL)
+        if not candidates:
+            return []
+        picked = await recall_rerank.rerank(
+            model, user_message, candidates, "conversation"
+        )
+        if picked is not None:
+            return picked[:min(recall_rerank.KEEP, limit)]
+    return await search(limit)
+
+
 async def build_conversation_recall_text(
     user_message: str,
     session_id: str,
@@ -267,57 +421,23 @@ async def build_conversation_recall_text(
             history or [],
             state.get("a_start_round", 0),
         )
-        results, _ = await db_search.search_chat_fragments(
-            user_message,
-            max_sessions=shared.MAX_CONVERSATIONS_INJECT,
-            max_matches_per_session=shared.MAX_CONVERSATIONS_INJECT,
-            context=1,
-            mode="hybrid",
-            exclude_session_ids=[session_id],
-            exclude_fragment_ids=state.get("seen_fragment_ids", []),
-            include_session_before=(session_id, *cutoff) if cutoff else None,
-            disjoint_fragments=True,
-            include_message_ids=True,
+        candidates = await _search_conversations_for_injection(
+            user_message, session_id, state, cutoff
         )
-        if not results:
+        if not candidates:
             return "", [], []
 
         blocks = []
         fragment_ids = []
         recalled_message_ids = []
-        role_labels = {"user": "用户", "assistant": "AI", "tool": "工具"}
-        per_session = [
-            list(zip(
-                result.get("fragments", []),
-                result.get("fragment_ids", []),
-                result.get("fragment_message_ids", [[] for _ in result.get("fragments", [])]),
-            ))
-            for result in results
-        ]
-        for match_index in range(max((len(items) for items in per_session), default=0)):
-            for items in per_session:
-                if match_index >= len(items):
-                    continue
-                fragment, fragment_id, message_ids = items[match_index]
-                lines = []
-                for message in fragment:
-                    date_prefix = ""
-                    if message.get("created_at"):
-                        date_prefix = f"[{_format_recall_timestamp(message['created_at'])}] "
-                    role = role_labels.get(message.get("role"), message.get("role", "消息"))
-                    lines.append(f"{date_prefix}{role}: {message.get('content', '')}")
-                if lines and fragment_id:
-                    blocks.append("\n".join(lines))
-                    fragment_ids.append(fragment_id)
-                    recalled_message_ids.extend(
-                        message_id
-                        for message_id in message_ids
-                        if isinstance(message_id, int) and not isinstance(message_id, bool)
-                    )
-                if len(blocks) >= shared.MAX_CONVERSATIONS_INJECT:
-                    break
-            if len(blocks) >= shared.MAX_CONVERSATIONS_INJECT:
-                break
+        for candidate in candidates:
+            blocks.append(candidate["text"])
+            fragment_ids.append(candidate["fragment_id"])
+            recalled_message_ids.extend(
+                message_id
+                for message_id in candidate["message_ids"]
+                if isinstance(message_id, int) and not isinstance(message_id, bool)
+            )
 
         if not blocks:
             return "", [], []

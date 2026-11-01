@@ -232,6 +232,11 @@ function renderTable(mems, startIndex) {
         const promoteBtn = candidateInfo
             ? '<button class="btn btn-success btn-sm" onclick="promoteCandidate(' + m.id + ')">升级核心</button>'
             : '';
+        const pinBtn = m.is_pinned
+            ? '<button class="btn btn-secondary btn-sm" onclick="togglePinned(' + m.id + ', false)">取消常驻</button>'
+            : (!isInactive
+                ? '<button class="btn btn-warning btn-sm" onclick="togglePinned(' + m.id + ', true)">设为常驻</button>'
+                : '');
         
         // 恢复按钮（只有已归档的记忆显示）
         let restoreBtn = '';
@@ -247,17 +252,20 @@ function renderTable(mems, startIndex) {
         }
         
         return '<tr data-id="' + m.id + '" class="' + rowClass + '">' +
-            '<td class="col-check"><input type="checkbox" class="mem-check" value="' + m.id + '" onchange="updateFloatingBar()"></td>' +
+            '<td class="col-check"><input type="checkbox" class="mem-check" value="' + m.id + '" onchange="updateFloatingBar()"' +
+                (m.is_pinned ? ' disabled title="先取消常驻再做批量操作"' : '') + '></td>' +
             '<td class="col-id">' + (startIndex + i + 1) + mergeInfo + versionInfo + '</td>' +
             '<td class="col-layer">' + layerSelect + '</td>' +
             '<td class="col-title"><input type="text" class="title-input" id="t_' + m.id + '" value="' + escapeHtml(titleDisplay) + '" placeholder="无标题">' + candidateInfo + '</td>' +
             '<td class="col-content"><textarea class="content-textarea" id="c_' + m.id + '">' + escapeHtml(m.content) + '</textarea></td>' +
             '<td class="col-importance"><input type="number" class="importance-input" id="i_' + m.id + '" value="' + m.importance + '" min="1" max="10"></td>' +
             '<td class="col-time">' + fmtTime(m.event_date || m.created_at) +
+                (m.is_pinned ? '<div class="reminder-tag" title="每轮优先注入">📌 常驻</div>' : '') +
                 (m.remind_at ? '<div class="reminder-tag" title="到期后自动注入一次">⏰ ' + escapeHtml(m.remind_at.slice(0, 16)) + (m.reminder_delivered_at ? '（已提醒）' : '') + '</div>' : '') +
             '</td>' +
             '<td class="col-actions"><div class="row-actions">' +
                 '<button class="btn btn-primary btn-sm" onclick="saveMem(' + m.id + ')">保存</button>' +
+                pinBtn +
                 promoteBtn +
                 revertBtn +
                 restoreBtn +
@@ -519,6 +527,25 @@ async function restoreMem(id) {
     }
 }
 
+async function togglePinned(id, isPinned) {
+    try {
+        const resp = await fetch('/api/memories/' + id, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({is_pinned: isPinned})
+        });
+        const data = await resp.json();
+        if (data.error) {
+            showManageMsg('error', '❌ ' + data.error);
+        } else {
+            showManageMsg('success', isPinned ? '✅ 已设为常驻记忆' : '✅ 已取消常驻');
+            loadMemories();
+        }
+    } catch(e) {
+        showManageMsg('error', '❌ ' + e.message);
+    }
+}
+
 async function batchSave() {
     const checked = [...document.querySelectorAll('.mem-check:checked')].map(c => parseInt(c.value));
     if (checked.length === 0) { showManageMsg('error', '请先勾选要保存的记忆'); return; }
@@ -628,7 +655,7 @@ async function batchRestore() {
 
 function toggleAll() {
     const val = event.target.checked;
-    document.querySelectorAll('.mem-check').forEach(c => c.checked = val);
+    document.querySelectorAll('.mem-check:not(:disabled)').forEach(c => c.checked = val);
     document.getElementById('selectAll').checked = val;
     document.getElementById('selectAllHead').checked = val;
     updateFloatingBar();
@@ -1300,7 +1327,9 @@ async function previewJson() {
         }
         
         pendingJsonData = parsed;
-        const verTag = parsed.schema_version === 5
+        const verTag = parsed.schema_version === 6
+            ? '（v6 完整备份，含常驻标记与来源记录）'
+            : parsed.schema_version === 5
             ? '（v5 完整备份，含来源记录）'
             : parsed.schema_version === 3
             ? '（v3 完整备份，含层级/日期/合并与版本关系）'
@@ -2586,11 +2615,11 @@ let _loadedEmbeddingSettings = {};
 // 所有需要读写的字段 key（开源版：EMBEDDING_API_KEY + EMBEDDING_BASE_URL）
 const _SETTINGS_FIELDS = {
     str: ['API_BASE_URL', 'API_KEY', 'DEFAULT_MODEL', 'MEMORY_API_KEY', 'MEMORY_MODEL',
-          'CACHE_SUMMARY_MODEL', 'CACHE_TTL', 'CACHE_PARTITION_TRIGGER', 'EMBEDDING_API_KEY', 'EMBEDDING_BASE_URL', 'EMBEDDING_MODEL', 'REASONING_EFFORT'],
+          'CACHE_SUMMARY_MODEL', 'CACHE_TTL', 'CACHE_PARTITION_TRIGGER', 'EMBEDDING_API_KEY', 'EMBEDDING_BASE_URL', 'EMBEDDING_MODEL', 'REASONING_EFFORT', 'RERANK_MODEL', 'RERANK_BASE_URL', 'RERANK_API_KEY'],
     int: ['MAX_MEMORIES_INJECT', 'MAX_CONVERSATIONS_INJECT', 'MEMORY_EXTRACT_INTERVAL', 'CACHE_PARTITION_X', 'CACHE_PARTITION_WINDOW', 'CACHE_SUMMARY_BUDGET_CHARS', 'EMBEDDING_DIM'],
     float: ['MIN_SCORE_THRESHOLD', 'CONVERSATION_MIN_SCORE_THRESHOLD',
             'MEMORY_SEEN_TTL_HOURS', 'CONVERSATION_SEEN_TTL_HOURS'],
-    bool: ['MEMORY_ENABLED', 'MEMORY_SOURCE_DEDUPE_ENABLED', 'CONVERSATION_RECALL_ENABLED', 'CACHE_PARTITION_ENABLED', 'MEMORY_VECTOR_ENABLED', 'FORCE_STREAM'],
+    bool: ['MEMORY_ENABLED', 'MEMORY_SOURCE_DEDUPE_ENABLED', 'CONVERSATION_RECALL_ENABLED', 'CACHE_PARTITION_ENABLED', 'MEMORY_VECTOR_ENABLED', 'FORCE_STREAM', 'MEMORY_RERANK_ENABLED', 'CONVERSATION_RERANK_ENABLED'],
     range: ['MEMORY_HW_KEYWORD', 'MEMORY_HW_SEMANTIC', 'MEMORY_HW_IMPORTANCE',
             'MEMORY_HW_RECENCY', 'MEMORY_SEMANTIC_THRESHOLD',
             'CONVERSATION_HW_KEYWORD', 'CONVERSATION_HW_SEMANTIC',
@@ -2619,7 +2648,7 @@ async function loadSettings() {
             if (el) el.value = s[k] || '';
         });
         // 打码字段提示
-        ['API_KEY', 'MEMORY_API_KEY', 'EMBEDDING_API_KEY'].forEach(k => {
+        ['API_KEY', 'MEMORY_API_KEY', 'EMBEDDING_API_KEY', 'RERANK_API_KEY'].forEach(k => {
             const hint = document.getElementById('set-' + k + '-hint');
             if (hint && s[k]) hint.textContent = '当前: ' + s[k];
         });
@@ -2688,6 +2717,8 @@ async function loadSettings() {
             const el = document.getElementById('set-' + k);
             if (el) { el.value = s[k]; updateSliderVal(k); }
         });
+        const phrasesEl = document.getElementById('set-MEMORY_PHRASES');
+        if (phrasesEl) phrasesEl.value = s.MEMORY_PHRASES || '';
         // 长文本
         const promptEl = document.getElementById('set-systemPrompt');
         if (promptEl) {
@@ -2767,6 +2798,8 @@ async function saveSettings() {
         const el = document.getElementById('set-' + k);
         if (el) payload[k] = parseFloat(el.value) || 0;
     });
+    const phrasesEl = document.getElementById('set-MEMORY_PHRASES');
+    if (phrasesEl) payload.MEMORY_PHRASES = phrasesEl.value;
     // 长文本
     const promptEl = document.getElementById('set-systemPrompt');
     if (promptEl) payload.systemPrompt = promptEl.value;
