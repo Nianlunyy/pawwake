@@ -214,6 +214,46 @@ class TestGatewayAuth(unittest.TestCase):
             self.assertEqual(resp.status_code, 401)
             self.assertEqual(resp.body, b'{"error":"Unauthorized. Provide X-Gateway-Key header."}')
 
+    def test_case_8_mcp_auth(self):
+        """⑧ /mcp 路由 Bearer 鉴权测试：正确密钥放行、非 ASCII 401 非 500、多 Key 均放行、未设密钥 401、X-Gateway-Key 仍可用"""
+        # 1. Bearer 正确密钥放行
+        with patch.object(shared, "GATEWAY_SECRET", "secret-mcp-1"):
+            req_ok = _make_request("/mcp", headers={"Authorization": "Bearer secret-mcp-1"})
+            resp_ok = asyncio.run(auth.gateway_auth_middleware(req_ok, _dummy_call_next))
+            self.assertEqual(resp_ok.status_code, 200, "Bearer 正确密钥应放行")
+
+        # 2. 非 ASCII 令牌得 401 而非 500
+        with patch.object(shared, "GATEWAY_SECRET", "secret-mcp-1"):
+            req_non_ascii = _make_request("/mcp", headers={"Authorization": "Bearer é"})
+            resp_non_ascii = asyncio.run(auth.gateway_auth_middleware(req_non_ascii, _dummy_call_next))
+            self.assertEqual(resp_non_ascii.status_code, 401, "非 ASCII 令牌应返回 401 而非 500")
+
+        # 3. 多 Key 配置下两个 Key 都放行
+        with patch.object(shared, "GATEWAY_SECRET", "mcp-key-1, mcp-key-2"):
+            req_k1 = _make_request("/mcp", headers={"Authorization": "Bearer mcp-key-1"})
+            resp_k1 = asyncio.run(auth.gateway_auth_middleware(req_k1, _dummy_call_next))
+            self.assertEqual(resp_k1.status_code, 200, "多 Key 下 Key 1 应放行")
+
+            req_k2 = _make_request("/mcp", headers={"Authorization": "Bearer mcp-key-2"})
+            resp_k2 = asyncio.run(auth.gateway_auth_middleware(req_k2, _dummy_call_next))
+            self.assertEqual(resp_k2.status_code, 200, "多 Key 下 Key 2 应放行")
+
+        # 4. 未设密钥得 401
+        with patch.object(shared, "GATEWAY_SECRET", ""):
+            req_unset_token = _make_request("/mcp", headers={"Authorization": "Bearer any-token"})
+            resp_unset_token = asyncio.run(auth.gateway_auth_middleware(req_unset_token, _dummy_call_next))
+            self.assertEqual(resp_unset_token.status_code, 401, "未设密钥带 Bearer 应返回 401")
+
+            req_unset_none = _make_request("/mcp")
+            resp_unset_none = asyncio.run(auth.gateway_auth_middleware(req_unset_none, _dummy_call_next))
+            self.assertEqual(resp_unset_none.status_code, 401, "未设密钥无 header 应返回 401")
+
+        # 5. X-Gateway-Key 在 /mcp 上仍可用
+        with patch.object(shared, "GATEWAY_SECRET", "secret-mcp-1"):
+            req_gw_key = _make_request("/mcp", headers={"X-Gateway-Key": "secret-mcp-1"})
+            resp_gw_key = asyncio.run(auth.gateway_auth_middleware(req_gw_key, _dummy_call_next))
+            self.assertEqual(resp_gw_key.status_code, 200, "X-Gateway-Key 在 /mcp 上应仍可用")
+
 
 
 if __name__ == "__main__":
