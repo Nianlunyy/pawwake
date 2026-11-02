@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import hmac
+import os
 import secrets
 import time
 
@@ -43,6 +44,48 @@ def get_gateway_secrets() -> list[str]:
     """支持逗号分隔的多个 Key：按逗号拆分、strip、丢弃空项。"""
     raw = getattr(shared, "GATEWAY_SECRET", "") or ""
     return [k.strip() for k in raw.split(",") if k.strip()]
+
+
+def get_public_base_url() -> str:
+    """Read PUBLIC_BASE_URL from environment or shared config."""
+    url = os.environ.get("PUBLIC_BASE_URL") or getattr(shared, "PUBLIC_BASE_URL", "") or ""
+    return url.strip().rstrip("/")
+
+
+def create_derived_token(expires_in: int = 2592000) -> str:
+    """Generate derived access token: pwa_<expires_at>_<HMAC>."""
+    expires_at = int(time.time()) + expires_in
+    keys = get_gateway_secrets()
+    signing_key = keys[0] if keys else "pawwake_default_key"
+    payload = str(expires_at).encode("ascii")
+    sig = hmac.new(signing_key.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+    return f"pwa_{expires_at}_{sig}"
+
+
+def verify_derived_token(token: str) -> bool:
+    """Verify derived access token pwa_<expires_at>_<HMAC> against GATEWAY_SECRET items."""
+    if not token or not token.startswith("pwa_"):
+        return False
+    parts = token.split("_")
+    if len(parts) != 3:
+        return False
+    try:
+        expires_at = int(parts[1])
+    except (ValueError, TypeError):
+        return False
+    if time.time() > expires_at:
+        return False
+    keys = get_gateway_secrets()
+    if not keys:
+        return False
+    provided_sig = parts[2].encode("ascii")
+    payload = str(expires_at).encode("ascii")
+    matched = False
+    for k in keys:
+        expected_sig = hmac.new(k.encode("utf-8"), payload, hashlib.sha256).hexdigest().encode("ascii")
+        if secrets.compare_digest(provided_sig, expected_sig):
+            matched = True
+    return matched
 
 
 def verify_gateway_key(provided_key: str) -> bool:
@@ -137,29 +180,27 @@ async def gateway_auth_middleware(request: Request, call_next):
         return await call_next(request)
 
     # MCP clients commonly support Bearer but not custom headers. This alternate spelling
-    # stays scoped to /mcp and uses the same secret as X-Gateway-Key.
+    # stays scoped to /mcp and accepts GATEWAY_SECRET or derived token.
     if is_mcp_path(path):
-        scheme, separator, token = request.headers.get("Authorization", "").partition(" ")
-        if (
-            separator
-            and scheme.lower() == "bearer"
-            and verify_gateway_key(token.strip())
-        ):
+        if provided_key and verify_derived_token(provided_key):
             return await call_next(request)
-        host = (
-            request.headers.get("x-forwarded-host")
-            or request.headers.get("host")
-            or request.url.netloc
-            or "localhost"
+        scheme, separator, token = request.headers.get("Authorization", "").partition(" ")
+        if separator and scheme.lower() == "bearer":
+            token_str = token.strip()
+            if verify_gateway_key(token_str) or verify_derived_token(token_str):
+                return await call_next(request)
+        base_url = get_public_base_url()
+        www_auth = (
+            f'Bearer resource_metadata="{base_url}/.well-known/oauth-protected-resource"'
+            if base_url
+            else "Bearer"
         )
         return JSONResponse(
             status_code=401,
             content={
                 "error": "Unauthorized. Provide X-Gateway-Key or Authorization: Bearer."
             },
-            headers={
-                "WWW-Authenticate": f'Bearer resource_metadata="https://{host}/.well-known/oauth-protected-resource"'
-            },
+            headers={"WWW-Authenticate": www_auth},
         )
 
     # 显式记忆写入只接受网关密钥，Dashboard Cookie 不授予这个外部写入口。
@@ -170,23 +211,23 @@ async def gateway_auth_middleware(request: Request, call_next):
         )
 
     if is_dashboard_path(path) and (get_gateway_secrets() or shared.DASHBOARD_PASSWORD or shared.SESSION_SECRET):
-        if not dashboard_auth_ready():
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "Dashboard login is not configured. Set DASHBOARD_PASSWORD and a stable SESSION_SECRET of at least 32 characters."
-                },
-            )
         token = request.cookies.get(shared.DASHBOARD_SESSION_COOKIE, "")
-        if valid_dashboard_session(token):
+        if dashboard_auth_ready() and valid_dashboard_session(token):
             if request.method in DASHBOARD_WRITE_METHODS and not request_has_same_origin(request):
                 return JSONResponse(status_code=403, content={"error": "Invalid request origin."})
             return await call_next(request)
         if path == "/dashboard" and request.method == "GET":
+            if not dashboard_auth_ready():
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "Dashboard login is not configured. Set DASHBOARD_PASSWORD and a stable SESSION_SECRET of at least 32 characters."
+                    },
+                )
             return RedirectResponse(url="/dashboard/login", status_code=303)
         return JSONResponse(
             status_code=401,
-            content={"error": "Dashboard login required."},
+            content={"error": "Unauthorized. Provide X-Gateway-Key header."},
         )
 
     # 未设置密钥时网关保护路径一律拒绝（返回 401），并确保警告已打印。

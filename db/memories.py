@@ -1703,15 +1703,14 @@ async def merge_memories(memory_ids: list, new_title: str, new_content: str,
 async def check_duplicate_memory(new_content: str, threshold: float = 0.7) -> dict:
     """检查新记忆是否与现有记忆重复
 
-    三层去重策略：
+    两层去重策略：
     1. 精确匹配：内容完全相同
-    2. 包含关系：新内容包含旧内容，或旧内容包含新内容
-    3. 关键词重叠度：Jaccard 相似度 > threshold
+    2. 关键词重叠度：Jaccard 相似度 > threshold
 
     Returns:
         {
             "is_duplicate": bool,
-            "reason": str,  # "exact" / "containment" / "similarity"
+            "reason": str,  # "exact" / "similarity"
             "matched_id": int or None,
             "similarity": float or None
         }
@@ -1740,23 +1739,7 @@ async def check_duplicate_memory(new_content: str, threshold: float = 0.7) -> di
                     "similarity": 1.0
                 }
 
-            # 第二层：包含关系
-            if new_content_lower in old_content_lower:
-                return {
-                    "is_duplicate": True,
-                    "reason": "containment",
-                    "matched_id": row['id'],
-                    "similarity": len(new_content) / len(old_content)
-                }
-            if old_content_lower in new_content_lower:
-                return {
-                    "is_duplicate": True,
-                    "reason": "containment_update",
-                    "matched_id": row['id'],
-                    "similarity": len(old_content) / len(new_content)
-                }
-
-            # 第三层：关键词重叠度（Jaccard 相似度）
+            # 第二层：关键词重叠度（Jaccard 相似度）
             old_keywords = set(db_search.extract_search_keywords(old_content))
             if new_keywords and old_keywords:
                 intersection = new_keywords & old_keywords

@@ -81,34 +81,18 @@ async def add_memory(
         except ValueError as exc:
             raise ValueError("event_date 必须是有效的 YYYY-MM-DD 日期") from exc
 
-    # 双端防重保护：未传 external_id 时先查最近是否已有内容相同或高度重合的激活态记忆
+    # 双端防重保护：未传 external_id 时先查最近是否已有内容相同或关键词高度相似的激活态记忆
     if not external_id:
         dup = await db_memories.check_duplicate_memory(content)
         if dup.get("is_duplicate") and dup.get("matched_id"):
             matched_id = dup["matched_id"]
-            if dup.get("reason") == "containment_update":
-                await db_memories.update_memory_with_layer(
-                    matched_id,
-                    content=content,
-                    importance=importance,
-                    title=title,
-                    layer=layer,
-                )
-                existing = await db_memories.get_memory_by_id(matched_id)
-                if existing:
-                    return {
-                        "status": "updated",
-                        "memory": _serialize_memory(existing),
-                        "duplicate_reason": dup.get("reason"),
-                    }
-            else:
-                existing = await db_memories.get_memory_by_id(matched_id)
-                if existing:
-                    return {
-                        "status": "exists",
-                        "memory": _serialize_memory(existing),
-                        "duplicate_reason": dup.get("reason"),
-                    }
+            existing = await db_memories.get_memory_by_id(matched_id)
+            if existing:
+                return {
+                    "status": "exists",
+                    "memory": _serialize_memory(existing),
+                    "duplicate_reason": dup.get("reason"),
+                }
 
     memory_id = await db_memories.save_memory(
         content=content,

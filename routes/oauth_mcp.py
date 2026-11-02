@@ -14,6 +14,7 @@ import base64
 import hashlib
 import hmac
 import html
+import os
 import secrets
 import time
 import urllib.parse
@@ -29,13 +30,37 @@ router = APIRouter()
 
 # In-memory storage for one-time authorization codes and registered clients
 _auth_codes: Dict[str, Dict[str, Any]] = {}
-_registered_clients: Dict[str, Dict[str, Any]] = {
-    "pawwake-gemini-client": {
-        "client_id": "pawwake-gemini-client",
-        "client_name": "Google Gemini",
-        "redirect_uris": [],
-    }
-}
+_registered_clients: Dict[str, Dict[str, Any]] = {}
+
+# Sliding window rate limiter for POST /oauth/authorize failures (max 5 per minute)
+_authorize_failures: list[float] = []
+
+
+def _clean_authorize_failures(now: float):
+    """Keep authorization failure timestamps within the last 60 seconds."""
+    cutoff = now - 60.0
+    while _authorize_failures and _authorize_failures[0] <= cutoff:
+        _authorize_failures.pop(0)
+
+
+def _is_authorize_rate_limited() -> bool:
+    """Check if failed authorization attempts exceeded 5 per minute."""
+    now = time.time()
+    _clean_authorize_failures(now)
+    return len(_authorize_failures) >= 5
+
+
+def _record_authorize_failure():
+    """Record a failed authorization attempt."""
+    now = time.time()
+    _clean_authorize_failures(now)
+    _authorize_failures.append(now)
+
+
+def get_public_base_url() -> str:
+    """Read PUBLIC_BASE_URL from environment or shared config."""
+    url = os.environ.get("PUBLIC_BASE_URL") or getattr(shared, "PUBLIC_BASE_URL", "") or ""
+    return url.strip().rstrip("/")
 
 
 def _clean_expired_codes():
@@ -44,16 +69,6 @@ def _clean_expired_codes():
     expired = [k for k, v in _auth_codes.items() if v.get("expires_at", 0) < now]
     for k in expired:
         _auth_codes.pop(k, None)
-
-
-def get_host(request: Request) -> str:
-    """Extract host with priority to reverse proxy forwarding headers."""
-    return (
-        request.headers.get("x-forwarded-host")
-        or request.headers.get("host")
-        or request.url.netloc
-        or "localhost"
-    )
 
 
 def _verify_secret_constant_time(provided: str) -> bool:
@@ -98,9 +113,8 @@ def verify_refresh_token(token: str) -> bool:
 
 
 def get_access_token() -> str:
-    """Return the primary GATEWAY_SECRET as access_token for seamless MCP compatibility."""
-    keys = auth.get_gateway_secrets()
-    return keys[0] if keys else ""
+    """Return derived access token pwa_<expires_at>_<HMAC>."""
+    return auth.create_derived_token()
 
 
 # ============================================================
@@ -109,29 +123,39 @@ def get_access_token() -> str:
 
 @router.get("/.well-known/oauth-protected-resource")
 @router.get("/.well-known/oauth-protected-resource/mcp")
-async def oauth_protected_resource(request: Request):
+async def oauth_protected_resource():
     """OAuth 2.0 Protected Resource Metadata."""
-    host = get_host(request)
+    base_url = get_public_base_url()
+    if not base_url:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "service_unavailable", "error_description": "PUBLIC_BASE_URL is not configured"},
+        )
     return {
-        "resource": f"https://{host}/mcp/",
-        "authorization_servers": [f"https://{host}"],
+        "resource": f"{base_url}/mcp/",
+        "authorization_servers": [base_url],
     }
 
 
 @router.get("/.well-known/oauth-authorization-server")
 @router.get("/.well-known/openid-configuration")
-async def oauth_authorization_server(request: Request):
+async def oauth_authorization_server():
     """OAuth 2.0 Authorization Server Metadata."""
-    host = get_host(request)
+    base_url = get_public_base_url()
+    if not base_url:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "service_unavailable", "error_description": "PUBLIC_BASE_URL is not configured"},
+        )
     return {
-        "issuer": f"https://{host}",
-        "authorization_endpoint": f"https://{host}/oauth/authorize",
-        "token_endpoint": f"https://{host}/oauth/token",
-        "registration_endpoint": f"https://{host}/oauth/register",
-        "revocation_endpoint": f"https://{host}/oauth/revoke",
+        "issuer": base_url,
+        "authorization_endpoint": f"{base_url}/oauth/authorize",
+        "token_endpoint": f"{base_url}/oauth/token",
+        "registration_endpoint": f"{base_url}/oauth/register",
+        "revocation_endpoint": f"{base_url}/oauth/revoke",
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
-        "code_challenge_methods_supported": ["S256", "plain"],
+        "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": [
             "client_secret_post",
             "client_secret_basic",
@@ -148,17 +172,56 @@ async def oauth_authorization_server(request: Request):
 @router.post("/oauth/register")
 async def oauth_register(request: Request):
     """Dynamic Client Registration endpoint."""
+    base_url = get_public_base_url()
+    if not base_url:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "service_unavailable", "error_description": "PUBLIC_BASE_URL is not configured"},
+        )
+
     try:
         body = await request.json()
     except Exception:
         body = {}
 
-    redirect_uris = body.get("redirect_uris", [])
-    if not isinstance(redirect_uris, list):
-        redirect_uris = [str(redirect_uris)] if redirect_uris else []
-    client_name = body.get("client_name", "Google Gemini")
-    client_id = "pawwake-gemini-client"
+    redirect_uris = body.get("redirect_uris")
+    if not isinstance(redirect_uris, list) or len(redirect_uris) == 0:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_redirect_uri",
+                "error_description": "redirect_uris must be a non-empty list",
+            },
+        )
 
+    for uri in redirect_uris:
+        if not isinstance(uri, str) or not uri.startswith("https://"):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "invalid_redirect_uri",
+                    "error_description": "redirect_uris must all use https scheme",
+                },
+            )
+
+    # 不覆盖已有登记
+    requested_client_id = body.get("client_id")
+    if requested_client_id and requested_client_id in _registered_clients:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_client_metadata",
+                "error_description": "client_id already registered, overwrite forbidden",
+            },
+        )
+
+    # client_id 每次随机生成
+    while True:
+        client_id = secrets.token_urlsafe(24)
+        if client_id not in _registered_clients:
+            break
+
+    client_name = body.get("client_name", "Google Gemini")
     _registered_clients[client_id] = {
         "client_id": client_id,
         "client_name": client_name,
@@ -195,6 +258,11 @@ def _render_authorize_html(
         f'<div class="error-banner">⚠️ {html.escape(error)}</div>'
         if error
         else ""
+    )
+    cancel_url = (
+        redirect_uri + ("&" if "?" in redirect_uri else "?") + f"error=access_denied&state={html.escape(state)}"
+        if redirect_uri
+        else "#"
     )
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -409,7 +477,7 @@ def _render_authorize_html(
 
             <div class="actions">
                 <button type="submit" class="btn btn-primary">确认授权并连接</button>
-                <a href="{html.escape(redirect_uri + ('?' if '?' not in redirect_uri else '&') + 'error=access_denied&state=' + state) if redirect_uri else '#'}" class="btn btn-secondary">取消</a>
+                <a href="{html.escape(cancel_url)}" class="btn btn-secondary">取消</a>
             </div>
         </form>
     </div>
@@ -429,16 +497,45 @@ async def oauth_authorize_get(
     scope: str = "mcp",
 ):
     """Render OAuth authorization page."""
-    if redirect_uri:
-        client_info = _registered_clients.get(client_id)
-        if client_info and client_info.get("redirect_uris") and redirect_uri not in client_info["redirect_uris"]:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": "invalid_request",
-                    "error_description": "redirect_uri mismatch with registered client redirect_uris",
-                },
-            )
+    base_url = get_public_base_url()
+    if not base_url:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "service_unavailable", "error_description": "PUBLIC_BASE_URL is not configured"},
+        )
+
+    # client_id 必须已登记
+    client_info = _registered_clients.get(client_id)
+    if not client_id or not client_info:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "unauthorized_client",
+                "error_description": "client_id is not registered",
+            },
+        )
+
+    # redirect_uri 必须与登记值逐字符一致，否则拒绝。取消链接同理
+    registered_uris = client_info.get("redirect_uris", [])
+    if not redirect_uri or redirect_uri not in registered_uris:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_request",
+                "error_description": "redirect_uri mismatch with registered client redirect_uris",
+            },
+        )
+
+    # 去掉 plain，元数据与实际校验只留 S256
+    if code_challenge_method and code_challenge_method.upper() != "S256":
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_request",
+                "error_description": "Unsupported code_challenge_method, only S256 is supported",
+            },
+        )
+
     html_content = _render_authorize_html(
         client_id=client_id,
         redirect_uri=redirect_uri,
@@ -454,6 +551,23 @@ async def oauth_authorize_get(
 @router.post("/oauth/authorize")
 async def oauth_authorize_post(request: Request):
     """Handle authorization form submission, verify GATEWAY_SECRET, and issue code."""
+    base_url = get_public_base_url()
+    if not base_url:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "service_unavailable", "error_description": "PUBLIC_BASE_URL is not configured"},
+        )
+
+    # 全局失败限流，每分钟最多 5 次失败，超过返回 429
+    if _is_authorize_rate_limited():
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": "slow_down",
+                "error_description": "Too many failed authorization attempts. Please try again later.",
+            },
+        )
+
     form = await request.form()
     gateway_secret = str(form.get("gateway_secret", "")).strip()
     client_id = str(form.get("client_id", "")).strip()
@@ -464,8 +578,44 @@ async def oauth_authorize_post(request: Request):
     response_type = str(form.get("response_type", "code")).strip()
     scope = str(form.get("scope", "mcp")).strip()
 
+    # client_id 必须已登记
+    client_info = _registered_clients.get(client_id)
+    if not client_id or not client_info:
+        _record_authorize_failure()
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "unauthorized_client",
+                "error_description": "client_id is not registered",
+            },
+        )
+
+    # redirect_uri 必须与登记值逐字符一致，否则拒绝
+    registered_uris = client_info.get("redirect_uris", [])
+    if not redirect_uri or redirect_uri not in registered_uris:
+        _record_authorize_failure()
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_request",
+                "error_description": "redirect_uri mismatch with registered client redirect_uris",
+            },
+        )
+
+    # 去掉 plain，元数据与实际校验只留 S256
+    if code_challenge_method and code_challenge_method.upper() != "S256":
+        _record_authorize_failure()
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_request",
+                "error_description": "Unsupported code_challenge_method, only S256 is supported",
+            },
+        )
+
     # Timing-safe comparison with GATEWAY_SECRET
     if not _verify_secret_constant_time(gateway_secret):
+        _record_authorize_failure()
         html_content = _render_authorize_html(
             client_id=client_id,
             redirect_uri=redirect_uri,
@@ -477,24 +627,6 @@ async def oauth_authorize_post(request: Request):
             error="网关密钥 (GATEWAY_SECRET) 校验失败，绝不签发授权码，请重试。",
         )
         return HTMLResponse(content=html_content, status_code=401)
-
-    if not redirect_uri:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "invalid_request", "error_description": "redirect_uri is required"},
-        )
-
-    # Validate redirect_uri matches DCR registered values if registered
-    client_info = _registered_clients.get(client_id)
-    if client_info and client_info.get("redirect_uris"):
-        if redirect_uri not in client_info["redirect_uris"]:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": "invalid_request",
-                    "error_description": "redirect_uri mismatch with registered client redirect_uris",
-                },
-            )
 
     # Generate one-time random authorization code (TTL: 5 minutes)
     code = secrets.token_urlsafe(32)
@@ -533,6 +665,13 @@ async def oauth_authorize_post(request: Request):
 @router.post("/oauth/token")
 async def oauth_token(request: Request):
     """Exchange authorization code or refresh token for access token (supports form or JSON)."""
+    base_url = get_public_base_url()
+    if not base_url:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "service_unavailable", "error_description": "PUBLIC_BASE_URL is not configured"},
+        )
+
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type:
         try:
@@ -589,9 +728,32 @@ async def oauth_token(request: Request):
                 },
             )
 
-        # Check redirect_uri consistency
+        # client_id 必须已登记
+        code_client_id = code_data.get("client_id", "")
+        provided_client_id = str(data.get("client_id", "")).strip()
+        if provided_client_id and provided_client_id != code_client_id:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "invalid_grant",
+                    "error_description": "client_id mismatch",
+                },
+            )
+
+        client_info = _registered_clients.get(code_client_id)
+        if not code_client_id or not client_info:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "invalid_client",
+                    "error_description": "client_id is not registered",
+                },
+            )
+
+        # redirect_uri 必须与登记值逐字符一致，否则拒绝
+        registered_uris = client_info.get("redirect_uris", [])
         expected_redirect_uri = code_data.get("redirect_uri", "")
-        if expected_redirect_uri and redirect_uri and expected_redirect_uri != redirect_uri:
+        if not redirect_uri or redirect_uri not in registered_uris or redirect_uri != expected_redirect_uri:
             return JSONResponse(
                 status_code=400,
                 content={
@@ -600,9 +762,18 @@ async def oauth_token(request: Request):
                 },
             )
 
-        # Strict PKCE verification
+        # Strict PKCE verification (only S256)
         expected_challenge = code_data.get("code_challenge", "")
         challenge_method = (code_data.get("code_challenge_method") or "S256").upper()
+        if challenge_method != "S256":
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "invalid_request",
+                    "error_description": f"Unsupported code_challenge_method: {challenge_method}",
+                },
+            )
+
         if expected_challenge:
             if not code_verifier:
                 return JSONResponse(
@@ -612,36 +783,16 @@ async def oauth_token(request: Request):
                         "error_description": "code_verifier is required",
                     },
                 )
-            if challenge_method == "S256":
-                digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
-                calculated = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
-                if not hmac.compare_digest(
-                    calculated.encode("ascii"), expected_challenge.encode("ascii")
-                ):
-                    return JSONResponse(
-                        status_code=400,
-                        content={
-                            "error": "invalid_grant",
-                            "error_description": "PKCE verification failed",
-                        },
-                    )
-            elif challenge_method == "PLAIN":
-                if not hmac.compare_digest(
-                    code_verifier.encode("utf-8"), expected_challenge.encode("utf-8")
-                ):
-                    return JSONResponse(
-                        status_code=400,
-                        content={
-                            "error": "invalid_grant",
-                            "error_description": "PKCE verification failed",
-                        },
-                    )
-            else:
+            digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+            calculated = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+            if not hmac.compare_digest(
+                calculated.encode("ascii"), expected_challenge.encode("ascii")
+            ):
                 return JSONResponse(
                     status_code=400,
                     content={
-                        "error": "invalid_request",
-                        "error_description": f"Unsupported code_challenge_method: {challenge_method}",
+                        "error": "invalid_grant",
+                        "error_description": "PKCE verification failed",
                     },
                 )
 
@@ -657,6 +808,16 @@ async def oauth_token(request: Request):
 
     if grant_type == "refresh_token":
         refresh_token = str(data.get("refresh_token", "")).strip()
+        provided_client_id = str(data.get("client_id", "")).strip()
+        if provided_client_id and provided_client_id not in _registered_clients:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "invalid_client",
+                    "error_description": "client_id is not registered",
+                },
+            )
+
         if not verify_refresh_token(refresh_token):
             return JSONResponse(
                 status_code=400,
@@ -692,4 +853,10 @@ async def oauth_token(request: Request):
 @router.post("/oauth/revoke")
 async def oauth_revoke():
     """Revoke issued token."""
+    base_url = get_public_base_url()
+    if not base_url:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "service_unavailable", "error_description": "PUBLIC_BASE_URL is not configured"},
+        )
     return {}

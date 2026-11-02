@@ -4,10 +4,12 @@ test_oauth_mcp.py: 针对 OAuth 2.1 握手层、/mcp/ 鉴权保护与拦截、PK
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import os
+import time
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -15,12 +17,24 @@ import auth
 import mcp_server
 import routes.oauth_mcp as oauth_mcp
 import shared
+from db import memories as db_memories
 from main import app
+
+
+@contextlib.contextmanager
+def mcp_test_client():
+    """Helper context manager to run MCPServer session manager cleanly in tests."""
+    sm = mcp_server.server.session_manager
+    sm._has_started = False
+    sm._task_group = None
+    with TestClient(app, follow_redirects=False) as c:
+        yield c
 
 
 class TestOAuthMCPHandshake(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        os.environ["PUBLIC_BASE_URL"] = "https://pawwake.example.com"
         cls.client = TestClient(app, follow_redirects=False)
 
     def setUp(self):
@@ -32,6 +46,13 @@ class TestOAuthMCPHandshake(unittest.TestCase):
         self.verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
         digest = hashlib.sha256(self.verifier.encode("ascii")).digest()
         self.challenge = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+        oauth_mcp._authorize_failures.clear()
+        oauth_mcp._registered_clients[self.client_id] = {
+            "client_id": self.client_id,
+            "client_name": "Google Gemini",
+            "redirect_uris": [self.redirect_uri],
+        }
 
     # ============================================================
     # 1. 资源与服务发现端点 (RFC 8414 / RFC 9728)
@@ -66,7 +87,8 @@ class TestOAuthMCPHandshake(unittest.TestCase):
             self.assertIn("code", data["response_types_supported"])
             self.assertIn("authorization_code", data["grant_types_supported"])
             self.assertIn("refresh_token", data["grant_types_supported"])
-            self.assertIn("S256", data["code_challenge_methods_supported"])
+            self.assertEqual(data["code_challenge_methods_supported"], ["S256"])
+            self.assertNotIn("plain", data["code_challenge_methods_supported"])
             self.assertIn("mcp", data["scopes_supported"])
 
     # ============================================================
@@ -74,7 +96,7 @@ class TestOAuthMCPHandshake(unittest.TestCase):
     # ============================================================
 
     def test_dynamic_client_registration(self):
-        """测试 POST /oauth/register 返回 201 Created 与已注册 client_id"""
+        """测试 POST /oauth/register 返回 201 Created 与每次随机生成的 client_id"""
         resp = self.client.post(
             "/oauth/register",
             json={
@@ -84,7 +106,8 @@ class TestOAuthMCPHandshake(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 201)
         data = resp.json()
-        self.assertEqual(data["client_id"], "pawwake-gemini-client")
+        self.assertTrue(data["client_id"])
+        self.assertNotEqual(data["client_id"], "pawwake-gemini-client")
         self.assertEqual(data["client_name"], "Google Gemini")
         self.assertEqual(data["redirect_uris"], [self.redirect_uri])
         self.assertIn("authorization_code", data["grant_types"])
@@ -189,7 +212,7 @@ class TestOAuthMCPHandshake(unittest.TestCase):
             self.assertEqual(resp.json()["error"], "invalid_grant")
 
     def test_oauth_token_success_and_replay_prevention(self):
-        """测试 PKCE 成功换取令牌，且同一 code 再次使用被销毁防重放"""
+        """测试 PKCE 成功换取派生令牌，且同一 code 再次使用被销毁防重放"""
         with patch.object(shared, "GATEWAY_SECRET", self.secret):
             code = self._get_auth_code()
 
@@ -206,7 +229,8 @@ class TestOAuthMCPHandshake(unittest.TestCase):
             )
             self.assertEqual(resp.status_code, 200)
             token_data = resp.json()
-            self.assertEqual(token_data["access_token"], self.secret)
+            self.assertTrue(token_data["access_token"].startswith("pwa_"))
+            self.assertTrue(auth.verify_derived_token(token_data["access_token"]))
             self.assertEqual(token_data["token_type"], "Bearer")
             self.assertTrue(token_data["refresh_token"].startswith("pwr_"))
             self.assertEqual(token_data["expires_in"], 2592000)
@@ -240,7 +264,8 @@ class TestOAuthMCPHandshake(unittest.TestCase):
                 },
             )
             self.assertEqual(resp.status_code, 200)
-            self.assertEqual(resp.json()["access_token"], self.secret)
+            self.assertTrue(resp.json()["access_token"].startswith("pwa_"))
+            self.assertTrue(auth.verify_derived_token(resp.json()["access_token"]))
 
     def test_oauth_token_client_secret_check(self):
         """测试携带非法 client_secret 时返回 401"""
@@ -286,7 +311,8 @@ class TestOAuthMCPHandshake(unittest.TestCase):
             )
             self.assertEqual(refresh_resp.status_code, 200)
             new_data = refresh_resp.json()
-            self.assertEqual(new_data["access_token"], self.secret)
+            self.assertTrue(new_data["access_token"].startswith("pwa_"))
+            self.assertTrue(auth.verify_derived_token(new_data["access_token"]))
             self.assertTrue(new_data["refresh_token"].startswith("pwr_"))
 
             # 伪造 refresh token
@@ -327,7 +353,6 @@ class TestOAuthMCPHandshake(unittest.TestCase):
     def test_mcp_dual_path_passthrough_no_307(self):
         """测试 /mcp 和 /mcp/ 双路径直通，绝不发生 307 POST 重定向"""
         with patch.object(shared, "GATEWAY_SECRET", self.secret):
-            # 未授权请求访问 /mcp 不应该发生 307，而是直接 401
             resp1 = self.client.post(
                 "/mcp",
                 json={"jsonrpc": "2.0", "method": "ping", "id": 1},
@@ -417,6 +442,7 @@ class TestReverseValidations(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        os.environ["PUBLIC_BASE_URL"] = "https://pawwake.example.com"
         cls.client = TestClient(app, follow_redirects=False)
 
     def setUp(self):
@@ -427,6 +453,13 @@ class TestReverseValidations(unittest.TestCase):
         self.verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
         digest = hashlib.sha256(self.verifier.encode("ascii")).digest()
         self.challenge = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+        oauth_mcp._authorize_failures.clear()
+        oauth_mcp._registered_clients[self.client_id] = {
+            "client_id": self.client_id,
+            "client_name": "Google Gemini",
+            "redirect_uris": [self.redirect_uri],
+        }
 
     def _get_code(self):
         resp = self.client.post(
@@ -511,6 +544,7 @@ class TestReverseValidations(unittest.TestCase):
     def test_reverse_secret_validation(self):
         """反向验证 3：密钥正确得 302，反向错误密钥得 401"""
         with patch.object(shared, "GATEWAY_SECRET", self.secret):
+            oauth_mcp._authorize_failures.clear()
             # 反向：错误密码 -> 401
             r_neg = self.client.post(
                 "/oauth/authorize",
@@ -525,6 +559,7 @@ class TestReverseValidations(unittest.TestCase):
             )
             self.assertEqual(r_neg.status_code, 401)
 
+            oauth_mcp._authorize_failures.clear()
             # 正向：正确密码 -> 302
             r_pos = self.client.post(
                 "/oauth/authorize",
@@ -546,10 +581,328 @@ class TestReverseValidations(unittest.TestCase):
             r_pos = self.client.get("/v1/models", headers={"X-Gateway-Key": self.secret})
             self.assertEqual(r_pos.status_code, 200)
 
-            # 反向：带 OAuth Bearer 令牌访问 /v1/models 被拒
-            r_neg = self.client.get("/v1/models", headers={"Authorization": f"Bearer {self.secret}"})
+            # 反向：带派生 OAuth Bearer 令牌访问 /v1/models 被拒
+            token = auth.create_derived_token()
+            r_neg = self.client.get("/v1/models", headers={"Authorization": f"Bearer {token}"})
             self.assertEqual(r_neg.status_code, 401)
             self.assertEqual(r_neg.json(), {"error": "Unauthorized. Provide X-Gateway-Key header."})
+
+
+# ============================================================
+# 8 项新增核心测试用例
+# ============================================================
+
+class TestNewRequirements(unittest.TestCase):
+    """测试用例新增覆盖：
+    1. 后注册覆盖回调地址的攻击
+    2. 未登记 client_id
+    3. plain 被拒
+    4. 伪造 Host 不影响元数据与未配置 PUBLIC_BASE_URL 返回 503
+    5. 全局失败限流
+    6. 派生令牌在 /v1 /api 得 401 在 /mcp 得 200
+    7. 过期令牌与换 Key 后旧令牌失效
+    8. add_memory 包含关系不覆盖
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ["PUBLIC_BASE_URL"] = "https://pawwake.example.com"
+        cls.client = TestClient(app, follow_redirects=False)
+
+    def setUp(self):
+        self.secret = "test-gateway-secret-12345"
+        self.client_id = "pawwake-gemini-client"
+        self.redirect_uri = "https://gemini.google.com/oauth/callback"
+        oauth_mcp._authorize_failures.clear()
+        oauth_mcp._registered_clients[self.client_id] = {
+            "client_id": self.client_id,
+            "client_name": "Google Gemini",
+            "redirect_uris": [self.redirect_uri],
+        }
+
+    def test_post_registration_overwrite_callback_attack(self):
+        """1. 后注册覆盖回调地址的攻击：DCR 随机生成 client_id 且绝不覆盖已有登记"""
+        # 受害者正常注册
+        resp = self.client.post(
+            "/oauth/register",
+            json={
+                "client_name": "Victim Client",
+                "redirect_uris": ["https://victim.example.com/callback"],
+            },
+        )
+        self.assertEqual(resp.status_code, 201)
+        victim_client_id = resp.json()["client_id"]
+        self.assertEqual(
+            oauth_mcp._registered_clients[victim_client_id]["redirect_uris"],
+            ["https://victim.example.com/callback"],
+        )
+
+        # 攻击者尝试带受害者的 client_id 重新注册并偷换回调地址
+        resp_attack = self.client.post(
+            "/oauth/register",
+            json={
+                "client_id": victim_client_id,
+                "client_name": "Attacker Client",
+                "redirect_uris": ["https://attacker.example.com/callback"],
+            },
+        )
+        self.assertEqual(resp_attack.status_code, 400)
+        self.assertEqual(
+            oauth_mcp._registered_clients[victim_client_id]["redirect_uris"],
+            ["https://victim.example.com/callback"],
+        )
+
+        # 攻击者即使不传 client_id 再次注册，也只能得到独立的新 client_id，受害者回调绝不被篡改
+        resp_attack2 = self.client.post(
+            "/oauth/register",
+            json={
+                "client_name": "Attacker Client 2",
+                "redirect_uris": ["https://attacker.example.com/callback"],
+            },
+        )
+        self.assertEqual(resp_attack2.status_code, 201)
+        attacker_client_id = resp_attack2.json()["client_id"]
+        self.assertNotEqual(attacker_client_id, victim_client_id)
+        self.assertEqual(
+            oauth_mcp._registered_clients[victim_client_id]["redirect_uris"],
+            ["https://victim.example.com/callback"],
+        )
+
+    def test_unregistered_client_id_rejected(self):
+        """2. 未登记 client_id：/oauth/authorize（GET 与 POST）和 /oauth/token 均拒绝"""
+        with patch.object(shared, "GATEWAY_SECRET", self.secret):
+            bad_id = "unregistered-client-id-xyz"
+
+            # GET /oauth/authorize 拒绝
+            resp_get = self.client.get(
+                "/oauth/authorize",
+                params={
+                    "client_id": bad_id,
+                    "redirect_uri": self.redirect_uri,
+                    "response_type": "code",
+                },
+            )
+            self.assertEqual(resp_get.status_code, 400)
+            self.assertEqual(resp_get.json()["error"], "unauthorized_client")
+
+            # POST /oauth/authorize 拒绝
+            resp_post = self.client.post(
+                "/oauth/authorize",
+                data={
+                    "gateway_secret": self.secret,
+                    "client_id": bad_id,
+                    "redirect_uri": self.redirect_uri,
+                },
+            )
+            self.assertEqual(resp_post.status_code, 400)
+            self.assertEqual(resp_post.json()["error"], "unauthorized_client")
+
+            # POST /oauth/token 拒绝未登记 client_id
+            resp_token = self.client.post(
+                "/oauth/token",
+                data={
+                    "grant_type": "authorization_code",
+                    "code": "non-existent-code",
+                    "redirect_uri": self.redirect_uri,
+                    "client_id": bad_id,
+                    "code_verifier": "verifier",
+                },
+            )
+            self.assertEqual(resp_token.status_code, 400)
+
+    def test_plain_code_challenge_rejected(self):
+        """3. plain 被拒：元数据去掉 plain，实际校验只留 S256，请求 plain 直接被拒"""
+        with patch.object(shared, "GATEWAY_SECRET", self.secret):
+            # 检查 Authorization Server 元数据
+            resp_meta = self.client.get("/.well-known/oauth-authorization-server")
+            self.assertEqual(resp_meta.status_code, 200)
+            self.assertEqual(resp_meta.json()["code_challenge_methods_supported"], ["S256"])
+            self.assertNotIn("plain", resp_meta.json()["code_challenge_methods_supported"])
+
+            # GET /oauth/authorize 使用 plain 被拒
+            resp_get = self.client.get(
+                "/oauth/authorize",
+                params={
+                    "client_id": self.client_id,
+                    "redirect_uri": self.redirect_uri,
+                    "response_type": "code",
+                    "code_challenge": "plain-challenge",
+                    "code_challenge_method": "plain",
+                },
+            )
+            self.assertEqual(resp_get.status_code, 400)
+
+            # POST /oauth/authorize 使用 plain 被拒
+            resp_post = self.client.post(
+                "/oauth/authorize",
+                data={
+                    "gateway_secret": self.secret,
+                    "client_id": self.client_id,
+                    "redirect_uri": self.redirect_uri,
+                    "code_challenge": "plain-challenge",
+                    "code_challenge_method": "plain",
+                },
+            )
+            self.assertEqual(resp_post.status_code, 400)
+
+    def test_forged_host_ignored_and_missing_public_base_url_503(self):
+        """4. 伪造 Host 不影响元数据，且未设置 PUBLIC_BASE_URL 时 OAuth 端点返回 503"""
+        # 伪造 Host 和 X-Forwarded-Host 头，元数据地址始终严格读取 PUBLIC_BASE_URL
+        forged_headers = {
+            "Host": "evil.attacker.com",
+            "X-Forwarded-Host": "evil.attacker.com",
+        }
+        resp = self.client.get("/.well-known/oauth-authorization-server", headers=forged_headers)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["issuer"], "https://pawwake.example.com")
+        self.assertNotIn("evil.attacker.com", resp.text)
+
+        resp_res = self.client.get("/.well-known/oauth-protected-resource", headers=forged_headers)
+        self.assertEqual(resp_res.status_code, 200)
+        self.assertEqual(resp_res.json()["resource"], "https://pawwake.example.com/mcp/")
+        self.assertNotIn("evil.attacker.com", resp_res.text)
+
+        # 未设置 PUBLIC_BASE_URL 时，全部 OAuth 端点返回 503
+        with patch.dict(os.environ, {"PUBLIC_BASE_URL": ""}):
+            self.assertEqual(
+                self.client.get("/.well-known/oauth-authorization-server").status_code, 503
+            )
+            self.assertEqual(
+                self.client.get("/.well-known/oauth-protected-resource").status_code, 503
+            )
+            self.assertEqual(
+                self.client.post("/oauth/register", json={"redirect_uris": ["https://foo.com/cb"]}).status_code, 503
+            )
+            self.assertEqual(
+                self.client.get(f"/oauth/authorize?client_id={self.client_id}&redirect_uri={self.redirect_uri}").status_code, 503
+            )
+            self.assertEqual(
+                self.client.post("/oauth/authorize", data={"client_id": self.client_id}).status_code, 503
+            )
+            self.assertEqual(
+                self.client.post("/oauth/token", data={"grant_type": "authorization_code"}).status_code, 503
+            )
+            self.assertEqual(
+                self.client.post("/oauth/revoke").status_code, 503
+            )
+
+    def test_authorize_rate_limiting(self):
+        """5. POST /oauth/authorize 全局失败限流：每分钟最多 5 次失败，第 6 次返回 429"""
+        with patch.object(shared, "GATEWAY_SECRET", self.secret):
+            oauth_mcp._authorize_failures.clear()
+
+            # 前 5 次失败（错误密码返回 401）
+            for i in range(5):
+                resp = self.client.post(
+                    "/oauth/authorize",
+                    data={
+                        "gateway_secret": f"wrong-pass-{i}",
+                        "client_id": self.client_id,
+                        "redirect_uri": self.redirect_uri,
+                    },
+                )
+                self.assertEqual(resp.status_code, 401)
+
+            # 第 6 次超过阈值，返回 429
+            resp_6 = self.client.post(
+                "/oauth/authorize",
+                data={
+                    "gateway_secret": self.secret,
+                    "client_id": self.client_id,
+                    "redirect_uri": self.redirect_uri,
+                },
+            )
+            self.assertEqual(resp_6.status_code, 429)
+            self.assertEqual(resp_6.json()["error"], "slow_down")
+
+    def test_derived_token_access_control(self):
+        """6. 派生令牌在 /v1 /api 返回 401，在 /mcp 返回 200；主密钥在 /mcp 老方式可用"""
+        with patch.object(shared, "GATEWAY_SECRET", self.secret):
+            token = auth.create_derived_token()
+
+            # /v1 端点拒绝派生令牌
+            resp_v1 = self.client.get("/v1/models", headers={"Authorization": f"Bearer {token}"})
+            self.assertEqual(resp_v1.status_code, 401)
+
+            # /api 端点拒绝派生令牌
+            resp_api = self.client.get("/api/memories", headers={"Authorization": f"Bearer {token}"})
+            self.assertEqual(resp_api.status_code, 401)
+
+            # /mcp 路径接受派生令牌（返回 200）
+            with mcp_test_client() as lifespan_client:
+                resp_mcp = lifespan_client.post(
+                    "/mcp",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={"jsonrpc": "2.0", "method": "ping", "id": 1},
+                )
+                self.assertEqual(resp_mcp.status_code, 200)
+
+                # 主密钥直接用于 /mcp 的老方式保持可用
+                resp_old = lifespan_client.post(
+                    "/mcp",
+                    headers={"X-Gateway-Key": self.secret},
+                    json={"jsonrpc": "2.0", "method": "ping", "id": 2},
+                )
+                self.assertEqual(resp_old.status_code, 200)
+
+    def test_expired_and_rotated_tokens_rejected(self):
+        """7. 过期令牌被拒；换 Key 后旧令牌自动失效"""
+        with patch.object(shared, "GATEWAY_SECRET", self.secret):
+            # 生成已过期的派生令牌 (expires_in = -10 秒)
+            expired_token = auth.create_derived_token(expires_in=-10)
+            self.assertFalse(auth.verify_derived_token(expired_token))
+
+            with mcp_test_client() as lifespan_client:
+                resp_exp = lifespan_client.post(
+                    "/mcp",
+                    headers={"Authorization": f"Bearer {expired_token}"},
+                    json={"jsonrpc": "2.0", "method": "ping", "id": 1},
+                )
+                self.assertEqual(resp_exp.status_code, 401)
+
+            # 测试轮换密钥：旧密钥签发的令牌在换 Key 后失效
+            valid_token = auth.create_derived_token(expires_in=3600)
+            self.assertTrue(auth.verify_derived_token(valid_token))
+
+            # 轮换密钥为 new-secret-key
+            with patch.object(shared, "GATEWAY_SECRET", "new-secret-key"):
+                self.assertFalse(auth.verify_derived_token(valid_token))
+                with mcp_test_client() as lifespan_client:
+                    resp_rotated = lifespan_client.post(
+                        "/mcp",
+                        headers={"Authorization": f"Bearer {valid_token}"},
+                        json={"jsonrpc": "2.0", "method": "ping", "id": 2},
+                    )
+                    self.assertEqual(resp_rotated.status_code, 401)
+
+    def test_add_memory_containment_does_not_overwrite(self):
+        """8. add_memory 包含关系不覆盖：去掉包含关系的覆盖与丢弃，新记忆正常创建"""
+        with patch.object(shared, "DATABASE_ENABLED", True):
+            with patch.object(shared, "MEMORY_ENABLED", True):
+                # 验证底层 check_duplicate_memory 对包含关系不再判定为 duplicate
+                mock_conn = AsyncMock()
+                mock_conn.fetch.return_value = [{"id": 10, "content": "小明在北京"}]
+                mock_pool = MagicMock()
+                mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+                with patch("db.core.get_pool", return_value=mock_pool):
+                    # 包含旧内容的新内容
+                    res_sup = asyncio.run(db_memories.check_duplicate_memory("小明在北京买了苹果"))
+                    self.assertFalse(res_sup["is_duplicate"])
+
+                    # 被旧内容包含的新内容
+                    res_sub = asyncio.run(db_memories.check_duplicate_memory("北京"))
+                    self.assertFalse(res_sub["is_duplicate"])
+
+                # 验证 mcp_server.add_memory 对包含关系不会调用 update 而是直接 save 创建
+                with patch("db.memories.check_duplicate_memory", new_callable=AsyncMock) as mock_dup:
+                    mock_dup.return_value = {"is_duplicate": False, "reason": None, "matched_id": None}
+                    with patch("db.memories.save_memory", new_callable=AsyncMock) as mock_save:
+                        mock_save.return_value = 101
+                        res = asyncio.run(mcp_server.add_memory(content="小明在北京买了苹果"))
+                        self.assertEqual(res["status"], "created")
+                        self.assertEqual(res["memory"]["id"], 101)
+                        self.assertNotEqual(res["status"], "updated")
 
 
 if __name__ == "__main__":
