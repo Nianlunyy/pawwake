@@ -14,6 +14,7 @@ import base64
 import hashlib
 import hmac
 import html
+import json
 import os
 import secrets
 import time
@@ -34,6 +35,8 @@ _registered_clients: Dict[str, Dict[str, Any]] = {}
 
 # Sliding window rate limiter for POST /oauth/authorize failures (max 5 per minute)
 _authorize_failures: list[float] = []
+
+REFRESH_TOKEN_EXPIRE_SECONDS = 90 * 86400  # 90 天有效期
 
 
 def _clean_authorize_failures(now: float):
@@ -63,6 +66,53 @@ def get_public_base_url() -> str:
     return url.strip().rstrip("/")
 
 
+def get_allowed_redirect_hosts() -> set[str]:
+    """Read OAUTH_ALLOWED_REDIRECT_HOSTS environment variable or shared config."""
+    raw = os.environ.get("OAUTH_ALLOWED_REDIRECT_HOSTS") or getattr(shared, "OAUTH_ALLOWED_REDIRECT_HOSTS", "") or ""
+    return {h.strip().lower() for h in raw.split(",") if h.strip()}
+
+
+def create_stateless_client_id(redirect_uris: list[str]) -> str:
+    """Generate stateless client_id: pwc_<redirect_uris 编码>_<HMAC>."""
+    normalized = json.dumps(sorted(u.strip() for u in redirect_uris), separators=(',', ':'))
+    encoded = base64.urlsafe_b64encode(normalized.encode("utf-8")).decode("ascii").rstrip("=")
+    keys = auth.get_gateway_secrets()
+    signing_key = keys[0] if keys else "pawwake_default_key"
+    sig = hmac.new(signing_key.encode("utf-8"), encoded.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"pwc_{encoded}_{sig}"
+
+
+def verify_client_id(client_id: str) -> tuple[bool, list[str]]:
+    """Verify stateless client_id pwc_<encoded_uris>_<HMAC> against GATEWAY_SECRET items."""
+    try:
+        if not isinstance(client_id, str) or not client_id.startswith("pwc_"):
+            return False, []
+        body = client_id[4:]
+        encoded_uris, sep, sig = body.rpartition("_")
+        if not sep or not encoded_uris or not sig:
+            return False, []
+        keys = auth.get_gateway_secrets()
+        if not keys:
+            return False, []
+        payload = encoded_uris.encode("utf-8")
+        provided_sig = sig.encode("utf-8")
+        matched = False
+        for k in keys:
+            expected_sig = hmac.new(k.encode("utf-8"), payload, hashlib.sha256).hexdigest().encode("utf-8")
+            if secrets.compare_digest(provided_sig, expected_sig):
+                matched = True
+        if not matched:
+            return False, []
+        pad = "=" * (-len(encoded_uris) % 4)
+        raw_json = base64.urlsafe_b64decode((encoded_uris + pad).encode("ascii")).decode("utf-8")
+        uris = json.loads(raw_json)
+        if not isinstance(uris, list):
+            return False, []
+        return True, uris
+    except Exception:
+        return False, []
+
+
 def _clean_expired_codes():
     """Remove expired authorization codes from memory."""
     now = time.time()
@@ -76,40 +126,51 @@ def _verify_secret_constant_time(provided: str) -> bool:
     return auth.verify_gateway_key(provided)
 
 
-def create_refresh_token() -> str:
-    """Generate an HMAC-SHA256 signed refresh token tied to the gateway secret."""
+def create_refresh_token(expires_in: int = REFRESH_TOKEN_EXPIRE_SECONDS) -> str:
+    """Generate an HMAC-SHA256 signed refresh token tied to the gateway secret with 90-day expiry."""
+    expires_at = int(time.time()) + expires_in
     raw = secrets.token_urlsafe(32)
     keys = auth.get_gateway_secrets()
     signing_key = keys[0] if keys else "pawwake_default_key"
+    payload = f"{expires_at}_{raw}".encode("utf-8")
     sig = hmac.new(
         signing_key.encode("utf-8"),
-        raw.encode("ascii"),
+        payload,
         hashlib.sha256,
     ).hexdigest()
-    return f"pwr_{raw}_{sig}"
+    return f"pwr_{expires_at}_{raw}_{sig}"
 
 
 def verify_refresh_token(token: str) -> bool:
-    """Verify refresh token signature using hmac.compare_digest."""
-    if not token or not token.startswith("pwr_"):
+    """Verify refresh token signature and expiration date."""
+    try:
+        if not isinstance(token, str) or not token.startswith("pwr_"):
+            return False
+        body = token[4:]
+        expires_at_str, sep1, rest = body.partition("_")
+        raw, sep2, sig = rest.rpartition("_")
+        if not sep1 or not sep2 or not expires_at_str or not raw or not sig:
+            return False
+        expires_at = int(expires_at_str)
+        if time.time() > expires_at:
+            return False
+        keys = auth.get_gateway_secrets()
+        if not keys:
+            return False
+        payload = f"{expires_at}_{raw}".encode("utf-8")
+        provided_sig = sig.encode("utf-8")
+        matched = False
+        for k in keys:
+            expected_sig = hmac.new(
+                k.encode("utf-8"),
+                payload,
+                hashlib.sha256,
+            ).hexdigest().encode("utf-8")
+            if secrets.compare_digest(provided_sig, expected_sig):
+                matched = True
+        return matched
+    except Exception:
         return False
-    body = token[4:]
-    raw, sep, sig = body.rpartition("_")
-    if not sep or not raw or not sig:
-        return False
-    keys = auth.get_gateway_secrets()
-    if not keys:
-        return False
-    matched = False
-    for k in keys:
-        expected_sig = hmac.new(
-            k.encode("utf-8"),
-            raw.encode("ascii"),
-            hashlib.sha256,
-        ).hexdigest()
-        if hmac.compare_digest(sig.encode("ascii"), expected_sig.encode("ascii")):
-            matched = True
-    return matched
 
 
 def get_access_token() -> str:
@@ -204,6 +265,21 @@ async def oauth_register(request: Request):
                 },
             )
 
+    # redirect_uris 必须在白名单主机内，名单为空也 403
+    allowed_hosts = get_allowed_redirect_hosts()
+    for uri in redirect_uris:
+        parsed = urllib.parse.urlparse(uri)
+        host = (parsed.hostname or "").lower()
+        if not allowed_hosts or host not in allowed_hosts:
+            print(f"🚫 OAuth 注册被拒 host={host or 'none'}")
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": "access_denied",
+                    "error_description": f"Redirect URI host '{host}' is not in allowed hosts whitelist",
+                },
+            )
+
     # 不覆盖已有登记
     requested_client_id = body.get("client_id")
     if requested_client_id and requested_client_id in _registered_clients:
@@ -215,13 +291,10 @@ async def oauth_register(request: Request):
             },
         )
 
-    # client_id 每次随机生成
-    while True:
-        client_id = secrets.token_urlsafe(24)
-        if client_id not in _registered_clients:
-            break
+    # client_id 改为无状态：pwc_<redirect_uris 编码>_<HMAC>
+    client_id = create_stateless_client_id(redirect_uris)
 
-    client_name = body.get("client_name", "Google Gemini")
+    client_name = body.get("client_name", "OAuth Client")
     _registered_clients[client_id] = {
         "client_id": client_id,
         "client_name": client_name,
@@ -264,6 +337,8 @@ def _render_authorize_html(
         if redirect_uri
         else "#"
     )
+    parsed = urllib.parse.urlparse(redirect_uri)
+    redirect_host = (parsed.hostname or "").lower() or redirect_uri
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -347,6 +422,7 @@ def _render_authorize_html(
             font-size: 0.85rem;
             font-weight: 600;
             margin: 0.85rem 0;
+            word-break: break-all;
         }}
         .info-box {{
             background: rgba(148, 163, 184, 0.08);
@@ -437,12 +513,12 @@ def _render_authorize_html(
         <div class="header">
             <div class="logo">🐾</div>
             <h1 class="title">Pawwake 授权确认</h1>
-            <p class="subtitle">Google Gemini 正在请求连接您的 Pawwake 记忆小家</p>
-            <div class="app-badge">客户端：{html.escape(client_id or "Google Gemini")}</div>
+            <p class="subtitle">授权码将发送到：{html.escape(redirect_host)}</p>
+            <div class="app-badge">客户端：{html.escape(client_id)}</div>
         </div>
 
         <div class="info-box">
-            <div>授权后，Gemini 将获得以下 MCP 访问权限：</div>
+            <div>授权后，应用将获得以下 MCP 访问权限：</div>
             <ul>
                 <li>读取、搜索与管理长短期记忆条目</li>
                 <li>读取分区上下文滚动摘要（Partition Summary）</li>
@@ -504,19 +580,22 @@ async def oauth_authorize_get(
             content={"error": "service_unavailable", "error_description": "PUBLIC_BASE_URL is not configured"},
         )
 
-    # client_id 必须已登记
-    client_info = _registered_clients.get(client_id)
-    if not client_id or not client_info:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error": "unauthorized_client",
-                "error_description": "client_id is not registered",
-            },
-        )
+    # client_id 必须已登记（支持无状态 client_id 或内存登记）
+    valid_client, registered_uris = verify_client_id(client_id)
+    if not valid_client:
+        if client_id in _registered_clients:
+            valid_client = True
+            registered_uris = _registered_clients[client_id].get("redirect_uris", [])
+        else:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "unauthorized_client",
+                    "error_description": "client_id is not registered",
+                },
+            )
 
     # redirect_uri 必须与登记值逐字符一致，否则拒绝。取消链接同理
-    registered_uris = client_info.get("redirect_uris", [])
     if not redirect_uri or redirect_uri not in registered_uris:
         return JSONResponse(
             status_code=400,
@@ -526,13 +605,13 @@ async def oauth_authorize_get(
             },
         )
 
-    # 去掉 plain，元数据与实际校验只留 S256
-    if code_challenge_method and code_challenge_method.upper() != "S256":
+    # 要求 code_challenge 非空且方法为 S256，否则 400
+    if not code_challenge or not code_challenge_method or code_challenge_method.upper() != "S256":
         return JSONResponse(
             status_code=400,
             content={
                 "error": "invalid_request",
-                "error_description": "Unsupported code_challenge_method, only S256 is supported",
+                "error_description": "code_challenge is required and code_challenge_method must be S256",
             },
         )
 
@@ -578,20 +657,23 @@ async def oauth_authorize_post(request: Request):
     response_type = str(form.get("response_type", "code")).strip()
     scope = str(form.get("scope", "mcp")).strip()
 
-    # client_id 必须已登记
-    client_info = _registered_clients.get(client_id)
-    if not client_id or not client_info:
-        _record_authorize_failure()
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error": "unauthorized_client",
-                "error_description": "client_id is not registered",
-            },
-        )
+    # client_id 必须已登记（支持无状态 client_id 或内存登记）
+    valid_client, registered_uris = verify_client_id(client_id)
+    if not valid_client:
+        if client_id in _registered_clients:
+            valid_client = True
+            registered_uris = _registered_clients[client_id].get("redirect_uris", [])
+        else:
+            _record_authorize_failure()
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "unauthorized_client",
+                    "error_description": "client_id is not registered",
+                },
+            )
 
     # redirect_uri 必须与登记值逐字符一致，否则拒绝
-    registered_uris = client_info.get("redirect_uris", [])
     if not redirect_uri or redirect_uri not in registered_uris:
         _record_authorize_failure()
         return JSONResponse(
@@ -602,14 +684,14 @@ async def oauth_authorize_post(request: Request):
             },
         )
 
-    # 去掉 plain，元数据与实际校验只留 S256
-    if code_challenge_method and code_challenge_method.upper() != "S256":
+    # 要求 code_challenge 非空且方法为 S256，否则 400
+    if not code_challenge or not code_challenge_method or code_challenge_method.upper() != "S256":
         _record_authorize_failure()
         return JSONResponse(
             status_code=400,
             content={
                 "error": "invalid_request",
-                "error_description": "Unsupported code_challenge_method, only S256 is supported",
+                "error_description": "code_challenge is required and code_challenge_method must be S256",
             },
         )
 
@@ -728,7 +810,7 @@ async def oauth_token(request: Request):
                 },
             )
 
-        # client_id 必须已登记
+        # client_id 必须已登记（支持无状态 client_id 或内存登记）
         code_client_id = code_data.get("client_id", "")
         provided_client_id = str(data.get("client_id", "")).strip()
         if provided_client_id and provided_client_id != code_client_id:
@@ -740,18 +822,21 @@ async def oauth_token(request: Request):
                 },
             )
 
-        client_info = _registered_clients.get(code_client_id)
-        if not code_client_id or not client_info:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": "invalid_client",
-                    "error_description": "client_id is not registered",
-                },
-            )
+        valid_client, registered_uris = verify_client_id(code_client_id)
+        if not valid_client:
+            if code_client_id in _registered_clients:
+                valid_client = True
+                registered_uris = _registered_clients[code_client_id].get("redirect_uris", [])
+            else:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_client",
+                        "error_description": "client_id is not registered",
+                    },
+                )
 
         # redirect_uri 必须与登记值逐字符一致，否则拒绝
-        registered_uris = client_info.get("redirect_uris", [])
         expected_redirect_uri = code_data.get("redirect_uri", "")
         if not redirect_uri or redirect_uri not in registered_uris or redirect_uri != expected_redirect_uri:
             return JSONResponse(
@@ -774,27 +859,26 @@ async def oauth_token(request: Request):
                 },
             )
 
-        if expected_challenge:
-            if not code_verifier:
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "error": "invalid_grant",
-                        "error_description": "code_verifier is required",
-                    },
-                )
-            digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
-            calculated = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
-            if not hmac.compare_digest(
-                calculated.encode("ascii"), expected_challenge.encode("ascii")
-            ):
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "error": "invalid_grant",
-                        "error_description": "PKCE verification failed",
-                    },
-                )
+        if not expected_challenge or not code_verifier:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "invalid_grant",
+                    "error_description": "code_verifier is required",
+                },
+            )
+        digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+        calculated = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+        if not hmac.compare_digest(
+            calculated.encode("ascii"), expected_challenge.encode("ascii")
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "invalid_grant",
+                    "error_description": "PKCE verification failed",
+                },
+            )
 
         access_token = get_access_token()
         refresh_token = create_refresh_token()
@@ -809,14 +893,16 @@ async def oauth_token(request: Request):
     if grant_type == "refresh_token":
         refresh_token = str(data.get("refresh_token", "")).strip()
         provided_client_id = str(data.get("client_id", "")).strip()
-        if provided_client_id and provided_client_id not in _registered_clients:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": "invalid_client",
-                    "error_description": "client_id is not registered",
-                },
-            )
+        if provided_client_id:
+            valid_client, _ = verify_client_id(provided_client_id)
+            if not valid_client and provided_client_id not in _registered_clients:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_client",
+                        "error_description": "client_id is not registered",
+                    },
+                )
 
         if not verify_refresh_token(refresh_token):
             return JSONResponse(

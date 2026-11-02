@@ -57,35 +57,35 @@ def create_derived_token(expires_in: int = 2592000) -> str:
     expires_at = int(time.time()) + expires_in
     keys = get_gateway_secrets()
     signing_key = keys[0] if keys else "pawwake_default_key"
-    payload = str(expires_at).encode("ascii")
+    payload = str(expires_at).encode("utf-8")
     sig = hmac.new(signing_key.encode("utf-8"), payload, hashlib.sha256).hexdigest()
     return f"pwa_{expires_at}_{sig}"
 
 
 def verify_derived_token(token: str) -> bool:
     """Verify derived access token pwa_<expires_at>_<HMAC> against GATEWAY_SECRET items."""
-    if not token or not token.startswith("pwa_"):
-        return False
-    parts = token.split("_")
-    if len(parts) != 3:
-        return False
     try:
+        if not isinstance(token, str) or not token.startswith("pwa_"):
+            return False
+        parts = token.split("_")
+        if len(parts) != 3:
+            return False
         expires_at = int(parts[1])
-    except (ValueError, TypeError):
+        if time.time() > expires_at:
+            return False
+        keys = get_gateway_secrets()
+        if not keys:
+            return False
+        provided_sig = parts[2].encode("utf-8")
+        payload = str(expires_at).encode("utf-8")
+        matched = False
+        for k in keys:
+            expected_sig = hmac.new(k.encode("utf-8"), payload, hashlib.sha256).hexdigest().encode("utf-8")
+            if secrets.compare_digest(provided_sig, expected_sig):
+                matched = True
+        return matched
+    except Exception:
         return False
-    if time.time() > expires_at:
-        return False
-    keys = get_gateway_secrets()
-    if not keys:
-        return False
-    provided_sig = parts[2].encode("ascii")
-    payload = str(expires_at).encode("ascii")
-    matched = False
-    for k in keys:
-        expected_sig = hmac.new(k.encode("utf-8"), payload, hashlib.sha256).hexdigest().encode("ascii")
-        if secrets.compare_digest(provided_sig, expected_sig):
-            matched = True
-    return matched
 
 
 def verify_gateway_key(provided_key: str) -> bool:
@@ -211,23 +211,23 @@ async def gateway_auth_middleware(request: Request, call_next):
         )
 
     if is_dashboard_path(path) and (get_gateway_secrets() or shared.DASHBOARD_PASSWORD or shared.SESSION_SECRET):
+        if not dashboard_auth_ready():
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "Dashboard login is not configured. Set DASHBOARD_PASSWORD and a stable SESSION_SECRET of at least 32 characters."
+                },
+            )
         token = request.cookies.get(shared.DASHBOARD_SESSION_COOKIE, "")
-        if dashboard_auth_ready() and valid_dashboard_session(token):
+        if valid_dashboard_session(token):
             if request.method in DASHBOARD_WRITE_METHODS and not request_has_same_origin(request):
                 return JSONResponse(status_code=403, content={"error": "Invalid request origin."})
             return await call_next(request)
         if path == "/dashboard" and request.method == "GET":
-            if not dashboard_auth_ready():
-                return JSONResponse(
-                    status_code=503,
-                    content={
-                        "error": "Dashboard login is not configured. Set DASHBOARD_PASSWORD and a stable SESSION_SECRET of at least 32 characters."
-                    },
-                )
             return RedirectResponse(url="/dashboard/login", status_code=303)
         return JSONResponse(
             status_code=401,
-            content={"error": "Unauthorized. Provide X-Gateway-Key header."},
+            content={"error": "Dashboard login required."},
         )
 
     # 未设置密钥时网关保护路径一律拒绝（返回 401），并确保警告已打印。
