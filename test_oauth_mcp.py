@@ -412,5 +412,145 @@ class TestMCPTools(unittest.TestCase):
                         self.assertEqual(res["duplicate_reason"], "exact")
 
 
+class TestReverseValidations(unittest.TestCase):
+    """专门针对反向验证的用例：PKCE 不匹配、redirect_uri 不匹配、错误密钥、用 OAuth 令牌访问 /v1/models"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(app, follow_redirects=False)
+
+    def setUp(self):
+        self.secret = "test-gateway-secret-12345"
+        self.client_id = "pawwake-gemini-client"
+        self.redirect_uri = "https://gemini.google.com/oauth/callback"
+        self.state = "state-rev"
+        self.verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+        digest = hashlib.sha256(self.verifier.encode("ascii")).digest()
+        self.challenge = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+    def _get_code(self):
+        resp = self.client.post(
+            "/oauth/authorize",
+            data={
+                "gateway_secret": self.secret,
+                "client_id": self.client_id,
+                "redirect_uri": self.redirect_uri,
+                "state": self.state,
+                "code_challenge": self.challenge,
+                "code_challenge_method": "S256",
+            },
+        )
+        import urllib.parse
+        q = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(resp.headers["location"]).query))
+        return q["code"]
+
+    def test_reverse_pkce(self):
+        """反向验证 1：PKCE 正向匹配得 200，反向不匹配得 400"""
+        with patch.object(shared, "GATEWAY_SECRET", self.secret):
+            # 反向：错误 code_verifier -> 400
+            code_neg = self._get_code()
+            r_neg = self.client.post(
+                "/oauth/token",
+                data={
+                    "grant_type": "authorization_code",
+                    "code": code_neg,
+                    "redirect_uri": self.redirect_uri,
+                    "client_id": self.client_id,
+                    "code_verifier": "wrong-verifier",
+                },
+            )
+            self.assertEqual(r_neg.status_code, 400)
+            self.assertEqual(r_neg.json()["error"], "invalid_grant")
+
+            # 正向：正确 code_verifier -> 200
+            code_pos = self._get_code()
+            r_pos = self.client.post(
+                "/oauth/token",
+                data={
+                    "grant_type": "authorization_code",
+                    "code": code_pos,
+                    "redirect_uri": self.redirect_uri,
+                    "client_id": self.client_id,
+                    "code_verifier": self.verifier,
+                },
+            )
+            self.assertEqual(r_pos.status_code, 200)
+
+    def test_reverse_redirect_uri(self):
+        """反向验证 2：redirect_uri 正向一致得 200，反向不匹配得 400"""
+        with patch.object(shared, "GATEWAY_SECRET", self.secret):
+            # 反向：token 交换时 redirect_uri 不匹配 -> 400
+            code_neg = self._get_code()
+            r_neg = self.client.post(
+                "/oauth/token",
+                data={
+                    "grant_type": "authorization_code",
+                    "code": code_neg,
+                    "redirect_uri": "https://evil.com/callback",
+                    "client_id": self.client_id,
+                    "code_verifier": self.verifier,
+                },
+            )
+            self.assertEqual(r_neg.status_code, 400)
+            self.assertEqual(r_neg.json()["error"], "invalid_grant")
+
+            # 正向：redirect_uri 匹配 -> 200
+            code_pos = self._get_code()
+            r_pos = self.client.post(
+                "/oauth/token",
+                data={
+                    "grant_type": "authorization_code",
+                    "code": code_pos,
+                    "redirect_uri": self.redirect_uri,
+                    "client_id": self.client_id,
+                    "code_verifier": self.verifier,
+                },
+            )
+            self.assertEqual(r_pos.status_code, 200)
+
+    def test_reverse_secret_validation(self):
+        """反向验证 3：密钥正确得 302，反向错误密钥得 401"""
+        with patch.object(shared, "GATEWAY_SECRET", self.secret):
+            # 反向：错误密码 -> 401
+            r_neg = self.client.post(
+                "/oauth/authorize",
+                data={
+                    "gateway_secret": "bad-password",
+                    "client_id": self.client_id,
+                    "redirect_uri": self.redirect_uri,
+                    "state": self.state,
+                    "code_challenge": self.challenge,
+                    "code_challenge_method": "S256",
+                },
+            )
+            self.assertEqual(r_neg.status_code, 401)
+
+            # 正向：正确密码 -> 302
+            r_pos = self.client.post(
+                "/oauth/authorize",
+                data={
+                    "gateway_secret": self.secret,
+                    "client_id": self.client_id,
+                    "redirect_uri": self.redirect_uri,
+                    "state": self.state,
+                    "code_challenge": self.challenge,
+                    "code_challenge_method": "S256",
+                },
+            )
+            self.assertEqual(r_pos.status_code, 302)
+
+    def test_reverse_oauth_token_on_v1_models(self):
+        """反向验证 4：X-Gateway-Key 访问 /v1/models 得 200，反向用 OAuth Bearer 访问 /v1/models 必须失败返回 401"""
+        with patch.object(shared, "GATEWAY_SECRET", self.secret):
+            # 正向：带 X-Gateway-Key 放行
+            r_pos = self.client.get("/v1/models", headers={"X-Gateway-Key": self.secret})
+            self.assertEqual(r_pos.status_code, 200)
+
+            # 反向：带 OAuth Bearer 令牌访问 /v1/models 被拒
+            r_neg = self.client.get("/v1/models", headers={"Authorization": f"Bearer {self.secret}"})
+            self.assertEqual(r_neg.status_code, 401)
+            self.assertEqual(r_neg.json(), {"error": "Unauthorized. Provide X-Gateway-Key header."})
+
+
 if __name__ == "__main__":
     unittest.main()

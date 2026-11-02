@@ -57,16 +57,8 @@ def get_host(request: Request) -> str:
 
 
 def _verify_secret_constant_time(provided: str) -> bool:
-    """Verify provided secret against GATEWAY_SECRET in constant time to prevent timing attacks."""
-    keys = auth.get_gateway_secrets()
-    if not keys or not provided:
-        return False
-    provided_bytes = provided.encode("utf-8")
-    matched = False
-    for k in keys:
-        if hmac.compare_digest(provided_bytes, k.encode("utf-8")):
-            matched = True
-    return matched
+    """Verify provided secret against GATEWAY_SECRET in constant time using auth.verify_gateway_key."""
+    return auth.verify_gateway_key(provided)
 
 
 def create_refresh_token() -> str:
@@ -86,10 +78,10 @@ def verify_refresh_token(token: str) -> bool:
     """Verify refresh token signature using hmac.compare_digest."""
     if not token or not token.startswith("pwr_"):
         return False
-    parts = token.split("_")
-    if len(parts) != 3:
+    body = token[4:]
+    raw, sep, sig = body.rpartition("_")
+    if not sep or not raw or not sig:
         return False
-    _, raw, sig = parts
     keys = auth.get_gateway_secrets()
     if not keys:
         return False
@@ -437,6 +429,16 @@ async def oauth_authorize_get(
     scope: str = "mcp",
 ):
     """Render OAuth authorization page."""
+    if redirect_uri:
+        client_info = _registered_clients.get(client_id)
+        if client_info and client_info.get("redirect_uris") and redirect_uri not in client_info["redirect_uris"]:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "invalid_request",
+                    "error_description": "redirect_uri mismatch with registered client redirect_uris",
+                },
+            )
     html_content = _render_authorize_html(
         client_id=client_id,
         redirect_uri=redirect_uri,
@@ -481,6 +483,18 @@ async def oauth_authorize_post(request: Request):
             status_code=400,
             content={"error": "invalid_request", "error_description": "redirect_uri is required"},
         )
+
+    # Validate redirect_uri matches DCR registered values if registered
+    client_info = _registered_clients.get(client_id)
+    if client_info and client_info.get("redirect_uris"):
+        if redirect_uri not in client_info["redirect_uris"]:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "invalid_request",
+                    "error_description": "redirect_uri mismatch with registered client redirect_uris",
+                },
+            )
 
     # Generate one-time random authorization code (TTL: 5 minutes)
     code = secrets.token_urlsafe(32)
