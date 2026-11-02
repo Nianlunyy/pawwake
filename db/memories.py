@@ -197,6 +197,21 @@ async def get_memory_by_external_id(external_id: str):
     return dict(row) if row else None
 
 
+async def get_memory_by_id(memory_id: int):
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, content, importance, title, layer, event_date,
+                   source_session, external_id, is_active, is_pinned, created_at
+            FROM memories
+            WHERE id = $1
+            """,
+            memory_id,
+        )
+    return dict(row) if row else None
+
+
 async def claim_due_reminders(lease_seconds: float) -> list:
     """取出全部到期未送达的提醒，并确保同一条只交给一个请求处理。
 

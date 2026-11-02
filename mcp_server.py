@@ -5,7 +5,10 @@ from datetime import date, datetime
 from mcp.server.mcpserver import MCPServer
 
 import shared
+from db import core as db_core
+from db import conversations as db_conversations
 from db import memories as db_memories
+from db import search as db_search
 
 
 server = MCPServer(
@@ -77,6 +80,35 @@ async def add_memory(
             parsed_event_date = date.fromisoformat(event_date)
         except ValueError as exc:
             raise ValueError("event_date 必须是有效的 YYYY-MM-DD 日期") from exc
+
+    # 双端防重保护：未传 external_id 时先查最近是否已有内容相同或高度重合的激活态记忆
+    if not external_id:
+        dup = await db_memories.check_duplicate_memory(content)
+        if dup.get("is_duplicate") and dup.get("matched_id"):
+            matched_id = dup["matched_id"]
+            if dup.get("reason") == "containment_update":
+                await db_memories.update_memory_with_layer(
+                    matched_id,
+                    content=content,
+                    importance=importance,
+                    title=title,
+                    layer=layer,
+                )
+                existing = await db_memories.get_memory_by_id(matched_id)
+                if existing:
+                    return {
+                        "status": "updated",
+                        "memory": _serialize_memory(existing),
+                        "duplicate_reason": dup.get("reason"),
+                    }
+            else:
+                existing = await db_memories.get_memory_by_id(matched_id)
+                if existing:
+                    return {
+                        "status": "exists",
+                        "memory": _serialize_memory(existing),
+                        "duplicate_reason": dup.get("reason"),
+                    }
 
     memory_id = await db_memories.save_memory(
         content=content,
@@ -252,6 +284,132 @@ async def unpin_memory(memory_id: int) -> dict:
     if not unpinned:
         raise ValueError("记忆不存在")
     return {"status": "unpinned", "id": memory_id}
+
+
+@server.tool(
+    description=(
+        "读取指定会话（或不传时默认读取最近活跃主会话）的当前 A/B 分区滚动记忆摘要（Partition Summary）及核心上下文状态。"
+    )
+)
+async def get_memory_summary(session_id: str | None = None) -> dict:
+    if not shared.DATABASE_ENABLED:
+        raise ValueError("数据库未启用")
+    session_id = (session_id or "").strip() or None
+    if not session_id:
+        session_id = shared.get_active_session_id()
+    if not session_id:
+        threads = await db_conversations.list_all_session_cache_states()
+        if threads:
+            session_id = threads[0]["session_id"]
+        else:
+            recent_convs, _ = await db_conversations.get_conversations_paginated(
+                page=1, per_page=1
+            )
+            if recent_convs:
+                session_id = recent_convs[0]["session_id"]
+            else:
+                session_id = "default"
+
+    state = await db_conversations.get_session_cache_state(session_id)
+    summary_parts = state.get("summary_parts", [])
+    summary = "\n\n".join(summary_parts)
+    updated_at = state.get("updated_at")
+    updated_at_str = (
+        updated_at.isoformat()
+        if isinstance(updated_at, (date, datetime))
+        else (str(updated_at) if updated_at else None)
+    )
+
+    return {
+        "status": "ok",
+        "session_id": session_id,
+        "summary": summary,
+        "summary_parts": summary_parts,
+        "summary_count": len(summary_parts),
+        "summary_length": len(summary),
+        "a_start_round": state.get("a_start_round", 0),
+        "updated_at": updated_at_str,
+        "partition_enabled": shared.CACHE_PARTITION_ENABLED,
+        "partition_x": shared.CACHE_PARTITION_X,
+    }
+
+
+@server.tool(
+    description=(
+        "根据关键词或语义在历史对话记录中检索相关的原始对话片段，或者列出最近对话切片。"
+    )
+)
+async def recall_conversation_snippets(query: str, limit: int = 5) -> dict:
+    if not shared.DATABASE_ENABLED:
+        raise ValueError("数据库未启用")
+    query = (query or "").strip()
+    if not query:
+        raise ValueError("query 不能为空")
+    limit = _limit(limit) if 1 <= limit <= 100 else 5
+
+    snippets = []
+    if shared.CONVERSATION_RECALL_ENABLED:
+        try:
+            results, _ = await db_search.search_chat_fragments(
+                query=query,
+                max_sessions=limit,
+                max_matches_per_session=1,
+                context=1,
+                mode="hybrid",
+            )
+            for item in results:
+                sid = item.get("session_id", "")
+                for frag in item.get("fragments", []):
+                    snippets.append({
+                        "session_id": sid,
+                        "snippet": frag,
+                    })
+        except Exception:
+            pass
+
+    if not snippets:
+        pool = await db_core.get_pool()
+        keywords = db_search.extract_search_keywords(query)
+        async with pool.acquire() as conn:
+            if keywords:
+                where_parts = [f"content ILIKE '%' || ${i+1} || '%'" for i in range(len(keywords))]
+                sql = f"""
+                    SELECT id, session_id, role, content, created_at
+                    FROM conversations
+                    WHERE deleted_at IS NULL AND ({" OR ".join(where_parts)})
+                    ORDER BY created_at DESC
+                    LIMIT ${len(keywords) + 1}
+                """
+                rows = await conn.fetch(sql, *keywords, limit)
+            else:
+                sql = """
+                    SELECT id, session_id, role, content, created_at
+                    FROM conversations
+                    WHERE deleted_at IS NULL AND content ILIKE '%' || $1 || '%'
+                    ORDER BY created_at DESC
+                    LIMIT $2
+                """
+                rows = await conn.fetch(sql, query, limit)
+
+            for row in rows:
+                t_str = row["created_at"].isoformat() if row.get("created_at") else ""
+                role = row.get("role", "")
+                content_snippet = (row.get("content") or "")[:500]
+                snippets.append({
+                    "session_id": row["session_id"],
+                    "message_id": row["id"],
+                    "role": role,
+                    "created_at": t_str,
+                    "content": content_snippet,
+                    "snippet": f"[{t_str}] {role}: {content_snippet}",
+                })
+
+    return {
+        "status": "ok",
+        "query": query,
+        "count": len(snippets),
+        "snippets": snippets,
+    }
 
 
 http_app = server.streamable_http_app(

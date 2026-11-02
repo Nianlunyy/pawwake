@@ -16,7 +16,14 @@ import shared
 # ============================================================
 
 # 不需要鉴权的路径（根路径精确匹配，其余按前缀匹配）
-PUBLIC_PATHS = ("/", "/static/", "/health", "/favicon.ico")
+PUBLIC_PATHS = (
+    "/",
+    "/static/",
+    "/health",
+    "/favicon.ico",
+    "/.well-known/",
+    "/oauth/",
+)
 DASHBOARD_PATH_PREFIXES = ("/api/", "/import/", "/export/")
 DASHBOARD_WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
@@ -139,10 +146,19 @@ async def gateway_auth_middleware(request: Request, call_next):
             and verify_gateway_key(token.strip())
         ):
             return await call_next(request)
+        host = (
+            request.headers.get("x-forwarded-host")
+            or request.headers.get("host")
+            or request.url.netloc
+            or "localhost"
+        )
         return JSONResponse(
             status_code=401,
             content={
                 "error": "Unauthorized. Provide X-Gateway-Key or Authorization: Bearer."
+            },
+            headers={
+                "WWW-Authenticate": f'Bearer resource_metadata="https://{host}/.well-known/oauth-protected-resource"'
             },
         )
 

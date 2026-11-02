@@ -35,6 +35,7 @@ from routes.memories import maintenance_router as memories_maintenance_router
 from routes.memories import router as memories_router
 from routes.conversations import router as conversations_router
 from routes.partition import router as partition_router
+from routes.oauth_mcp import router as oauth_mcp_router
 from mcp_server import http_app as mcp_http_app, server as mcp_server
 
 # ============================================================
@@ -168,8 +169,8 @@ async def normalize_mcp_path(request, call_next):
     return await call_next(request)
 
 
-app.middleware("http")(normalize_mcp_path)
 app.middleware("http")(auth.gateway_auth_middleware)
+app.middleware("http")(normalize_mcp_path)
 
 # CORS：为网页前端放行跨域请求
 # ⚠️ allow_origins 目前是占位符，Cloudflare Pages 部署拿到正式域名后需回来替换
@@ -181,6 +182,7 @@ app.add_middleware(
 )
 
 # Centralized router registration. Preserve this order in route snapshots.
+app.include_router(oauth_mcp_router)
 app.include_router(chat_router)
 database_dependencies = [Depends(auth.require_database_enabled)]
 app.include_router(memories_bootstrap_router, dependencies=database_dependencies)
