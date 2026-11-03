@@ -867,10 +867,23 @@ async def oauth_token(request: Request):
                     "error_description": "code_verifier is required",
                 },
             )
-        digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
-        calculated = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+        try:
+            verifier_bytes = code_verifier.encode("ascii")
+            challenge_bytes = expected_challenge.encode("ascii")
+        except (UnicodeEncodeError, UnicodeError, AttributeError):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "invalid_grant",
+                    "error_description": "PKCE verification failed",
+                },
+            )
+
+        digest = hashlib.sha256(verifier_bytes).digest()
+        calculated_bytes = base64.urlsafe_b64encode(digest).rstrip(b"=")
         if not hmac.compare_digest(
-            calculated.encode("ascii"), expected_challenge.encode("ascii")
+            calculated_bytes, challenge_bytes
         ):
             return JSONResponse(
                 status_code=400,

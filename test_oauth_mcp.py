@@ -1211,6 +1211,41 @@ class TestOAuthRound2Requirements(unittest.TestCase):
         self.assertIn("授权码将发送到：allowed.example.com", resp.text)
         self.assertNotIn("Google Gemini 正在请求连接", resp.text)
 
+    def test_code_verifier_with_non_ascii_returns_400_not_500(self):
+        """8. code_verifier 含 é 在 /oauth/token 交换时得 400 而非 500"""
+        with patch.object(shared, "GATEWAY_SECRET", self.secret):
+            verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+            digest = hashlib.sha256(verifier.encode("ascii")).digest()
+            challenge = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+            resp_auth = self.client.post(
+                "/oauth/authorize",
+                data={
+                    "gateway_secret": self.secret,
+                    "client_id": self.client_id,
+                    "redirect_uri": self.redirect_uri,
+                    "code_challenge": challenge,
+                    "code_challenge_method": "S256",
+                },
+            )
+            self.assertEqual(resp_auth.status_code, 302)
+            parsed = urllib.parse.urlparse(resp_auth.headers["location"])
+            code = dict(urllib.parse.parse_qsl(parsed.query))["code"]
+
+            # 使用包含非 ASCII 字符 é 的 code_verifier 进行换票
+            resp_tok = self.client.post(
+                "/oauth/token",
+                data={
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": self.redirect_uri,
+                    "client_id": self.client_id,
+                    "code_verifier": "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk_é",
+                },
+            )
+            self.assertEqual(resp_tok.status_code, 400)
+            self.assertEqual(resp_tok.json()["error"], "invalid_grant")
+
 
 if __name__ == "__main__":
     unittest.main()
