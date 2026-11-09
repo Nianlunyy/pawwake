@@ -308,7 +308,6 @@ async def get_memory_summary(session_id: str | None = None) -> dict:
         "status": "ok",
         "session_id": session_id,
         "summary": summary,
-        "summary_parts": summary_parts,
         "summary_count": len(summary_parts),
         "summary_length": len(summary),
         "a_start_round": state.get("a_start_round", 0),

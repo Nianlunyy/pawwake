@@ -392,6 +392,7 @@ class TestMCPTools(unittest.TestCase):
                     self.assertEqual(res["summary"], "第1段摘要\n\n第2段摘要")
                     self.assertEqual(res["summary_count"], 2)
                     self.assertEqual(res["a_start_round"], 10)
+                    self.assertNotIn("summary_parts", res)
 
     def test_recall_conversation_snippets(self):
         """测试 recall_conversation_snippets 工具召回历史对话切片"""
