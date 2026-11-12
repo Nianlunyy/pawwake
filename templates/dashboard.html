@@ -589,19 +589,19 @@
                     <div>
                         <div class="settings-field">
                             <label>召回重排模型</label>
-                            <input type="text" id="set-RERANK_MODEL" class="input" placeholder="typesafe/jev-1.13" autocomplete="off">
-                            <small class="form-hint">模型名按照供应商页面上的填，同一个模型各家写法可能不同。</small>
+                            <input type="text" id="set-RERANK_MODEL" class="input" placeholder="Qwen/Qwen3-Reranker-8B" autocomplete="off">
+                            <small class="form-hint">支持硅基流动等标准 /v1/rerank 模型（如 Qwen/Qwen3-Reranker-8B、BAAI/bge-reranker-v2-m3）。</small>
                         </div>
                         <div class="settings-field">
                             <label>重排 API Base URL</label>
-                            <input type="text" id="set-RERANK_BASE_URL" class="input" placeholder="留空时使用基础连接的 API Base URL" autocomplete="off">
+                            <input type="text" id="set-RERANK_BASE_URL" class="input" placeholder="留空时优先复用向量搜索的 API Base URL" autocomplete="off">
                         </div>
                         <div class="settings-field">
                             <label>重排 API Key</label>
-                            <input type="text" id="set-RERANK_API_KEY" class="input" placeholder="留空时使用基础连接的 API Key" autocomplete="off">
+                            <input type="text" id="set-RERANK_API_KEY" class="input" placeholder="留空时优先复用向量搜索的 API Key" autocomplete="off">
                             <small class="form-hint" id="set-RERANK_API_KEY-hint"></small>
                         </div>
-                        <small class="form-hint">专用地址和钥匙须同时填写或同时留空；两项都留空时使用基础连接。失败时沿用原搜索。两个开关都关闭时保留设置</small>
+                        <small class="form-hint">专用地址和钥匙须同时填写或同时留空；都留空时优先与向量搜索共用地址和 Key（其次使用基础连接）。失败时沿用原搜索。</small>
                     </div>
                 </div>
 

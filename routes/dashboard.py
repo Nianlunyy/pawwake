@@ -311,9 +311,17 @@ async def save_settings(request: Request):
             api_base_url = data.get("API_BASE_URL", shared.API_BASE_URL)
             if not isinstance(api_base_url, str):
                 return {"error": "API Base URL 须为文字"}
-            effective_base_url = rerank_base_url or api_base_url.strip()
-            if urlsplit(effective_base_url).hostname not in recall_rerank.ENDPOINTS:
-                return {"error": "重排只支持 OpenRouter、Zenmux 和 TypeSafe"}
+            emb_base_url = data.get("EMBEDDING_BASE_URL", shared.EMBEDDING_BASE_URL)
+            if not isinstance(emb_base_url, str):
+                emb_base_url = shared.EMBEDDING_BASE_URL
+            effective_base_url = (
+                rerank_base_url
+                or emb_base_url.strip()
+                or api_base_url.strip()
+            )
+            parsed_rerank = urlsplit(effective_base_url)
+            if parsed_rerank.scheme not in ("http", "https") or not parsed_rerank.hostname:
+                return {"error": "请填写有效的重排、向量或基础 API Base URL"}
         updated = []
         skipped = []
         if data.pop("redetect_embedding", False) is True:

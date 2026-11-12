@@ -508,17 +508,17 @@ def _effective_days_ago(event_date, created_at, now_utc):
 
 
 def _anchored_semantic_normalize(scores: dict, threshold: float) -> dict:
-    """语义轴归一化：下界取批内最低，上界不低于语义阈值。
+    """语义轴归一化：下界取批内最低（单候选时以 0.0 为下界避免自减归零），上界不低于语义阈值。
     池里有候选过阈值时与 min-max 一致；全弱池不再把最高项拉满"""
     if not scores:
         return {}
     vals = list(scores.values())
-    min_v = min(vals)
+    min_v = 0.0 if len(vals) == 1 else min(vals)
     max_v = max(max(vals), threshold)
     spread = max_v - min_v
     if spread == 0:
         return {k: 0.0 if max_v == 0 else 1.0 for k in scores}
-    return {k: (v - min_v) / spread for k, v in scores.items()}
+    return {k: max(0.0, (v - min_v) / spread) for k, v in scores.items()}
 
 
 async def search_memories_hybrid(

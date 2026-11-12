@@ -1,4 +1,8 @@
-"""Jev reranking shared by memory and conversation injection."""
+"""Reranking shared by memory and conversation injection.
+
+Supports SiliconFlow / OpenAI-compatible /v1/rerank endpoints as well as
+legacy decision/systemone providers (OpenRouter, Zenmux, TypeSafe).
+"""
 
 import asyncio
 import time
@@ -18,7 +22,7 @@ ENDPOINTS = {
 POOL = 20
 KEEP = 3
 GATE_LINE = 0.5
-TIMEOUTS = {"memory": 2.0, "conversation": 4.0}
+TIMEOUTS = {"memory": 4.0, "conversation": 5.0}
 CONVERSATION_TEXT_LIMIT = 700
 PROVIDER = {"data_collection": "deny", "zdr": True, "allow_fallbacks": False}
 CRITERIA = {
@@ -29,21 +33,131 @@ GATE_CRITERIA = {
     "true": "至少一片候选与问句指向同一具体话题、人物、事件或事实，回想起来能直接帮助回应问句。",
     "false": "没有任何一片能直接帮助回应问句：都只是字面词相同、主题沾边，或与问句无关。",
 }
+QWEN_INSTRUCTIONS = {
+    "memory": "判断候选记忆是否与用户当前的话直接相关，能够提供对话所需的具体事实、习惯、约定或事件背景；仅字面词相同但话题无关则不相关。",
+    "conversation": "判断候选历史对话片段是否与用户当前的话指向同一具体话题、人物或事件，能直接帮助回忆上下文；仅字面词相同但话题无关则不相关。",
+}
+
+
+def resolve_rerank_config() -> tuple[str, str] | tuple[None, None]:
+    """解析重排使用的 (base_url, api_key)。
+
+    专用地址与专用钥匙都留空时，优先复用 EMBEDDING_BASE_URL + EMBEDDING_API_KEY，
+    其次回退到 API_BASE_URL + API_KEY。若两者只有其一填写，返回 (None, None)。
+    """
+    dedicated_base = shared.RERANK_BASE_URL.strip()
+    dedicated_key = shared.RERANK_API_KEY.strip()
+    if bool(dedicated_base) != bool(dedicated_key):
+        return None, None
+    if dedicated_base and dedicated_key:
+        return dedicated_base, dedicated_key
+
+    emb_base = shared.EMBEDDING_BASE_URL.strip()
+    emb_key = shared.EMBEDDING_API_KEY.strip()
+    if emb_base and emb_key:
+        return emb_base, emb_key
+
+    api_base = shared.API_BASE_URL.strip()
+    api_key = shared.API_KEY.strip()
+    if api_base and api_key:
+        return api_base, api_key
+
+    return "", ""
+
+
+def is_legacy_decision_endpoint(base_url: str) -> bool:
+    clean = base_url.strip().rstrip("/")
+    if clean.endswith("/rerank"):
+        return False
+    return urlsplit(clean).hostname in ENDPOINTS
+
+
+def build_standard_rerank_url(base_url: str) -> str:
+    clean = base_url.strip().rstrip("/")
+    if clean.endswith("/rerank"):
+        return clean
+    if clean.endswith("/embeddings"):
+        return clean[:-len("/embeddings")] + "/rerank"
+    return f"{clean}/rerank"
 
 
 def _candidate_payload(candidate: dict, kind: str) -> dict:
     if kind == "memory":
         return {
             "date": str(candidate.get("event_date") or candidate.get("created_at") or "?"),
-            "text": candidate.get("content", ""),
+            "text": str(candidate.get("content", ""))[:1000],
         }
     if kind == "conversation":
         return {
             "session_id": candidate.get("session_id", ""),
             "date": candidate.get("date", "?"),
-            "text": candidate.get("text", "")[:CONVERSATION_TEXT_LIMIT],
+            "text": str(candidate.get("text", ""))[:CONVERSATION_TEXT_LIMIT],
         }
     raise ValueError("unknown rerank kind")
+
+
+def format_rerank_document(candidate: dict, kind: str) -> str:
+    payload = _candidate_payload(candidate, kind)
+    date = payload.get("date", "?")
+    text = payload.get("text", "")
+    if date and date != "?":
+        return f"[{date}] {text}"
+    return text
+
+
+def standard_request_body(
+    model: str,
+    query: str,
+    candidates: list,
+    kind: str,
+    include_instruction: bool = True,
+) -> dict:
+    body = {
+        "model": model,
+        "query": query[:1000],
+        "documents": [format_rerank_document(c, kind) for c in candidates],
+        "top_n": len(candidates),
+        "return_documents": False,
+    }
+    if include_instruction and "qwen" in model.lower() and kind in QWEN_INSTRUCTIONS:
+        body["instruction"] = QWEN_INSTRUCTIONS[kind]
+    return body
+
+
+def pick_standard(data: dict, count: int) -> tuple[list[int], float]:
+    """解析标准 /v1/rerank 响应，返回通过 GATE_LINE 的索引列表（最多 KEEP 条）及最高分 gate。"""
+    results = data.get("results")
+    if not isinstance(results, list) or not results:
+        raise ValueError("missing rerank results")
+    scores_by_idx = {}
+    for item in results:
+        if not isinstance(item, dict):
+            raise ValueError("bad rerank item")
+        idx = item.get("index")
+        score = item.get("relevance_score")
+        if (
+            isinstance(idx, bool)
+            or not isinstance(idx, int)
+            or not (0 <= idx < count)
+        ):
+            raise ValueError(f"bad rerank index: {idx}")
+        if (
+            isinstance(score, bool)
+            or not isinstance(score, (int, float))
+        ):
+            raise ValueError(f"bad relevance_score: {score}")
+        scores_by_idx[idx] = float(score)
+
+    if not scores_by_idx:
+        raise ValueError("empty scores")
+    gate = max(scores_by_idx.values())
+    if gate < GATE_LINE:
+        return [], gate
+    qualified = [
+        idx for idx, s in scores_by_idx.items() if s >= GATE_LINE
+    ]
+    qualified.sort(key=lambda i: (-scores_by_idx[i], i))
+    return qualified[:KEEP], gate
 
 
 def request_body(
@@ -114,38 +228,93 @@ def pick(answers: dict, count: int):
 async def rerank(model: str, query: str, candidates: list, kind: str):
     """Return selected candidates, including valid empty, or None on technical failure."""
     label = "记忆" if kind == "memory" else "对话"
-    dedicated_base = shared.RERANK_BASE_URL.strip()
-    dedicated_key = shared.RERANK_API_KEY.strip()
-    if bool(dedicated_base) != bool(dedicated_key):
+    if not candidates:
+        return []
+
+    base_url, key = resolve_rerank_config()
+    if base_url is None:
         print(f"⚠️ {label}重排：专用地址和钥匙须同时填写，回退原搜索")
         return None
-    base_url = dedicated_base or shared.API_BASE_URL
-    endpoint = ENDPOINTS.get(urlsplit(base_url).hostname)
-    if endpoint is None:
-        print(f"⚠️ {label}重排：不支持当前供应商，回退原搜索")
+    if not base_url or not key:
+        print(f"⚠️ {label}重排：没有可用的重排/向量/主接口地址或 API Key，回退原搜索")
         return None
-    key = dedicated_key or shared.API_KEY
-    if not key:
-        print(f"⚠️ {label}重排：没有 RERANK_API_KEY 或 API_KEY，回退原搜索")
-        return None
-    url, include_provider = endpoint
-    body = request_body(model, query, candidates, kind, include_provider)
-    timeout = TIMEOUTS[kind]
+
+    timeout = TIMEOUTS.get(kind, 4.0)
     started = time.perf_counter()
 
-    async def call():
+    if is_legacy_decision_endpoint(base_url):
+        endpoint = ENDPOINTS.get(urlsplit(base_url).hostname)
+        if endpoint is None:
+            print(f"⚠️ {label}重排：不支持当前供应商，回退原搜索")
+            return None
+        url, include_provider = endpoint
+        body = request_body(model, query, candidates, kind, include_provider)
+
+        async def call_legacy():
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(
+                    url,
+                    json=body,
+                    headers={"Authorization": f"Bearer {key}"},
+                )
+            response.raise_for_status()
+            return response.json()
+
+        try:
+            data = await asyncio.wait_for(call_legacy(), timeout)
+            picked, gate = pick(data["answers"], len(candidates))
+        except Exception as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", "")
+            elapsed = (time.perf_counter() - started) * 1000
+            print(
+                f"⚠️ {label}重排失败 {type(exc).__name__} {status} "
+                f"{elapsed:.0f}ms，回退原搜索"
+            )
+            return None
+
+        elapsed = (time.perf_counter() - started) * 1000
+        print(
+            f"🎯 {label}重排 gate={gate:.2f} 候选{len(candidates)}→{len(picked)} "
+            f"{elapsed:.0f}ms model={data.get('model')}"
+        )
+        return [candidates[index] for index in picked]
+
+    # 标准 /v1/rerank 接口（适配 SiliconFlow、千问 Qwen3-Reranker、BGE 等）
+    url = build_standard_rerank_url(base_url)
+    include_instruction = "qwen" in model.lower() and kind in QWEN_INSTRUCTIONS
+    body = standard_request_body(
+        model, query, candidates, kind, include_instruction=include_instruction
+    )
+
+    async def call_standard(request_body_dict: dict):
+        headers = {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        }
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(
                 url,
-                json=body,
-                headers={"Authorization": f"Bearer {key}"},
+                json=request_body_dict,
+                headers=headers,
             )
+            if (
+                include_instruction
+                and response.status_code in (400, 422)
+                and "instruction" in request_body_dict
+            ):
+                fallback_body = dict(request_body_dict)
+                fallback_body.pop("instruction", None)
+                response = await client.post(
+                    url,
+                    json=fallback_body,
+                    headers=headers,
+                )
         response.raise_for_status()
         return response.json()
 
     try:
-        data = await asyncio.wait_for(call(), timeout)
-        picked, gate = pick(data["answers"], len(candidates))
+        data = await asyncio.wait_for(call_standard(body), timeout)
+        picked, gate = pick_standard(data, len(candidates))
     except Exception as exc:
         status = getattr(getattr(exc, "response", None), "status_code", "")
         elapsed = (time.perf_counter() - started) * 1000
@@ -156,8 +325,9 @@ async def rerank(model: str, query: str, candidates: list, kind: str):
         return None
 
     elapsed = (time.perf_counter() - started) * 1000
+    model_name = data.get("model") or model
     print(
         f"🎯 {label}重排 gate={gate:.2f} 候选{len(candidates)}→{len(picked)} "
-        f"{elapsed:.0f}ms model={data.get('model')}"
+        f"{elapsed:.0f}ms model={model_name}"
     )
     return [candidates[index] for index in picked]
