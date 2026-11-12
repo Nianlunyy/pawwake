@@ -644,6 +644,35 @@ async def api_revert_merge(memory_id: int):
         return shared._api_failure("撤回合并失败")
 
 
+@router.post("/api/memories/batch-revert-merge")
+async def api_batch_revert_merge(request: Request):
+    """批量或一键撤回合并操作：恢复原始碎片，删除合并后的事件记忆"""
+    if not shared.MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "请求格式错误"})
+
+    revert_all = bool(data.get("all", False))
+    ids = data.get("ids", [])
+    if not revert_all:
+        if not isinstance(ids, list) or not ids:
+            return JSONResponse(status_code=400, content={"error": "未选择要撤回合并的记忆"})
+        if any(isinstance(i, bool) or not isinstance(i, int) for i in ids):
+            return JSONResponse(status_code=400, content={"error": "记忆 ID 必须是整数"})
+
+    try:
+        return await db_memories.revert_merge_batch(
+            memory_ids=ids if not revert_all else None,
+            revert_all=revert_all,
+        )
+    except Exception:
+        return shared._api_failure("批量撤回合并失败")
+
+
+
 @router.post("/api/memories/{memory_id}/restore")
 async def api_restore_memory(memory_id: int):
     """恢复已归档的记忆（将 is_active 设为 TRUE）"""

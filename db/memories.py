@@ -1983,3 +1983,134 @@ async def revert_merge(memory_id: int):
             """, memory_id)
 
             return {"status": "ok", "restored": restored}
+
+
+async def revert_merge_batch(memory_ids: list = None, revert_all: bool = False) -> dict:
+    """批量或一键全量撤回事件记忆合并。
+
+    恢复原始碎片（is_active = TRUE），删除合并后的事件记忆。
+    对于嵌套合并（事件又被合并为新事件），revert_all 模式支持多轮自顶向下解包。
+
+    Args:
+        memory_ids: 指定要撤回的记忆 ID 列表（revert_all=False 时使用）
+        revert_all: 是否一键撤回所有可撤回的活跃事件记忆
+
+    Returns:
+        {
+            "status": "ok",
+            "reverted": 解除合并的事件记忆数,
+            "restored": 最终恢复为活跃的原始记忆数,
+            "skipped": 跳过的记忆数,
+        }
+    """
+    if not revert_all and not memory_ids:
+        return {"status": "ok", "reverted": 0, "restored": 0, "skipped": 0}
+
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            reverted = 0
+            restored_ids = set()
+            reverted_ids = set()
+            skipped_ids = set()
+
+            max_passes = 5 if revert_all else 1
+            for _ in range(max_passes):
+                if revert_all:
+                    rows = await conn.fetch("""
+                        SELECT memory.id, memory.layer, memory.is_active, memory.is_pinned,
+                               memory.merged_from,
+                               (memory.remind_at IS NOT NULL AND memory.reminder_delivered_at IS NULL) AS has_pending_reminder,
+                               memory.superseded_by IS NOT NULL OR EXISTS (
+                                   SELECT 1
+                                   FROM memories AS predecessor
+                                   WHERE predecessor.superseded_by = memory.id
+                               ) AS protected_by_supersession
+                        FROM memories AS memory
+                        WHERE memory.layer = 2
+                          AND memory.is_active = TRUE
+                        ORDER BY memory.id DESC
+                        FOR UPDATE OF memory
+                    """)
+                else:
+                    clean_ids = [
+                        int(mid)
+                        for mid in memory_ids
+                        if isinstance(mid, int) and not isinstance(mid, bool)
+                    ]
+                    if not clean_ids:
+                        break
+                    rows = await conn.fetch("""
+                        SELECT memory.id, memory.layer, memory.is_active, memory.is_pinned,
+                               memory.merged_from,
+                               (memory.remind_at IS NOT NULL AND memory.reminder_delivered_at IS NULL) AS has_pending_reminder,
+                               memory.superseded_by IS NOT NULL OR EXISTS (
+                                   SELECT 1
+                                   FROM memories AS predecessor
+                                   WHERE predecessor.superseded_by = memory.id
+                               ) AS protected_by_supersession
+                        FROM memories AS memory
+                        WHERE memory.id = ANY($1::int[])
+                        ORDER BY memory.id DESC
+                        FOR UPDATE OF memory
+                    """, clean_ids)
+                    found_ids = {int(r["id"]) for r in rows}
+                    for mid in set(clean_ids) - found_ids:
+                        skipped_ids.add(mid)
+
+                reverted_in_pass = 0
+                for row in rows:
+                    mid = int(row["id"])
+                    if mid in skipped_ids or mid in reverted_ids:
+                        continue
+                    if (
+                        row["layer"] != 2
+                        or not row["is_active"]
+                        or row.get("is_pinned") is True
+                        or row.get("has_pending_reminder") is True
+                        or row.get("protected_by_supersession") is True
+                    ):
+                        skipped_ids.add(mid)
+                        continue
+
+                    merged_from = row["merged_from"]
+                    if not merged_from or len(merged_from) == 0:
+                        skipped_ids.add(mid)
+                        continue
+
+                    expected_ids = {int(x) for x in merged_from}
+                    source_rows = await conn.fetch("""
+                        SELECT id
+                        FROM memories
+                        WHERE id = ANY($1::int[])
+                        FOR UPDATE
+                    """, list(expected_ids))
+                    source_ids = {int(s["id"]) for s in source_rows}
+                    if source_ids != expected_ids:
+                        skipped_ids.add(mid)
+                        continue
+
+                    await conn.execute("""
+                        UPDATE memories SET is_active = TRUE
+                        WHERE id = ANY($1::int[])
+                    """, list(expected_ids))
+                    await conn.execute("""
+                        DELETE FROM memories WHERE id = $1
+                    """, mid)
+
+                    reverted += 1
+                    reverted_in_pass += 1
+                    reverted_ids.add(mid)
+                    restored_ids.discard(mid)
+                    restored_ids.update(expected_ids)
+
+                if reverted_in_pass == 0:
+                    break
+
+            return {
+                "status": "ok",
+                "reverted": reverted,
+                "restored": len(restored_ids),
+                "skipped": len(skipped_ids),
+            }
+

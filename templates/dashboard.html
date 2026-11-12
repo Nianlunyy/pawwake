@@ -99,6 +99,7 @@
                         </select>
                         <div class="toolbar-actions">
                             <button class="btn btn-warning" id="consolidateBtn" onclick="openConsolidateModal()">自动整理记忆</button>
+                            <button class="btn btn-secondary" id="revertAllMergesBtn" onclick="revertAllMerges()" title="将所有来源完整的合并事件拆回原始碎片">一键解除合并</button>
                             <label class="checkbox-label">
                                 <input type="checkbox" id="selectAll" onchange="toggleAll()">
                                 <span>全选</span>
@@ -230,6 +231,7 @@
                 <div class="floating-actions" id="activeSelectionActions">
                     <button class="btn btn-primary" onclick="batchSave()">保存选中</button>
                     <button class="btn btn-secondary" onclick="openMergeModal()">合并选中</button>
+                    <button class="btn btn-warning" onclick="batchRevertMerge()">撤回合并</button>
                     <button class="btn btn-danger" onclick="batchDelete()">删除选中</button>
                 </div>
                 <div class="floating-actions" id="archivedSelectionActions" style="display:none;">

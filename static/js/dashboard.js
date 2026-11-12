@@ -134,6 +134,8 @@ function switchMemoryStatus(status) {
         tab.classList.toggle('active', tab.dataset.status === status);
     });
     document.getElementById('consolidateBtn').style.display = status === 'active' ? '' : 'none';
+    const revertAllBtn = document.getElementById('revertAllMergesBtn');
+    if (revertAllBtn) revertAllBtn.style.display = status === 'active' ? '' : 'none';
     document.getElementById('semanticSearchBtn').style.display = status === 'active' ? '' : 'none';
     document.getElementById('coreCandidatesBtn').style.display = status === 'active' ? '' : 'none';
     document.getElementById('cleanupArchivedCard').style.display = status === 'archived' ? '' : 'none';
@@ -821,6 +823,64 @@ async function revertMerge(id) {
             showManageMsg('error', '❌ ' + data.error);
         } else {
             showManageMsg('success', '✅ 已撤回合并，恢复了 ' + data.restored + ' 条碎片');
+            loadMemories();
+        }
+    } catch(e) {
+        showManageMsg('error', '❌ ' + e.message);
+    }
+}
+
+async function batchRevertMerge() {
+    const checked = [...document.querySelectorAll('.mem-check:checked')].map(c => parseInt(c.value));
+    if (checked.length === 0) {
+        showManageMsg('error', '请先勾选要撤回合并的记忆');
+        return;
+    }
+
+    if (!confirm('确定撤回选中的 ' + checked.length + ' 条记忆的合并？\n\n符合条件的事件记忆将恢复其原始碎片并被删除；常驻记忆、非事件层或来源不完整的记忆将被安全跳过。')) {
+        return;
+    }
+
+    try {
+        const resp = await fetch('/api/memories/batch-revert-merge', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ids: checked})
+        });
+        const data = await resp.json();
+        if (data.error) {
+            showManageMsg('error', '❌ ' + data.error);
+        } else {
+            const skippedText = data.skipped > 0 ? '（跳过 ' + data.skipped + ' 条）' : '';
+            showManageMsg('success', '✅ 已解除 ' + data.reverted + ' 条合并，恢复了 ' + data.restored + ' 条碎片' + skippedText);
+            clearSelection();
+            loadMemories();
+        }
+    } catch(e) {
+        showManageMsg('error', '❌ ' + e.message);
+    }
+}
+
+async function revertAllMerges() {
+    const candidates = (allMemories || []).filter(m => m.layer === 2 && m.is_active && m.merged_from && m.merged_from.length > 0 && !m.is_pinned);
+    const countDesc = candidates.length > 0 ? '检测到当前约 ' + candidates.length + ' 条' : '将扫描所有';
+    if (!confirm('确定一键解除所有合并事件？\n\n' + countDesc + '可拆解的活跃事件记忆。\n操作将恢复原始碎片并删除合并后的事件记录；常驻记忆、非事件或来源不完整的记忆将受到保护。\n（如果是多层嵌套合并，系统将自动自顶向下完全解开）')) {
+        return;
+    }
+
+    try {
+        const resp = await fetch('/api/memories/batch-revert-merge', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({all: true})
+        });
+        const data = await resp.json();
+        if (data.error) {
+            showManageMsg('error', '❌ ' + data.error);
+        } else {
+            const skippedText = data.skipped > 0 ? '（跳过 ' + data.skipped + ' 条）' : '';
+            showManageMsg('success', '✅ 一键解除完成：共解除 ' + data.reverted + ' 条合并事件，恢复了 ' + data.restored + ' 条碎片' + skippedText);
+            clearSelection();
             loadMemories();
         }
     } catch(e) {

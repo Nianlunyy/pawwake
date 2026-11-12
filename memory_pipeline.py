@@ -158,7 +158,7 @@ async def build_system_prompt_with_memories(
     due = await _claim_due_reminders()
     due_ids = {mem["id"] for mem in due}
     pinned = _without_ids(await _get_pinned_memories_or_empty(), due_ids)
-    remaining = max(0, shared.MAX_MEMORIES_INJECT - len(pinned))
+    remaining = max(0, shared.MAX_MEMORIES_INJECT)
     searched = _without_ids(
         await _search_memories_or_empty(
             user_message,
@@ -224,7 +224,7 @@ async def build_memory_text(
     due_ids = {mem["id"] for mem in due}
     pinned = _without_ids(await _get_pinned_memories_or_empty(), due_ids)
     pinned_ids = {mem["id"] for mem in pinned}
-    remaining = max(0, shared.MAX_MEMORIES_INJECT - len(pinned))
+    remaining = max(0, shared.MAX_MEMORIES_INJECT)
     try:
         excluded_ids = []
         if session_id and shared.MEMORY_SEEN_TTL_HOURS > 0:
