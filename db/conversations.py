@@ -1,11 +1,14 @@
 """Conversation, partition state, token usage, and conversation exports."""
 
 import json
+import logging
 from datetime import datetime, timedelta, timezone as dt_timezone
 
 import shared
 from db import core as db_core
 from db import search as db_search
+
+logger = logging.getLogger(__name__)
 
 
 async def _park_session_cache_states(conn, session_ids: list):
@@ -339,6 +342,101 @@ async def get_conversation_messages(session_id: str, limit: int = 100):
             LIMIT $2
         """, session_id, limit)
         return [dict(r) for r in rows]
+
+
+async def get_partition_conversation_messages(session_id: str, a_start_round: int = None, limit: int = 10000):
+    """按分区缓存轮次游标读取活跃消息（Zone A + Zone B）。
+
+    若 a_start_round > 0，仅拉取第 a_start_round 轮及之后的消息，
+    并获取第 a_start_round 轮起点之前紧邻的那条消息作为 cutoff 锚点；
+    若 a_start_round <= 0 或查询异常/越界，安全回退到全量查询。
+
+    返回: (rows, cutoff_row, a_start_round, is_sliced)
+    """
+    if a_start_round is None:
+        try:
+            state = await get_session_cache_state(session_id)
+            a_start_round = int(state.get("a_start_round", 0)) if state else 0
+        except Exception:
+            a_start_round = 0
+
+    if a_start_round <= 0:
+        rows = await get_conversation_messages(session_id, limit=limit)
+        return rows, None, 0, False
+
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        try:
+            # 步骤 A：通过窗口函数定位第 a_start_round 轮第一条消息（round_idx 从 0 开始算起）
+            # group_by_rounds 规则：每条 role='user' 开启新一轮（除历史首条若是 user 属于 round 0）
+            boundary_sql = """
+                WITH numbered_msgs AS (
+                    SELECT id, role, created_at,
+                           ROW_NUMBER() OVER (ORDER BY created_at ASC, id ASC) AS rn
+                    FROM conversations
+                    WHERE session_id = $1 AND deleted_at IS NULL
+                ),
+                round_indexed_msgs AS (
+                    SELECT id, role, created_at,
+                           SUM(CASE WHEN role = 'user' AND rn > 1 THEN 1 ELSE 0 END)
+                               OVER (ORDER BY created_at ASC, id ASC) AS round_idx
+                    FROM numbered_msgs
+                )
+                SELECT id, created_at
+                FROM round_indexed_msgs
+                WHERE round_idx = $2
+                ORDER BY created_at ASC, id ASC
+                LIMIT 1
+            """
+            start_row = await conn.fetchrow(boundary_sql, session_id, a_start_round)
+
+            # 若 a_start_round 超出当前实际轮数（如历史被删除或状态异常），安全回退全量
+            if not start_row:
+                rows = await conn.fetch("""
+                    SELECT id, role, content, metadata, created_at
+                    FROM conversations
+                    WHERE session_id = $1 AND deleted_at IS NULL
+                    ORDER BY created_at ASC, id ASC
+                    LIMIT $2
+                """, session_id, limit)
+                return [dict(r) for r in rows], None, 0, False
+
+            start_id = start_row["id"]
+            start_at = start_row["created_at"]
+
+            # 步骤 B：获取第 a_start_round 轮起点之前紧邻的那条消息（真实 cutoff 锚点）
+            cutoff_sql = """
+                SELECT id, role, created_at
+                FROM conversations
+                WHERE session_id = $1 AND deleted_at IS NULL
+                  AND (created_at, id) < ($2::timestamptz, $3::integer)
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+            """
+            cutoff_row = await conn.fetchrow(cutoff_sql, session_id, start_at, start_id)
+
+            # 步骤 C：仅拉取第 a_start_round 轮及之后的消息（Zone A + Zone B）
+            active_sql = """
+                SELECT id, role, content, metadata, created_at
+                FROM conversations
+                WHERE session_id = $1 AND deleted_at IS NULL
+                  AND (created_at, id) >= ($2::timestamptz, $3::integer)
+                ORDER BY created_at ASC, id ASC
+                LIMIT $4
+            """
+            active_rows = await conn.fetch(active_sql, session_id, start_at, start_id, limit)
+            return [dict(r) for r in active_rows], dict(cutoff_row) if cutoff_row else None, a_start_round, True
+
+        except Exception as e:
+            logger.warning("get_partition_conversation_messages 游标截断查询失败，降级全量: %s", e)
+            rows = await conn.fetch("""
+                SELECT id, role, content, metadata, created_at
+                FROM conversations
+                WHERE session_id = $1 AND deleted_at IS NULL
+                ORDER BY created_at ASC, id ASC
+                LIMIT $2
+            """, session_id, limit)
+            return [dict(r) for r in rows], None, 0, False
 
 
 # ============================================================

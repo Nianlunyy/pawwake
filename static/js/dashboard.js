@@ -47,11 +47,9 @@ document.addEventListener('DOMContentLoaded', () => {
     initNavigation();
     // 初始化Tab切换
     initTabs();
-    // 加载记忆数据
+    // 加载记忆数据（单次加载并同步更新管理页与导出页统计，避免首屏重复拉取）
     loadMemories();
     pollBackfillStatus();
-    // 加载导出统计
-    loadExportStats();
 });
 
 // ============================================
@@ -181,6 +179,8 @@ async function loadMemories() {
         allMemories = data.memories || [];
         if (data.layer_stats) updateLayerCounts(data.layer_stats);
         document.getElementById('stats').textContent = '共 ' + allMemories.length + ' 条记忆';
+        const exportEl = document.getElementById('export-stats');
+        if (exportEl) exportEl.textContent = '当前共有 ' + allMemories.length + ' 条记忆';
         filterAndSort();
     } catch(e) {
         showManageMsg('error', '加载失败：' + e.message);
@@ -1492,11 +1492,16 @@ function clearImportResult() {
 // ============================================
 async function loadExportStats() {
     const el = document.getElementById('export-stats');
+    if (!el) return;
+    if (allMemories && allMemories.length > 0) {
+        el.textContent = '当前共有 ' + allMemories.length + ' 条记忆';
+        return;
+    }
     try {
         const resp = await fetch('/api/memories');
         const data = await resp.json();
-        const count = (data.memories || []).length;
-        el.textContent = '当前共有 ' + count + ' 条记忆';
+        allMemories = data.memories || [];
+        el.textContent = '当前共有 ' + allMemories.length + ' 条记忆';
     } catch(e) {
         el.textContent = '无法加载统计';
     }

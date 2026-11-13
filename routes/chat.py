@@ -607,10 +607,33 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
 
         # 从DB读取历史
         try:
-            db_history = await db_conversations.get_conversation_messages(session_id, limit=10000)
+            (
+                db_history,
+                cutoff_row,
+                a_start_round,
+                is_sliced,
+            ) = await db_conversations.get_partition_conversation_messages(session_id, limit=10000)
             db_msgs = []
             recall_history = []
             db_extraction_msgs = []
+
+            if is_sliced and a_start_round > 0:
+                cutoff_id = cutoff_row.get("id") if cutoff_row else None
+                cutoff_at = cutoff_row.get("created_at") if cutoff_row else None
+                padded_virtual_rounds = [
+                    {"role": "user", "content": "", "_virtual": True}
+                ] * (a_start_round - 1) + [
+                    {
+                        "role": "user",
+                        "content": "",
+                        "id": cutoff_id,
+                        "created_at": cutoff_at,
+                        "_virtual": True,
+                    }
+                ]
+                db_msgs.extend(padded_virtual_rounds)
+                recall_history.extend(padded_virtual_rounds)
+
             for m in (db_history or []):
                 msg = db_conversations.db_row_to_message(m)
                 msg['created_at'] = m.get('created_at')  # 保留时间戳供分区时间窗口判断
@@ -684,7 +707,10 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
         # 同步更新tool_messages，避免process_memories_background存重复的旧tool
         tool_messages = [m for m in client_new_msgs if m.get("role") == "tool"]
 
-        print(f"📦 分区模式: DB历史{len(db_msgs)}条 + 客户端消息{len(client_new_msgs)}条")
+        if is_sliced and a_start_round > 0:
+            print(f"📦 分区模式: 游标截断命中 a_start_round={a_start_round}, 仅拉取活跃历史{len(db_history or [])}条(含虚拟轮次共{len(db_msgs)}条) + 客户端消息{len(client_new_msgs)}条")
+        else:
+            print(f"📦 分区模式: DB历史{len(db_msgs)}条 + 客户端消息{len(client_new_msgs)}条")
 
         partition_prompt = resolved_system_prompt
         if shared.memory_injection_enabled():
