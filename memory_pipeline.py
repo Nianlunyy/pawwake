@@ -671,6 +671,11 @@ async def process_memories_background(
             print("⏭️  MEMORY_MODEL 未设置，跳过记忆提取")
             return
 
+        # 3.5 防 re-roll 判定完成后，剥离末尾 [ui-state #N: ...] 并折叠历史/当轮互动源码，避免污染记忆与检索
+        messages_for_extraction = partition_engine.sanitize_messages_for_memory(
+            messages_for_extraction
+        )
+
         # 4. 用同一提取窗口只读检索相关候选与最新活跃记忆。
         candidate_query = _extraction_query_text(messages_for_extraction)
         existing = await db_memories.get_extraction_candidates(candidate_query)

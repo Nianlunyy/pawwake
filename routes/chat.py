@@ -721,8 +721,9 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
         if client_system_text:
             partition_prompt = ((partition_prompt or "") + "\n\n" + client_system_text).strip()
         try:
+            clean_user_query = partition_engine.strip_ui_state_suffix(user_message)
             recall_result = await memory_pipeline.build_conversation_recall_text(
-                user_message,
+                clean_user_query,
                 session_id,
                 recall_history,
             )
@@ -731,7 +732,7 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
 
             async def build_session_memory_text(message: str):
                 return await memory_pipeline.build_memory_text(
-                    message,
+                    partition_engine.strip_ui_state_suffix(message),
                     session_id,
                     pending_memory_ids,
                     pending_reminder_claims,
@@ -765,7 +766,7 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
         if not skip_conversation_log and (resolved_system_prompt or (shared.MEMORY_ENABLED and user_message)):
             if shared.MEMORY_ENABLED and user_message:
                 enhanced_prompt = await memory_pipeline.build_system_prompt_with_memories(
-                    user_message,
+                    partition_engine.strip_ui_state_suffix(user_message),
                     resolved_system_prompt,
                     pending_reminder_claims,
                 )
@@ -783,6 +784,11 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
                     messages.insert(0, {"role": "system", "content": enhanced_prompt})
 
         body["messages"] = messages
+
+    # ---------- 历史互动界面折叠（仅保留最后一张源码原文以保护前缀缓存） ----------
+    body["messages"] = partition_engine.fold_historical_interactive_ui_messages(
+        body.get("messages", [])
+    )
 
     # ---------- cache_control 兼容性处理 ----------
     if shared.CACHE_PARTITION_ENABLED and not partition_engine._is_anthropic_model(model):

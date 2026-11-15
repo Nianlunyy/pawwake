@@ -42,6 +42,193 @@ def _strip_cache_control(messages: list):
         print(f"🔧 兼容性处理: 剥离了 {stripped} 个 cache_control 字段（非 Claude 模型）")
 
 
+# ============================================================
+# 互动界面（cuplivo-ui）源码折叠与状态元数据清洗
+# ============================================================
+
+INTERACTIVE_UI_BLOCK_RE = re.compile(
+    r"```(?:cuplivo-ui|html-preview)(?:[ \t]*\r?\n(?P<code>[\s\S]*?)(?:\r?\n)?[ \t]*```(?=[ \t]*(?:\r?\n|$))|[ \t]+(?P<inline_code>[^\r\n]*?)```)",
+    re.IGNORECASE,
+)
+INTERACTIVE_UI_COMMENT_TITLE_RE = re.compile(r"<!--\s*title\s*:\s*(.+?)\s*-->", re.IGNORECASE)
+INTERACTIVE_UI_TAG_TITLE_RE = re.compile(r"<title[^>]*>([^<]{1,80})</title>", re.IGNORECASE)
+UI_STATE_SUFFIX_RE = re.compile(r"\n*\[ui-state\s+#\d+(?::\s*[\s\S]*?)?\]\s*$")
+
+
+def _match_interactive_code(match) -> str:
+    return match.group("code") or match.group("inline_code") or ""
+
+
+def extract_interactive_ui_title(code: str) -> str:
+    """从互动卡片 HTML 源码中提取标题（优先 <!-- title: xxx -->，其次 <title>）。"""
+    if not code:
+        return "未命名卡片"
+    match = INTERACTIVE_UI_COMMENT_TITLE_RE.search(code) or INTERACTIVE_UI_TAG_TITLE_RE.search(code)
+    if not match:
+        return "未命名卡片"
+    title = re.sub(r"\s+", " ", match.group(1)).strip()
+    return title[:80] if title else "未命名卡片"
+
+
+def _interactive_ui_placeholder(code: str) -> str:
+    title = extract_interactive_ui_title(code)
+    return f"[曾生成互动界面：{title}（源码已折叠）]"
+
+
+def fold_all_interactive_ui_blocks(text: str) -> str:
+    """折叠文本中所有 cuplivo-ui / html-preview 代码块。"""
+    if not text or not isinstance(text, str):
+        return text
+    return INTERACTIVE_UI_BLOCK_RE.sub(
+        lambda m: _interactive_ui_placeholder(_match_interactive_code(m)),
+        text,
+    )
+
+
+def strip_ui_state_suffix(text: str) -> str:
+    """剥离用户消息末尾的 [ui-state #N: ...] 状态元数据。"""
+    if not text or not isinstance(text, str):
+        return text
+    return UI_STATE_SUFFIX_RE.sub("", text)
+
+
+def _transform_message_text_content(content, transform):
+    """对 str 或 OpenAI 多模态 list content 中的 text 块应用文本转换（不就地修改原结构）。"""
+    if isinstance(content, str):
+        updated = transform(content)
+        return updated, updated != content
+    if isinstance(content, list):
+        changed = False
+        new_blocks = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                old_text = block.get("text", "")
+                new_text = transform(old_text)
+                if new_text != old_text:
+                    changed = True
+                    nb = dict(block)
+                    nb["text"] = new_text
+                    new_blocks.append(nb)
+                    continue
+            new_blocks.append(block)
+        return (new_blocks if changed else content), changed
+    return content, False
+
+
+def fold_historical_interactive_ui_messages(messages: list) -> list:
+    """仅保留整段上下文中最后一张互动卡片的完整源码，其余历史卡片统一静态折叠以保护前缀缓存。"""
+    if not messages:
+        return messages
+
+    # 定位最后一个包含互动代码块的位置 (msg_idx, block_idx, match_start)
+    last_location = None
+    for msg_idx, msg in enumerate(messages):
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            matches = list(INTERACTIVE_UI_BLOCK_RE.finditer(content))
+            if matches:
+                last_location = (msg_idx, None, matches[-1].start())
+        elif isinstance(content, list):
+            for block_idx, block in enumerate(content):
+                if isinstance(block, dict) and block.get("type") == "text":
+                    matches = list(INTERACTIVE_UI_BLOCK_RE.finditer(block.get("text", "")))
+                    if matches:
+                        last_location = (msg_idx, block_idx, matches[-1].start())
+
+    if last_location is None:
+        return messages
+
+    result = []
+    for msg_idx, msg in enumerate(messages):
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            result.append(msg)
+            continue
+
+        content = msg.get("content")
+        if isinstance(content, str):
+            def _fold_text(text: str, cur_block_idx=None, cur_msg_idx=msg_idx) -> str:
+                def _repl(m):
+                    if (
+                        last_location[0] == cur_msg_idx
+                        and last_location[1] == cur_block_idx
+                        and m.start() == last_location[2]
+                    ):
+                        return m.group(0)
+                    return _interactive_ui_placeholder(_match_interactive_code(m))
+                return INTERACTIVE_UI_BLOCK_RE.sub(_repl, text)
+
+            new_content = _fold_text(content)
+            if new_content != content:
+                new_msg = dict(msg)
+                new_msg["content"] = new_content
+                result.append(new_msg)
+            else:
+                result.append(msg)
+        elif isinstance(content, list):
+            changed = False
+            new_blocks = []
+            for block_idx, block in enumerate(content):
+                if isinstance(block, dict) and block.get("type") == "text":
+                    old_text = block.get("text", "")
+
+                    def _repl_block(m, cur_block_idx=block_idx, cur_msg_idx=msg_idx):
+                        if (
+                            last_location[0] == cur_msg_idx
+                            and last_location[1] == cur_block_idx
+                            and m.start() == last_location[2]
+                        ):
+                            return m.group(0)
+                        return _interactive_ui_placeholder(_match_interactive_code(m))
+
+                    new_text = INTERACTIVE_UI_BLOCK_RE.sub(_repl_block, old_text)
+                    if new_text != old_text:
+                        changed = True
+                        nb = dict(block)
+                        nb["text"] = new_text
+                        new_blocks.append(nb)
+                        continue
+                new_blocks.append(block)
+            if changed:
+                new_msg = dict(msg)
+                new_msg["content"] = new_blocks
+                result.append(new_msg)
+            else:
+                result.append(msg)
+        else:
+            result.append(msg)
+
+    return result
+
+
+def sanitize_messages_for_memory(messages: list) -> list:
+    """在送入记忆提取或候选检索前，剥离 [ui-state #N] 并折叠所有互动代码块。"""
+    if not messages:
+        return messages
+    sanitized = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            sanitized.append(msg)
+            continue
+        role = msg.get("role")
+        content = msg.get("content", "")
+        if role == "user":
+            new_content, changed = _transform_message_text_content(content, strip_ui_state_suffix)
+        elif role == "assistant":
+            new_content, changed = _transform_message_text_content(content, fold_all_interactive_ui_blocks)
+        else:
+            new_content, changed = content, False
+
+        if changed:
+            new_msg = dict(msg)
+            new_msg["content"] = new_content
+            sanitized.append(new_msg)
+        else:
+            sanitized.append(msg)
+    return sanitized
+
+
 def _assemble_current_user_message(parts: list, raw_content) -> dict:
     """
     组装当前轮 user 消息：注入文本（时间/记忆，parts）+ 客户端原始 content。
@@ -257,6 +444,12 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
         content_text = _message_text(msg).strip()
         if role == "assistant" and not content_text:
             continue
+        if role == "assistant":
+            content_text = fold_all_interactive_ui_blocks(content_text)
+        elif role == "user":
+            content_text = strip_ui_state_suffix(content_text).strip()
+            if not content_text:
+                continue
 
         role_label = "用户" if role == "user" else "AI"
         created_at = msg.get("created_at")
@@ -783,7 +976,7 @@ async def build_partitioned_messages(
     tool_stripped = len(a_msgs) - len(cleaned_a)
     a_info = f"A区{len(cleaned_a)}条({len(a_round_groups)}轮)" + (f"[剥离{tool_stripped}条tool]" if tool_stripped else "")
     print(f"🔒 分区缓存: BP×{bp_count} | 摘要{'有' if summary_parts else '无'}({len(summary_parts)}段/{summary_total}字) | {a_info} | B区{len(b_msgs)}条({b_rounds_count}轮) | 总{len(result)}条messages")
-    return result
+    return fold_historical_interactive_ui_messages(result)
 
 
 async def _build_basic_cached(
@@ -846,4 +1039,4 @@ async def _build_basic_cached(
     summary_total = sum(len(p) for p in summary_parts)
     bp_count = 1 + (1 if summary_parts else 0) + (1 if history else 0)
     print(f"🔒 基础缓存(降级): BP×{bp_count} | 摘要{'有' if summary_parts else '无'}({len(summary_parts)}段/{summary_total}字) | 历史{len(history)}条 | 总{len(result)}条messages")
-    return result
+    return fold_historical_interactive_ui_messages(result)
