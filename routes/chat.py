@@ -160,26 +160,66 @@ async def _settle_reminder_claims(lease_keeper, pending_reminder_claims, deliver
     await _release_reminder_claims(pending_reminder_claims)
 
 
-async def _close_stream_and_release(stream, pending_reminder_claims):
+# =========================================================================
+# 会话级实时聊天占线守卫（后台自主唤醒 100% 让路给主聊天）与顶层环境镜像缓存
+# =========================================================================
+_ACTIVE_CHAT_COUNTS: dict[str, int] = {}
+_LAST_ENVELOPE_HASH: dict[str, str] = {}
+
+
+def is_session_chat_busy(session_id: str) -> bool:
+    if not session_id:
+        return False
+    return _ACTIVE_CHAT_COUNTS.get(session_id, 0) > 0
+
+
+def _acquire_chat_busy(session_id: str, busy_ref: list) -> None:
+    if not session_id or busy_ref[0] is not None:
+        return
+    _ACTIVE_CHAT_COUNTS[session_id] = _ACTIVE_CHAT_COUNTS.get(session_id, 0) + 1
+    busy_ref[0] = session_id
+
+
+def _release_chat_busy(busy_ref: list) -> None:
+    if not busy_ref or busy_ref[0] is None:
+        return
+    sid = busy_ref[0]
+    busy_ref[0] = None
+    remaining = _ACTIVE_CHAT_COUNTS.get(sid, 0) - 1
+    if remaining <= 0:
+        _ACTIVE_CHAT_COUNTS.pop(sid, None)
+    else:
+        _ACTIVE_CHAT_COUNTS[sid] = remaining
+
+
+async def _save_envelope_snapshot_safe(session_id: str, snapshot: dict) -> None:
+    try:
+        await db_conversations.save_session_envelope_snapshot(session_id, snapshot)
+    except Exception as e:
+        logger.debug("Envelope snapshot save skipped: %s", e)
+
+
+async def _close_stream_and_release(stream, pending_reminder_claims, busy_ref=None):
     """响应任务退出后（自然结束、客户端断开、建好响应却没开始消费）显式关掉生成器，
-    让它的 finally 立即运行；生成器未启动或收尾被取消时，这里交回剩余提醒。
+    让它的 finally 立即运行；生成器未启动或收尾被取消时，这里交回剩余提醒并释放占线锁。
     自然结束时两步都是空操作。"""
     try:
         await stream.aclose()
     except Exception as e:
         print(f"⚠️ 关闭流式生成器失败: {e}")
     finally:
+        _release_chat_busy(busy_ref)
         await _release_reminder_claims(pending_reminder_claims)
 
 
-def _streaming_response(stream, pending_reminder_claims) -> StreamingResponse:
+def _streaming_response(stream, pending_reminder_claims, busy_ref=None) -> StreamingResponse:
     """流式响应统一在这里建。Starlette 收到 http.disconnect 只取消发送任务，不会替我们关 body iterator，
     所以挂 BackgroundTask 在响应任务退出后显式 aclose 并交回剩余提醒。"""
     return StreamingResponse(
         stream,
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-        background=BackgroundTask(_close_stream_and_release, stream, pending_reminder_claims),
+        background=BackgroundTask(_close_stream_and_release, stream, pending_reminder_claims, busy_ref),
     )
 
 
@@ -540,6 +580,20 @@ def log_cache_usage(usage: dict, req_id: str = ""):
 
 
 async def _chat_completions_inner(request: Request, pending_reminder_claims: list = None):
+    busy_ref = [None]
+    try:
+        response = await _chat_completions_body(request, pending_reminder_claims, busy_ref)
+        if not isinstance(response, StreamingResponse):
+            _release_chat_busy(busy_ref)
+        return response
+    except Exception:
+        _release_chat_busy(busy_ref)
+        raise
+
+
+async def _chat_completions_body(request: Request, pending_reminder_claims: list = None, busy_ref: list = None):
+    if busy_ref is None:
+        busy_ref = [None]
     body = await request.json()
     req_id = str(body.get("req_id") or request.headers.get("X-Request-ID") or uuid.uuid4().hex[:6])[:6]
     body.pop("req_id", None)
@@ -600,10 +654,12 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
 
     # ---------- 分区缓存模式 ----------
     db_history_count = 0
+    captured_client_system_text = ""
     if shared.CACHE_PARTITION_ENABLED and not skip_conversation_log:
         active_sid = shared.get_active_session_id()
         if active_sid:
             session_id = active_sid
+        _acquire_chat_busy(session_id, busy_ref)
 
         # 从DB读取历史
         try:
@@ -637,6 +693,12 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
             for m in (db_history or []):
                 msg = db_conversations.db_row_to_message(m)
                 msg['created_at'] = m.get('created_at')  # 保留时间戳供分区时间窗口判断
+                if m.get('message_type') and m.get('message_type') != 'normal':
+                    msg['message_type'] = m.get('message_type')
+                if m.get('proactive_meta') is not None:
+                    msg['proactive_meta'] = m.get('proactive_meta')
+                if m.get('skip_memory_extract'):
+                    msg['skip_memory_extract'] = True
                 db_msgs.append(msg)
                 recall_history.append({**msg, "id": m.get("id")})
                 db_extraction_msgs.append({**msg, "_source_message_id": m.get("id")})
@@ -718,6 +780,7 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
         # 保留客户端自带的 system（工具说明等），拼接到网关 prompt 之后，
         # 与非分区路径的行为对齐（前端 system 稳定时不影响 BP1 缓存命中）
         client_system_text = partition_engine._extract_client_system_text(messages)
+        captured_client_system_text = client_system_text
         if client_system_text:
             partition_prompt = ((partition_prompt or "") + "\n\n" + client_system_text).strip()
         try:
@@ -885,6 +948,24 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
     # [Gemini/Vertex AI 专用] 工具返回缓冲防 429 END
     # =========================================================================
 
+    # 保存顶层环境镜像快照（供后台自主唤醒复用与主聊天完全一致的 client_sys + tools，死守 BP1 前缀缓存）
+    if shared.CACHE_PARTITION_ENABLED and shared.DATABASE_ENABLED and not skip_conversation_log:
+        try:
+            snapshot_obj = {
+                "client_system_text": captured_client_system_text,
+                "tools": body.get("tools") or [],
+                "thinking_level": effective_effort or "",
+                "model": model,
+            }
+            snap_hash = hashlib.sha256(
+                json.dumps(snapshot_obj, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            ).hexdigest()[:16]
+            if _LAST_ENVELOPE_HASH.get(session_id) != snap_hash:
+                _LAST_ENVELOPE_HASH[session_id] = snap_hash
+                asyncio.create_task(_save_envelope_snapshot_safe(session_id, snapshot_obj))
+        except Exception as e:
+            logger.debug("Envelope snapshot prep skipped: %s", e)
+
     # 前缀诊断日志（仅主聊天请求，不改变任何行为，严格异常拦截）
     try:
         diagnose_cache_prefix(
@@ -912,8 +993,9 @@ async def _chat_completions_inner(request: Request, pending_reminder_claims: lis
             pending_memory_ids,
             pending_reminder_claims,
             req_id=req_id,
+            busy_ref=busy_ref,
         )
-        return _streaming_response(stream, pending_reminder_claims)
+        return _streaming_response(stream, pending_reminder_claims, busy_ref)
     else:
         # 非流式发送期间延长提醒处理时限；退出时标记送达或交回等待重试
         delivered_ok = False
@@ -1069,6 +1151,7 @@ async def stream_and_capture(
     pending_memory_ids: list = None,
     pending_reminder_claims: list = None,
     req_id: str = "",
+    busy_ref: list = None,
 ):
     """流式发送期间延长提醒处理时限；结束时标记送达或交回等待重试。"""
     rid = req_id or (str(body.get("req_id") or "") if isinstance(body, dict) else "")
@@ -1095,6 +1178,7 @@ async def stream_and_capture(
         ):
             yield chunk
     finally:
+        _release_chat_busy(busy_ref)
         try:
             if not stream_state.get("completed"):
                 elapsed = time.monotonic() - req_start_time

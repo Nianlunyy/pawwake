@@ -639,7 +639,21 @@ async def process_memories_background(
         if shared.MEMORY_EXTRACT_INTERVAL > 1:
             print(f"📝 {round_scope} 第 {current_round_count} 轮，执行记忆提取")
 
-        # 3. 按逻辑轮截取近期上下文，而非发送完整会话。
+        if not memory_extractor.MEMORY_MODEL:
+            print("⏭️  MEMORY_MODEL 未设置，跳过记忆提取")
+            return
+
+        # 3. 收集尚未提取的挂账主动消息（如 proactive_chat），等用户回复凑成完整问答轮后再一并提取
+        pending_proactive_messages = []
+        if shared.CACHE_PARTITION_ENABLED and shared.DATABASE_ENABLED:
+            try:
+                pending_proactive_messages = await db_conversations.get_pending_proactive_for_extraction(
+                    session_id
+                )
+            except Exception as e:
+                print(f"⚠️ 读取挂账主动消息失败，跳过合并提取: {e}")
+
+        # 3.2 按逻辑轮截取近期上下文，而非发送完整会话。
         if context_messages:
             messages_for_extraction, selected_round_count = (
                 partition_engine._build_memory_extraction_messages(
@@ -647,6 +661,7 @@ async def process_memories_background(
                     assistant_msg,
                     shared.MEMORY_EXTRACT_INTERVAL,
                     assistant_source_id=assistant_source_id,
+                    pending_proactive_messages=pending_proactive_messages,
                 )
             )
             print(
@@ -667,10 +682,6 @@ async def process_memories_background(
                 },
             ]
 
-        if not memory_extractor.MEMORY_MODEL:
-            print("⏭️  MEMORY_MODEL 未设置，跳过记忆提取")
-            return
-
         # 3.5 防 re-roll 判定完成后，剥离末尾 [ui-state #N: ...] 并折叠历史/当轮互动源码，避免污染记忆与检索
         messages_for_extraction = partition_engine.sanitize_messages_for_memory(
             messages_for_extraction
@@ -685,6 +696,19 @@ async def process_memories_background(
             messages_for_extraction,
             existing_memories=existing,
         )
+
+        # 只要本次提取调用正常返回，就把本轮囊括的挂账主动消息标为已提取，防止下次重复抽取
+        if pending_proactive_messages:
+            pending_ids = [
+                m["id"]
+                for m in pending_proactive_messages
+                if isinstance(m.get("id"), int) and not isinstance(m.get("id"), bool)
+            ]
+            if pending_ids:
+                try:
+                    await db_conversations.mark_proactive_extracted(pending_ids)
+                except Exception as e:
+                    print(f"⚠️ 标记挂账主动消息已提取失败: {e}")
 
         # 过滤垃圾记忆（不靠模型自觉，硬过滤）
         META_BLACKLIST = [

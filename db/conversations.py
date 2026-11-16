@@ -90,23 +90,53 @@ async def _invalidate_deleted_cache_states(conn, session_ids: list, clear_active
 # 对话记录操作
 # ============================================================
 
-async def save_message(session_id: str, role: str, content: str, model: str = "", metadata: str = None):
+async def save_message(
+    session_id: str,
+    role: str,
+    content: str,
+    model: str = "",
+    metadata: str = None,
+    *,
+    message_type: str = "normal",
+    proactive_meta: dict | str | None = None,
+    skip_memory_extract: bool = False,
+    memory_extracted: bool = False,
+):
     tsv_text = (
         db_search.jieba_tokenize_for_tsv(content or "")
         if shared.CONVERSATION_RECALL_ENABLED
         else None
     )
+    msg_type = (message_type or "normal").strip() or "normal"
+    if msg_type == "proactive_event":
+        skip_memory_extract = True
+    meta_json = (
+        json.dumps(proactive_meta, ensure_ascii=False)
+        if isinstance(proactive_meta, dict)
+        else proactive_meta
+    )
     pool = await db_core.get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """INSERT INTO conversations (
-                   session_id, role, content, model, metadata, content_tsv
+                   session_id, role, content, model, metadata, content_tsv,
+                   message_type, proactive_meta, skip_memory_extract, memory_extracted
                ) VALUES (
                    $1, $2, $3, $4, $5,
-                   array_to_tsvector(string_to_array($6, ' '))
+                   array_to_tsvector(string_to_array($6, ' ')),
+                   $7, $8::jsonb, $9, $10
                )
                RETURNING id""",
-            session_id, role, content, model, metadata, tsv_text,
+            session_id,
+            role,
+            content,
+            model,
+            metadata,
+            tsv_text,
+            msg_type,
+            meta_json,
+            bool(skip_memory_extract),
+            bool(memory_extracted),
         )
     message_id = row["id"] if row else None
     if (
@@ -127,23 +157,24 @@ async def get_last_user_content(session_id: str) -> str:
         row = await conn.fetchrow("""
             SELECT content FROM conversations
             WHERE session_id = $1 AND role = 'user' AND deleted_at IS NULL
-            ORDER BY created_at DESC
+            ORDER BY created_at DESC, id DESC
             LIMIT 1
         """, session_id)
         return row['content'] if row else ""
 
 
 async def update_last_assistant_message(session_id: str, new_content: str, model: str = ""):
-    """覆盖指定session最后一条assistant消息的content（用于re-roll去重）"""
+    """覆盖指定session最后一条常规assistant消息的content（用于re-roll去重，绝不误覆主动唤醒消息）"""
     pool = await db_core.get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
-            SELECT id FROM conversations
-            WHERE session_id = $1 AND role = 'assistant' AND deleted_at IS NULL
-            ORDER BY created_at DESC
+            SELECT id, role, COALESCE(message_type, 'normal') AS message_type
+            FROM conversations
+            WHERE session_id = $1 AND deleted_at IS NULL
+            ORDER BY created_at DESC, id DESC
             LIMIT 1
         """, session_id)
-        if row:
+        if row and row["role"] == "assistant" and row["message_type"] == "normal":
             embedding_column = "embedding" if db_core.HAS_PGVECTOR else "embedding_json"
             tsv_text = (
                 db_search.jieba_tokenize_for_tsv(new_content or "")
@@ -335,7 +366,11 @@ async def get_conversation_messages(session_id: str, limit: int = 100):
     pool = await db_core.get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT id, role, content, metadata, created_at
+            SELECT id, role, content, metadata, created_at,
+                   COALESCE(message_type, 'normal') AS message_type,
+                   proactive_meta,
+                   COALESCE(skip_memory_extract, FALSE) AS skip_memory_extract,
+                   COALESCE(memory_extracted, FALSE) AS memory_extracted
             FROM conversations
             WHERE session_id = $1 AND deleted_at IS NULL
             ORDER BY created_at ASC, id ASC
@@ -393,7 +428,11 @@ async def get_partition_conversation_messages(session_id: str, a_start_round: in
             # 若 a_start_round 超出当前实际轮数（如历史被删除或状态异常），安全回退全量
             if not start_row:
                 rows = await conn.fetch("""
-                    SELECT id, role, content, metadata, created_at
+                    SELECT id, role, content, metadata, created_at,
+                           COALESCE(message_type, 'normal') AS message_type,
+                           proactive_meta,
+                           COALESCE(skip_memory_extract, FALSE) AS skip_memory_extract,
+                           COALESCE(memory_extracted, FALSE) AS memory_extracted
                     FROM conversations
                     WHERE session_id = $1 AND deleted_at IS NULL
                     ORDER BY created_at ASC, id ASC
@@ -417,7 +456,11 @@ async def get_partition_conversation_messages(session_id: str, a_start_round: in
 
             # 步骤 C：仅拉取第 a_start_round 轮及之后的消息（Zone A + Zone B）
             active_sql = """
-                SELECT id, role, content, metadata, created_at
+                SELECT id, role, content, metadata, created_at,
+                       COALESCE(message_type, 'normal') AS message_type,
+                       proactive_meta,
+                       COALESCE(skip_memory_extract, FALSE) AS skip_memory_extract,
+                       COALESCE(memory_extracted, FALSE) AS memory_extracted
                 FROM conversations
                 WHERE session_id = $1 AND deleted_at IS NULL
                   AND (created_at, id) >= ($2::timestamptz, $3::integer)
@@ -430,7 +473,11 @@ async def get_partition_conversation_messages(session_id: str, a_start_round: in
         except Exception as e:
             logger.warning("get_partition_conversation_messages 游标截断查询失败，降级全量: %s", e)
             rows = await conn.fetch("""
-                SELECT id, role, content, metadata, created_at
+                SELECT id, role, content, metadata, created_at,
+                       COALESCE(message_type, 'normal') AS message_type,
+                       proactive_meta,
+                       COALESCE(skip_memory_extract, FALSE) AS skip_memory_extract,
+                       COALESCE(memory_extracted, FALSE) AS memory_extracted
                 FROM conversations
                 WHERE session_id = $1 AND deleted_at IS NULL
                 ORDER BY created_at ASC, id ASC
@@ -1156,3 +1203,230 @@ async def import_conversations(records: list):
         ):
             db_search.kick_embedding_backfill()
         return imported, skipped
+
+
+# ============================================================
+# 自主唤醒（Autonomous Heartbeat）持久化支持
+# ============================================================
+
+def _decode_json_field(val):
+    if val is None:
+        return None
+    if isinstance(val, (dict, list)):
+        return val
+    if isinstance(val, str):
+        try:
+            return json.loads(val)
+        except (json.JSONDecodeError, ValueError):
+            return None
+    return None
+
+
+async def save_session_envelope_snapshot(session_id: str, snapshot: dict):
+    """持久化主聊天顶层环境镜像（client_system_text / tools / thinking_level / model）。"""
+    if not session_id or not isinstance(snapshot, dict):
+        return
+    snapshot_json = json.dumps(snapshot, ensure_ascii=False)
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO session_cache_state (session_id, envelope_snapshot, updated_at)
+               VALUES ($1, $2::jsonb, NOW())
+               ON CONFLICT (session_id)
+               DO UPDATE SET envelope_snapshot = $2::jsonb, updated_at = NOW()""",
+            session_id,
+            snapshot_json,
+        )
+
+
+async def get_session_envelope_snapshot(session_id: str) -> dict | None:
+    if not session_id:
+        return None
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        val = await conn.fetchval(
+            "SELECT envelope_snapshot FROM session_cache_state WHERE session_id = $1",
+            session_id,
+        )
+    decoded = _decode_json_field(val)
+    return decoded if isinstance(decoded, dict) else None
+
+
+async def get_latest_message_meta(session_id: str) -> dict | None:
+    if not session_id:
+        return None
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT id, role, COALESCE(message_type, 'normal') AS message_type, created_at
+               FROM conversations
+               WHERE session_id = $1 AND deleted_at IS NULL
+               ORDER BY created_at DESC, id DESC
+               LIMIT 1""",
+            session_id,
+        )
+    return dict(row) if row else None
+
+
+async def get_most_recent_active_session_id() -> str:
+    """获取最近一条非删除消息所属的唯一活跃会话 ID。"""
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        sid = await conn.fetchval(
+            """SELECT session_id
+               FROM conversations
+               WHERE deleted_at IS NULL
+               ORDER BY created_at DESC, id DESC
+               LIMIT 1"""
+        )
+        if sid:
+            return sid
+        sid = await conn.fetchval(
+            """SELECT session_id
+               FROM session_cache_state
+               ORDER BY updated_at DESC
+               LIMIT 1"""
+        )
+        return sid or ""
+
+
+async def get_heartbeat_session_stats(session_id: str) -> dict:
+    """汇总门卫判定所需的未读计数、最新消息游标与上次互动上下文。"""
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        latest = await conn.fetchrow(
+            """SELECT id, role, COALESCE(message_type, 'normal') AS message_type, created_at
+               FROM conversations
+               WHERE session_id = $1 AND deleted_at IS NULL
+               ORDER BY created_at DESC, id DESC
+               LIMIT 1""",
+            session_id,
+        )
+        last_user = await conn.fetchrow(
+            """SELECT id, content, created_at
+               FROM conversations
+               WHERE session_id = $1 AND deleted_at IS NULL
+                 AND role = 'user' AND COALESCE(message_type, 'normal') = 'normal'
+               ORDER BY created_at DESC, id DESC
+               LIMIT 1""",
+            session_id,
+        )
+        last_normal_at = await conn.fetchval(
+            """SELECT MAX(created_at)
+               FROM conversations
+               WHERE session_id = $1 AND deleted_at IS NULL
+                 AND COALESCE(message_type, 'normal') = 'normal'""",
+            session_id,
+        )
+        if last_user:
+            unread_row = await conn.fetchrow(
+                """SELECT
+                       COUNT(*) FILTER (WHERE COALESCE(message_type, 'normal') = 'proactive_chat') AS unread_chat,
+                       COUNT(*) FILTER (WHERE COALESCE(message_type, 'normal') = 'proactive_event') AS unread_event,
+                       MAX(created_at) FILTER (WHERE COALESCE(message_type, 'normal') = 'proactive_chat') AS last_proactive_chat_at
+                   FROM conversations
+                   WHERE session_id = $1 AND deleted_at IS NULL
+                     AND role = 'assistant'
+                     AND (created_at, id) > ($2::timestamptz, $3::integer)""",
+                session_id,
+                last_user["created_at"],
+                last_user["id"],
+            )
+        else:
+            unread_row = await conn.fetchrow(
+                """SELECT
+                       COUNT(*) FILTER (WHERE COALESCE(message_type, 'normal') = 'proactive_chat') AS unread_chat,
+                       COUNT(*) FILTER (WHERE COALESCE(message_type, 'normal') = 'proactive_event') AS unread_event,
+                       MAX(created_at) FILTER (WHERE COALESCE(message_type, 'normal') = 'proactive_chat') AS last_proactive_chat_at
+                   FROM conversations
+                   WHERE session_id = $1 AND deleted_at IS NULL
+                     AND role = 'assistant'""",
+                session_id,
+            )
+
+    return {
+        "latest_id": latest["id"] if latest else None,
+        "latest_role": latest["role"] if latest else None,
+        "latest_message_type": latest["message_type"] if latest else None,
+        "latest_created_at": latest["created_at"] if latest else None,
+        "last_user_id": last_user["id"] if last_user else None,
+        "last_user_content": (last_user["content"] or "") if last_user else "",
+        "last_user_at": last_user["created_at"] if last_user else None,
+        "last_normal_at": last_normal_at,
+        "unread_proactive_chat": int(unread_row["unread_chat"] or 0) if unread_row else 0,
+        "unread_proactive_event": int(unread_row["unread_event"] or 0) if unread_row else 0,
+        "last_proactive_chat_at": unread_row["last_proactive_chat_at"] if unread_row else None,
+    }
+
+
+async def get_proactive_messages_since(session_id: str, after_id: int = 0, limit: int = 50) -> list[dict]:
+    """按自增 ID 正向拉取增量自主唤醒消息，供 Cuplivo 增量同步。"""
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, session_id, role, content, model, metadata,
+                      COALESCE(message_type, 'normal') AS message_type,
+                      proactive_meta, created_at
+               FROM conversations
+               WHERE session_id = $1
+                 AND deleted_at IS NULL
+                 AND id > $2
+                 AND COALESCE(message_type, 'normal') IN ('proactive_chat', 'proactive_event')
+               ORDER BY id ASC
+               LIMIT $3""",
+            session_id,
+            max(0, int(after_id)),
+            max(1, min(200, int(limit))),
+        )
+    results = []
+    for r in rows:
+        meta = _decode_json_field(r.get("metadata"))
+        reasoning = meta.get("reasoning_content") if isinstance(meta, dict) else None
+        p_meta = _decode_json_field(r.get("proactive_meta"))
+        results.append({
+            "id": r["id"],
+            "session_id": r["session_id"],
+            "role": r["role"],
+            "content": r["content"] or "",
+            "reasoning": reasoning or "",
+            "model": r["model"] or "",
+            "message_type": r["message_type"],
+            "proactive_meta": p_meta,
+            "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
+        })
+    return results
+
+
+async def get_pending_proactive_for_extraction(session_id: str, limit: int = 10) -> list[dict]:
+    """读取尚未完成挂账记忆提取的 proactive_chat 消息。"""
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, role, content, created_at
+               FROM conversations
+               WHERE session_id = $1
+                 AND deleted_at IS NULL
+                 AND COALESCE(message_type, 'normal') = 'proactive_chat'
+                 AND COALESCE(skip_memory_extract, FALSE) = FALSE
+                 AND COALESCE(memory_extracted, FALSE) = FALSE
+               ORDER BY id ASC
+               LIMIT $2""",
+            session_id,
+            max(1, min(50, int(limit))),
+        )
+    return [dict(r) for r in rows]
+
+
+async def mark_proactive_extracted(message_ids: list[int]) -> int:
+    ids = sorted({int(mid) for mid in (message_ids or []) if isinstance(mid, int) and not isinstance(mid, bool)})
+    if not ids:
+        return 0
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """UPDATE conversations
+               SET memory_extracted = TRUE
+               WHERE id = ANY($1::int[])""",
+            ids,
+        )
+    return int(result.split()[-1]) if result else 0

@@ -163,6 +163,24 @@ RERANK_API_KEY = os.getenv("RERANK_API_KEY", "").strip()
 # 非分区模式没有稳定 session 历史，保留进程内提取计数。
 _nonpartition_round_counter = 0
 
+# 自主唤醒（Autonomous Heartbeat）配置
+HEARTBEAT_ENABLED = DATABASE_ENABLED and os.getenv("HEARTBEAT_ENABLED", "false").lower() == "true"
+HEARTBEAT_SESSION_ID = os.getenv("HEARTBEAT_SESSION_ID", "")
+HEARTBEAT_QUIET_START = os.getenv("HEARTBEAT_QUIET_START", "23:30")
+HEARTBEAT_QUIET_END = os.getenv("HEARTBEAT_QUIET_END", "08:00")
+HEARTBEAT_MAX_UNREAD = max(1, int(os.getenv("HEARTBEAT_MAX_UNREAD", "5")))
+HEARTBEAT_BASE_COOLDOWN_MINUTES = max(1, int(os.getenv("HEARTBEAT_BASE_COOLDOWN_MINUTES", "45")))
+HEARTBEAT_WEATHER_CITY = os.getenv("HEARTBEAT_WEATHER_CITY", "南京")
+HEARTBEAT_WEATHER_LAT = float(os.getenv("HEARTBEAT_WEATHER_LAT", "32.0603"))
+HEARTBEAT_WEATHER_LON = float(os.getenv("HEARTBEAT_WEATHER_LON", "118.7969"))
+HEARTBEAT_SURF_DAILY_LIMIT = max(0, int(os.getenv("HEARTBEAT_SURF_DAILY_LIMIT", "2")))
+HEARTBEAT_SURF_MAX_STEPS = max(2, int(os.getenv("HEARTBEAT_SURF_MAX_STEPS", "5")))
+
+
+def resolve_heartbeat_session_id() -> str:
+    """解析自主唤醒锁定的唯一主会话 ID（优先显式配置，否则沿用活跃分区会话）。"""
+    return (HEARTBEAT_SESSION_ID or "").strip() or get_active_session_id()
+
 # 强制流式传输（部分客户端不发stream=true导致thinking数据丢失，开启后强制所有请求走流式）
 FORCE_STREAM = os.getenv("FORCE_STREAM", "false").lower() == "true"
 
@@ -217,10 +235,20 @@ SETTINGS_TYPES = {
     "RERANK_MODEL": lambda value: str(value).strip(),
     "RERANK_BASE_URL": lambda value: str(value).strip(),
     "RERANK_API_KEY": lambda value: str(value).strip(),
+    "HEARTBEAT_ENABLED": lambda value: _parse_bool(value),
+    "HEARTBEAT_SESSION_ID": lambda value: str(value).strip(),
+    "HEARTBEAT_QUIET_START": lambda value: str(value).strip() or "23:30",
+    "HEARTBEAT_QUIET_END": lambda value: str(value).strip() or "08:00",
+    "HEARTBEAT_MAX_UNREAD": lambda value: max(1, min(20, int(value))),
+    "HEARTBEAT_BASE_COOLDOWN_MINUTES": lambda value: max(1, min(1440, int(value))),
+    "HEARTBEAT_WEATHER_CITY": lambda value: str(value).strip(),
+    "HEARTBEAT_SURF_DAILY_LIMIT": lambda value: max(0, min(10, int(value))),
+    "HEARTBEAT_SURF_MAX_STEPS": lambda value: max(2, min(10, int(value))),
 }
 SETTINGS_ALLOW_EMPTY = {
     "CACHE_SUMMARY_MODEL", "DEFAULT_MODEL", "MEMORY_API_KEY", "MEMORY_PHRASES",
     "RERANK_MODEL", "RERANK_BASE_URL", "RERANK_API_KEY",
+    "HEARTBEAT_SESSION_ID", "HEARTBEAT_WEATHER_CITY",
 }
 
 

@@ -198,6 +198,34 @@ async def init_tables():
             ON conversations USING GIN (content_tsv);
         """)
 
+        # 自主唤醒（Autonomous Heartbeat）消息形态与挂账记忆提取扩展列（一次性设计到位）
+        await conn.execute("""
+            ALTER TABLE conversations
+            ADD COLUMN IF NOT EXISTS message_type TEXT NOT NULL DEFAULT 'normal';
+        """)
+        await conn.execute("""
+            ALTER TABLE conversations
+            ADD COLUMN IF NOT EXISTS proactive_meta JSONB DEFAULT NULL;
+        """)
+        await conn.execute("""
+            ALTER TABLE conversations
+            ADD COLUMN IF NOT EXISTS skip_memory_extract BOOLEAN NOT NULL DEFAULT FALSE;
+        """)
+        await conn.execute("""
+            ALTER TABLE conversations
+            ADD COLUMN IF NOT EXISTS memory_extracted BOOLEAN NOT NULL DEFAULT FALSE;
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_conversations_session_id_asc
+            ON conversations (session_id, id ASC)
+            WHERE deleted_at IS NULL;
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_conversations_proactive_pending_extract
+            ON conversations (session_id, id ASC)
+            WHERE deleted_at IS NULL AND message_type = 'proactive_chat' AND memory_extracted = FALSE;
+        """)
+
         # 网关配置表（存储运行时可变配置）
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS gateway_config (
@@ -251,6 +279,60 @@ async def init_tables():
         await conn.execute("""
             ALTER TABLE session_cache_state
             ADD COLUMN IF NOT EXISTS deleted_cache_valid BOOLEAN;
+        """)
+        # 顶层环境镜像快照（供后台唤醒复用主聊天前缀缓存）及 Phase 3 每日冲浪配额
+        await conn.execute("""
+            ALTER TABLE session_cache_state
+            ADD COLUMN IF NOT EXISTS envelope_snapshot JSONB DEFAULT NULL;
+        """)
+        await conn.execute("""
+            ALTER TABLE session_cache_state
+            ADD COLUMN IF NOT EXISTS daily_surf_date DATE DEFAULT NULL;
+        """)
+        await conn.execute("""
+            ALTER TABLE session_cache_state
+            ADD COLUMN IF NOT EXISTS daily_surf_count INTEGER NOT NULL DEFAULT 0;
+        """)
+
+        # 自定唤醒闹钟表（Phase 2 启用，一次性建表避免后续改表）
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS wake_alarms (
+                id                  SERIAL PRIMARY KEY,
+                session_id          TEXT NOT NULL,
+                alarm_type          TEXT NOT NULL DEFAULT 'short_thought',
+                due_at              TIMESTAMPTZ NOT NULL,
+                reason              TEXT NOT NULL,
+                status              TEXT NOT NULL DEFAULT 'pending',
+                source_message_id   INTEGER REFERENCES conversations(id) ON DELETE SET NULL,
+                consumed_message_id INTEGER REFERENCES conversations(id) ON DELETE SET NULL,
+                claimed_at          TIMESTAMPTZ DEFAULT NULL,
+                expires_at          TIMESTAMPTZ DEFAULT NULL,
+                created_at          TIMESTAMPTZ DEFAULT NOW(),
+                updated_at          TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_wake_alarms_due
+            ON wake_alarms (session_id, due_at ASC)
+            WHERE status = 'pending';
+        """)
+
+        # 96 小时反刍翻篇闸主题表（Phase 3 启用，一次性建表）
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS proactive_topics (
+                id              SERIAL PRIMARY KEY,
+                session_id      TEXT NOT NULL,
+                topic_key       TEXT NOT NULL,
+                topic_summary   TEXT NOT NULL DEFAULT '',
+                hit_count       INTEGER NOT NULL DEFAULT 1,
+                first_seen_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_seen_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                cooldown_until  TIMESTAMPTZ DEFAULT NULL
+            );
+        """)
+        await conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_proactive_topics_session_key
+            ON proactive_topics (session_id, topic_key);
         """)
         await conn.execute("""
             UPDATE session_cache_state AS scs

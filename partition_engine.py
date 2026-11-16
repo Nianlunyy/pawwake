@@ -437,9 +437,9 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
     warning_logged = False
 
     for msg in messages:
-        # 跳过 tool 消息和内容为空的 assistant
+        # 跳过 tool 消息、跳过标记不提取的独处胶囊、以及内容为空的 assistant
         role = msg.get("role")
-        if role == "tool":
+        if role == "tool" or msg.get("skip_memory_extract"):
             continue
         content_text = _message_text(msg).strip()
         if role == "assistant" and not content_text:
@@ -451,7 +451,12 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
             if not content_text:
                 continue
 
-        role_label = "用户" if role == "user" else "AI"
+        if role == "user":
+            role_label = "用户"
+        elif msg.get("message_type") == "proactive_chat":
+            role_label = "AI(主动微信)"
+        else:
+            role_label = "AI"
         created_at = msg.get("created_at")
         dt_local = _parse_message_local_time(created_at)
 
@@ -695,14 +700,16 @@ def _build_memory_extraction_messages(
     assistant_msg: str,
     interval: int,
     assistant_source_id: int = None,
+    pending_proactive_messages: list = None,
 ) -> tuple[list, int]:
-    """按逻辑轮截取近期上下文，并附上本轮最终 assistant 回复。"""
+    """按逻辑轮截取近期上下文，并附上挂账主动搭话与本轮最终 assistant 回复。"""
     non_system = [
         msg for msg in (context_messages or [])
-        if msg.get("role") != "system"
+        if msg.get("role") != "system" and not msg.get("skip_memory_extract")
     ]
     recent_rounds = group_by_rounds(non_system)[-max(1, interval):]
     messages = []
+    included_source_ids = set()
     for round_messages in recent_rounds:
         for msg in round_messages:
             if msg.get("role") not in {"user", "assistant"}:
@@ -711,7 +718,25 @@ def _build_memory_extraction_messages(
             source_id = msg.get("_source_message_id")
             if isinstance(source_id, int) and not isinstance(source_id, bool):
                 item["_source_message_id"] = source_id
+                included_source_ids.add(source_id)
             messages.append(item)
+
+    # 将窗口前挂账的未提取 proactive_chat 按时间顺序前置拼入，凑成完整问答轮
+    pending_items = []
+    for p_msg in (pending_proactive_messages or []):
+        pid = p_msg.get("id")
+        if isinstance(pid, int) and not isinstance(pid, bool) and pid in included_source_ids:
+            continue
+        text = (p_msg.get("content") or "").strip()
+        if not text:
+            continue
+        item = {"role": p_msg.get("role") or "assistant", "content": text}
+        if isinstance(pid, int) and not isinstance(pid, bool):
+            item["_source_message_id"] = pid
+        pending_items.append(item)
+    if pending_items:
+        messages = pending_items + messages
+
     assistant = {"role": "assistant", "content": assistant_msg}
     if isinstance(assistant_source_id, int) and not isinstance(assistant_source_id, bool):
         assistant["_source_message_id"] = assistant_source_id
@@ -779,6 +804,166 @@ def _apply_breakpoint(msg: dict) -> bool:
     return False
 
 
+_INTERNAL_MSG_KEYS = {
+    "created_at",
+    "message_type",
+    "proactive_meta",
+    "skip_memory_extract",
+    "memory_extracted",
+    "id",
+    "_virtual",
+    "_source_message_id",
+}
+_WEEKDAY_SHORT = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+_MAX_HISTORY_PROACTIVE_EVENTS = 2
+
+
+def _strip_internal_fields(msg: dict, drop_tool_calls: bool = False) -> dict:
+    """剥离仅用于网关内部分区/唤醒判断的元数据，避免污染上游请求体。"""
+    drop_keys = _INTERNAL_MSG_KEYS | ({"tool_calls"} if drop_tool_calls else set())
+    return {k: v for k, v in msg.items() if k not in drop_keys}
+
+
+def _proactive_history_prefix(msg: dict) -> str:
+    """按消息落库时的 created_at 生成确定性绝对场景头（绝不使用动态相对时间）。"""
+    msg_type = msg.get("message_type") or "normal"
+    dt_local = _parse_message_local_time(msg.get("created_at"))
+    time_label = (
+        f"{_WEEKDAY_SHORT[dt_local.weekday()]} {dt_local.strftime('%H:%M')} "
+        if dt_local is not None
+        else ""
+    )
+    if msg_type == "proactive_chat":
+        return f"[{time_label}隔着手机屏幕给阿狸留的简短微信（仅因她不在身边才简写；当阿狸回复后即恢复平时的完整互动与神态描写）]"
+    if msg_type == "proactive_event":
+        return f"[{time_label}你独自一人时的状态随记（未发给阿狸，仅作心底刚发生过的小事，除非话头聊到否则绝不主动提起）]"
+    return ""
+
+
+def _prefix_message_text(content, prefix: str):
+    if not prefix:
+        return content
+    if isinstance(content, str):
+        return f"{prefix}\n{content}" if content else prefix
+    if isinstance(content, list):
+        blocks = [dict(b) if isinstance(b, dict) else b for b in content]
+        for b in blocks:
+            if isinstance(b, dict) and b.get("type") == "text":
+                old_t = b.get("text", "")
+                b["text"] = f"{prefix}\n{old_t}" if old_t else prefix
+                return blocks
+        blocks.insert(0, {"type": "text", "text": prefix})
+        return blocks
+    return content
+
+
+def _merge_content_pair(first_content, second_content):
+    """合并相邻同角色消息内容，并保留末段块上的 cache_control。"""
+    if isinstance(first_content, str) and isinstance(second_content, str):
+        if not first_content:
+            return second_content
+        if not second_content:
+            return first_content
+        return f"{first_content}\n\n{second_content}"
+
+    def _to_blocks(c):
+        if isinstance(c, list):
+            return [dict(b) if isinstance(b, dict) else {"type": "text", "text": str(b)} for b in c]
+        if isinstance(c, str) and c:
+            return [{"type": "text", "text": c}]
+        return []
+
+    b1 = _to_blocks(first_content)
+    b2 = _to_blocks(second_content)
+    if not b1:
+        return second_content
+    if not b2:
+        return first_content
+    # 若第一段尾部带有 cache_control 而合并后第二段在末尾，去掉中间断点以免浪费数量配额
+    for b in b1:
+        if isinstance(b, dict):
+            b.pop("cache_control", None)
+    return b1 + b2
+
+
+def merge_consecutive_assistant_messages(messages: list) -> list:
+    """合并连续 assistant 消息，防止 Gemini/Claude 因角色未交替返回 400。"""
+    merged = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            merged.append(msg)
+            continue
+        prev = merged[-1] if merged else None
+        if (
+            prev is not None
+            and prev.get("role") == "assistant"
+            and msg.get("role") == "assistant"
+            and not prev.get("tool_calls")
+        ):
+            combined = dict(prev)
+            combined["content"] = _merge_content_pair(prev.get("content"), msg.get("content"))
+            if msg.get("tool_calls"):
+                combined["tool_calls"] = msg["tool_calls"]
+            r1 = prev.get("reasoning_content") or ""
+            r2 = msg.get("reasoning_content") or ""
+            if r1 or r2:
+                combined["reasoning_content"] = f"{r1}\n\n{r2}".strip() if (r1 and r2) else (r1 or r2)
+            merged[-1] = combined
+        else:
+            merged.append(msg)
+    return merged
+
+
+def _prepare_zone_messages(msgs: list, *, drop_tool_calls: bool = False, drop_empty_assistant: bool = False) -> list:
+    """清洗分区内消息：限定最近少量 proactive_event、加绝对场景头、剥离内部字段、合并连续 assistant。"""
+    event_indices = [
+        idx for idx, m in enumerate(msgs)
+        if isinstance(m, dict) and m.get("message_type") == "proactive_event"
+    ]
+    kept_event_indices = set(event_indices[-_MAX_HISTORY_PROACTIVE_EVENTS:])
+
+    cleaned = []
+    for idx, msg in enumerate(msgs):
+        if drop_tool_calls and msg.get("role") == "tool":
+            continue
+        msg_type = msg.get("message_type") or "normal"
+        if msg_type == "proactive_event" and idx not in kept_event_indices:
+            continue
+        m = _strip_internal_fields(msg, drop_tool_calls=drop_tool_calls)
+        if drop_empty_assistant and m.get("role") == "assistant":
+            c = m.get("content")
+            is_empty = (not c or not str(c).strip()) if isinstance(c, str) else (not c)
+            if is_empty and not m.get("tool_calls"):
+                continue
+        prefix = _proactive_history_prefix(msg)
+        if prefix:
+            m["content"] = _prefix_message_text(m.get("content", ""), prefix)
+        cleaned.append(m)
+
+    return merge_consecutive_assistant_messages(cleaned)
+
+
+def _append_tail_user_message(result: list, tail_msg: dict):
+    """追加末尾用户消息；若前一条已是 user（如待回复的末句），合并块以保证角色严格交替。"""
+    if result and result[-1].get("role") == "user" and tail_msg.get("role") == "user":
+        prev = dict(result[-1])
+        prev_content = prev.get("content")
+        tail_content = tail_msg.get("content", "")
+        if isinstance(prev_content, list):
+            if isinstance(tail_content, list):
+                prev["content"] = prev_content + tail_content
+            else:
+                prev["content"] = prev_content + [{"type": "text", "text": str(tail_content)}]
+        elif isinstance(tail_content, list):
+            blocks = [{"type": "text", "text": str(prev_content)}] if prev_content else []
+            prev["content"] = blocks + tail_content
+        else:
+            prev["content"] = _merge_content_pair(prev_content or "", str(tail_content))
+        result[-1] = prev
+    else:
+        result.append(tail_msg)
+
+
 async def build_partitioned_messages(
     session_id: str,
     all_messages: list,
@@ -786,6 +971,9 @@ async def build_partitioned_messages(
     user_message: str,
     conversation_recall_text: str = "",
     memory_text_builder=None,
+    *,
+    allow_rotation: bool = True,
+    temporary_tail_message: dict = None,
 ) -> list:
     """
     分区缓存模式：构建带breakpoint的messages数组。
@@ -797,7 +985,7 @@ async def build_partitioned_messages(
       [摘要assistant]
       [A区消息... 最后一条BP2]                    ← 正常轮次不变
       [B区消息... 最后一条BP3]                    ← lookback命中
-      [当前user: 时间+记忆+消息]                  ← 不缓存
+      [当前user: 时间+记忆+消息 或 唤醒临时纸条]  ← 不缓存
     """
     X = shared.CACHE_PARTITION_X
 
@@ -805,7 +993,7 @@ async def build_partitioned_messages(
 
     current_user_msg = None
     history = non_system[:]
-    if history and history[-1].get('role') == 'user':
+    if temporary_tail_message is None and history and history[-1].get('role') == 'user':
         current_user_msg = history.pop()
 
     # 防止DB里的重复tool消息导致消息乱序
@@ -828,6 +1016,7 @@ async def build_partitioned_messages(
             summary_parts,
             conversation_recall_text,
             memory_text_builder,
+            temporary_tail_message=temporary_tail_message,
         )
 
     # 计算A/B区（按逻辑轮切片）
@@ -861,7 +1050,8 @@ async def build_partitioned_messages(
     # 把正在进行中（尤其是等待工具结果）的当前轮次误划进A区，被剥离tool_calls/tool内容。
     MIN_B_ROUNDS_FLOOR = 1
     while (
-        _should_rotate(b_rounds_count, X, a_msgs)
+        allow_rotation
+        and _should_rotate(b_rounds_count, X, a_msgs)
         and rotation_count < max_rotations
         and (total_rounds - (a_start_round + X)) >= MIN_B_ROUNDS_FLOOR
     ):
@@ -926,15 +1116,8 @@ async def build_partitioned_messages(
         result.append({"role": "user", "content": blocks})
         result.append({"role": "assistant", "content": "好的，我已了解之前的对话内容。"})
 
-    # A区：剥离tool消息和tool_calls，只保留有文本的user/assistant（节省上下文）
-    cleaned_a = []
-    for msg in a_msgs:
-        if msg.get('role') == 'tool':
-            continue
-        m = {k: v for k, v in msg.items() if k not in ('created_at', 'tool_calls')}
-        if m.get('role') == 'assistant' and not (m.get('content') or '').strip():
-            continue
-        cleaned_a.append(m)
+    # A区：剥离tool消息和tool_calls，合并连续assistant后打BP
+    cleaned_a = _prepare_zone_messages(a_msgs, drop_tool_calls=True, drop_empty_assistant=True)
 
     # A区：从末尾往前找第一条非tool消息打BP
     for j in range(len(cleaned_a) - 1, -1, -1):
@@ -944,8 +1127,8 @@ async def build_partitioned_messages(
     for m in cleaned_a:
         result.append(m)
 
-    # B区：先构建去掉created_at的副本，再从末尾往前打BP
-    b_cleaned = [{k: v for k, v in msg.items() if k not in ('created_at',)} for msg in b_msgs]
+    # B区：合并连续assistant与剥离内部字段，再从末尾往前打BP
+    b_cleaned = _prepare_zone_messages(b_msgs, drop_tool_calls=False, drop_empty_assistant=False)
 
     for j in range(len(b_cleaned) - 1, -1, -1):
         if b_cleaned[j].get('role') != 'tool' and _apply_breakpoint(b_cleaned[j]):
@@ -954,7 +1137,12 @@ async def build_partitioned_messages(
     for m in b_cleaned:
         result.append(m)
 
-    if current_user_msg:
+    # 跨区边界（如摘要assistant后紧接首条历史assistant）再兜底合并一次
+    result = merge_consecutive_assistant_messages(result)
+
+    if temporary_tail_message is not None:
+        _append_tail_user_message(result, dict(temporary_tail_message))
+    elif current_user_msg:
         parts = [build_time_injection()]
 
         if (
@@ -987,6 +1175,8 @@ async def _build_basic_cached(
     summary_parts: list = None,
     conversation_recall_text: str = "",
     memory_text_builder=None,
+    *,
+    temporary_tail_message: dict = None,
 ) -> list:
     """基础版prompt caching（历史不够分区时的降级模式）"""
     summary_parts = summary_parts or []
@@ -1009,7 +1199,7 @@ async def _build_basic_cached(
         result.append({"role": "user", "content": blocks})
         result.append({"role": "assistant", "content": "好的，我已了解之前的对话内容。"})
 
-    h_cleaned = [{k: v for k, v in msg.items() if k not in ('created_at',)} for msg in history]
+    h_cleaned = _prepare_zone_messages(history, drop_tool_calls=False, drop_empty_assistant=False)
 
     # 从末尾往前找第一条非tool消息打BP
     for j in range(len(h_cleaned) - 1, -1, -1):
@@ -1019,7 +1209,11 @@ async def _build_basic_cached(
     for m in h_cleaned:
         result.append(m)
 
-    if current_user_msg:
+    result = merge_consecutive_assistant_messages(result)
+
+    if temporary_tail_message is not None:
+        _append_tail_user_message(result, dict(temporary_tail_message))
+    elif current_user_msg:
         parts = [build_time_injection()]
 
         if (
