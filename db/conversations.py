@@ -1323,7 +1323,8 @@ async def get_heartbeat_session_stats(session_id: str) -> dict:
                 """SELECT
                        COUNT(*) FILTER (WHERE COALESCE(message_type, 'normal') = 'proactive_chat') AS unread_chat,
                        COUNT(*) FILTER (WHERE COALESCE(message_type, 'normal') = 'proactive_event') AS unread_event,
-                       MAX(created_at) FILTER (WHERE COALESCE(message_type, 'normal') = 'proactive_chat') AS last_proactive_chat_at
+                       MAX(created_at) FILTER (WHERE COALESCE(message_type, 'normal') = 'proactive_chat') AS last_proactive_chat_at,
+                       MAX(created_at) FILTER (WHERE COALESCE(message_type, 'normal') = 'proactive_event') AS last_proactive_event_at
                    FROM conversations
                    WHERE session_id = $1 AND deleted_at IS NULL
                      AND role = 'assistant'
@@ -1337,12 +1338,22 @@ async def get_heartbeat_session_stats(session_id: str) -> dict:
                 """SELECT
                        COUNT(*) FILTER (WHERE COALESCE(message_type, 'normal') = 'proactive_chat') AS unread_chat,
                        COUNT(*) FILTER (WHERE COALESCE(message_type, 'normal') = 'proactive_event') AS unread_event,
-                       MAX(created_at) FILTER (WHERE COALESCE(message_type, 'normal') = 'proactive_chat') AS last_proactive_chat_at
+                       MAX(created_at) FILTER (WHERE COALESCE(message_type, 'normal') = 'proactive_chat') AS last_proactive_chat_at,
+                       MAX(created_at) FILTER (WHERE COALESCE(message_type, 'normal') = 'proactive_event') AS last_proactive_event_at
                    FROM conversations
                    WHERE session_id = $1 AND deleted_at IS NULL
                      AND role = 'assistant'""",
                 session_id,
             )
+
+        alarm_row = await conn.fetchrow(
+            """SELECT id, session_id, alarm_type, due_at, reason, status, source_message_id, created_at
+               FROM wake_alarms
+               WHERE session_id = $1 AND status = 'pending'
+               ORDER BY due_at ASC, id DESC
+               LIMIT 1""",
+            session_id,
+        )
 
     return {
         "latest_id": latest["id"] if latest else None,
@@ -1356,7 +1367,95 @@ async def get_heartbeat_session_stats(session_id: str) -> dict:
         "unread_proactive_chat": int(unread_row["unread_chat"] or 0) if unread_row else 0,
         "unread_proactive_event": int(unread_row["unread_event"] or 0) if unread_row else 0,
         "last_proactive_chat_at": unread_row["last_proactive_chat_at"] if unread_row else None,
+        "last_proactive_event_at": unread_row["last_proactive_event_at"] if unread_row else None,
+        "pending_alarm": dict(alarm_row) if alarm_row else None,
     }
+
+
+async def upsert_wake_alarm(
+    session_id: str,
+    minutes: int,
+    reason: str,
+    *,
+    alarm_type: str = "short_thought",
+    source_message_id: int | None = None,
+    now_utc: datetime | None = None,
+) -> dict | None:
+    """写入或覆写当前会话的隐式自定义短闹钟（minutes 限幅 [12, 720]）。"""
+    if not session_id:
+        return None
+    clamped_minutes = max(12, min(720, int(minutes)))
+    now_ts = now_utc or datetime.now(dt_timezone.utc)
+    if now_ts.tzinfo is None:
+        now_ts = now_ts.replace(tzinfo=dt_timezone.utc)
+    due_at = now_ts + timedelta(minutes=clamped_minutes)
+    clean_reason = (reason or "").strip()[:500] or "按约定再来看看你"
+
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                """UPDATE wake_alarms
+                   SET status = 'superseded', updated_at = NOW()
+                   WHERE session_id = $1 AND status = 'pending'""",
+                session_id,
+            )
+            row = await conn.fetchrow(
+                """INSERT INTO wake_alarms (
+                       session_id, alarm_type, due_at, reason, status,
+                       source_message_id, created_at, updated_at
+                   ) VALUES ($1, $2, $3, $4, 'pending', $5, $6, $6)
+                   RETURNING id, session_id, alarm_type, due_at, reason, status, source_message_id, created_at""",
+                session_id,
+                alarm_type,
+                due_at,
+                clean_reason,
+                source_message_id,
+                now_ts,
+            )
+    return dict(row) if row else None
+
+
+async def get_pending_wake_alarm(session_id: str) -> dict | None:
+    """只读获取会话中待触发的最新闹钟。"""
+    if not session_id:
+        return None
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT id, session_id, alarm_type, due_at, reason, status, source_message_id, created_at
+               FROM wake_alarms
+               WHERE session_id = $1 AND status = 'pending'
+               ORDER BY due_at ASC, id DESC
+               LIMIT 1""",
+            session_id,
+        )
+    return dict(row) if row else None
+
+
+async def consume_wake_alarm(
+    alarm_id: int,
+    consumed_message_id: int | None = None,
+    *,
+    status: str = "consumed",
+) -> bool:
+    """单次消费并清空已触发的自定闹钟。"""
+    if not alarm_id:
+        return False
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        res = await conn.execute(
+            """UPDATE wake_alarms
+               SET status = $2,
+                   consumed_message_id = COALESCE($3, consumed_message_id),
+                   claimed_at = COALESCE(claimed_at, NOW()),
+                   updated_at = NOW()
+               WHERE id = $1 AND status = 'pending'""",
+            int(alarm_id),
+            status,
+            consumed_message_id,
+        )
+    return str(res).endswith("1")
 
 
 async def get_proactive_messages_since(session_id: str, after_id: int = 0, limit: int = 50) -> list[dict]:

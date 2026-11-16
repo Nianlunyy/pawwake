@@ -951,12 +951,18 @@ async def _chat_completions_body(request: Request, pending_reminder_claims: list
     # 保存顶层环境镜像快照（供后台自主唤醒复用与主聊天完全一致的 client_sys + tools，死守 BP1 前缀缓存）
     if shared.CACHE_PARTITION_ENABLED and shared.DATABASE_ENABLED and not skip_conversation_log:
         try:
+            cuplivo_origin = str(request.headers.get("X-Cuplivo-Origin") or "").strip().rstrip("/")
+            if cuplivo_origin:
+                shared.CUPLIVO_ORIGIN = cuplivo_origin
+            effective_origin = cuplivo_origin or shared.CUPLIVO_ORIGIN
             snapshot_obj = {
                 "client_system_text": captured_client_system_text,
                 "tools": body.get("tools") or [],
                 "thinking_level": effective_effort or "",
                 "model": model,
             }
+            if effective_origin:
+                snapshot_obj["tool_executor_origin"] = effective_origin
             snap_hash = hashlib.sha256(
                 json.dumps(snapshot_obj, sort_keys=True, ensure_ascii=False).encode("utf-8")
             ).hexdigest()[:16]
@@ -1017,9 +1023,16 @@ async def _chat_completions_body(request: Request, pending_reminder_claims: list
                     assistant_msg = ""
                     assistant_tool_calls = None
                     assistant_reasoning = None
+                    parsed_wake_alarm = None
                     try:
                         msg_obj = resp_data["choices"][0]["message"]
-                        assistant_msg = msg_obj.get("content") or ""
+                        raw_assistant_msg = msg_obj.get("content") or ""
+                        if "<next_wake" in raw_assistant_msg.lower():
+                            import heartbeat_service as _hb_service
+                            assistant_msg, parsed_wake_alarm = _hb_service.parse_and_strip_next_wake(raw_assistant_msg)
+                            msg_obj["content"] = assistant_msg
+                        else:
+                            assistant_msg = raw_assistant_msg
                         if msg_obj.get("tool_calls"):
                             assistant_tool_calls = msg_obj["tool_calls"]
                             print(f"🔧 Response 包含 {len(assistant_tool_calls)} 个工具调用")
@@ -1039,7 +1052,8 @@ async def _chat_completions_body(request: Request, pending_reminder_claims: list
                                                         context_round_count=extraction_round_count,
                                                         skip_conversation_log=skip_conversation_log,
                                                         tool_messages=tool_messages, assistant_tool_calls=assistant_tool_calls,
-                                                        assistant_reasoning=assistant_reasoning)
+                                                        assistant_reasoning=assistant_reasoning,
+                                                        wake_alarm_spec=parsed_wake_alarm)
                         )
 
                     return JSONResponse(status_code=200, content=resp_data)

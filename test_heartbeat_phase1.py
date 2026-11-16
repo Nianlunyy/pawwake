@@ -240,10 +240,10 @@ class HeartbeatPhase1Tests(unittest.TestCase):
                 self.assertEqual(sent_body["tools"], snapshot["tools"])
                 self.assertIn("前端MCP工具说明", json.dumps(sent_body["messages"][0], ensure_ascii=False))
 
-            # 场景 B：模型意外吐出 tool_calls -> 按 silent 熔断不落库
+            # 场景 B：模型持续吐出 tool_calls 直到步数熔断且无有效正文 -> 按 silent 熔断不落库
             async def fake_post_tools(client, url, api_key, body):
                 return FakeResponse(200, {
-                    "choices": [{"message": {"content": "", "tool_calls": [{"id": "c1", "function": {"name": "search_web"}}]}}],
+                    "choices": [{"message": {"content": "", "tool_calls": [{"id": "c1", "function": {"name": "search_web", "arguments": "{\"query\":\"cat\"}"}}]}}],
                 })
 
             with patch.object(shared, "DATABASE_ENABLED", True), \
@@ -256,12 +256,14 @@ class HeartbeatPhase1Tests(unittest.TestCase):
                  patch.object(db_conversations, "get_session_envelope_snapshot", new=AsyncMock(return_value=snapshot)), \
                  patch.object(db_conversations, "get_partition_conversation_messages", new=AsyncMock(return_value=(db_rows, None, 0, False))), \
                  patch.object(db_conversations, "get_session_cache_state", new=AsyncMock(return_value={"summary_parts": [], "a_start_round": 0})), \
+                 patch.object(db_conversations, "get_latest_message_meta", new=AsyncMock(return_value={"id": 88})), \
                  patch.object(heartbeat_service, "fetch_local_weather", new=AsyncMock(return_value="")), \
+                 patch.object(heartbeat_service, "execute_background_tool_call", new=AsyncMock(return_value="{\"items\": []}")), \
                  patch.object(shared, "post_chat_completion", side_effect=fake_post_tools), \
                  patch.object(db_conversations, "save_message", new=AsyncMock()) as mock_save_2:
                 res_tc = await heartbeat_service.run_heartbeat_tick(now_utc=now, jitter_fn=lambda: 1.0)
                 self.assertEqual(res_tc["status"], "silent")
-                self.assertEqual(res_tc["reason"], "unexpected_tool_calls")
+                self.assertEqual(res_tc["reason"], "tool_circuit_breaker")
                 mock_save_2.assert_not_awaited()
 
             # 场景 C：生成期间用户发了新消息（latest_id 变更）-> 乐观锁丢弃

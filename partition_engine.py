@@ -836,7 +836,17 @@ def _proactive_history_prefix(msg: dict) -> str:
     if msg_type == "proactive_chat":
         return f"[{time_label}隔着手机屏幕给阿狸留的简短微信（仅因她不在身边才简写；当阿狸回复后即恢复平时的完整互动与神态描写）]"
     if msg_type == "proactive_event":
-        return f"[{time_label}你独自一人时的状态随记（未发给阿狸，仅作心底刚发生过的小事，除非话头聊到否则绝不主动提起）]"
+        event_title = ""
+        p_meta = msg.get("proactive_meta")
+        if isinstance(p_meta, str):
+            try:
+                p_meta = json.loads(p_meta)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                p_meta = None
+        if isinstance(p_meta, dict):
+            event_title = str(p_meta.get("event_title") or "").strip()
+        title_part = f"《{event_title}》" if event_title else ""
+        return f"[{time_label}你独自一人时的后台手账{title_part}（未发给阿狸，仅作心底刚发生过的小事与探索留痕，除非话头聊到否则绝不主动提起）]"
     return ""
 
 

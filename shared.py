@@ -175,6 +175,7 @@ HEARTBEAT_WEATHER_LAT = float(os.getenv("HEARTBEAT_WEATHER_LAT", "32.0603"))
 HEARTBEAT_WEATHER_LON = float(os.getenv("HEARTBEAT_WEATHER_LON", "118.7969"))
 HEARTBEAT_SURF_DAILY_LIMIT = max(0, int(os.getenv("HEARTBEAT_SURF_DAILY_LIMIT", "2")))
 HEARTBEAT_SURF_MAX_STEPS = max(2, int(os.getenv("HEARTBEAT_SURF_MAX_STEPS", "5")))
+CUPLIVO_ORIGIN = os.getenv("CUPLIVO_ORIGIN", "").strip().rstrip("/")
 
 
 def resolve_heartbeat_session_id() -> str:

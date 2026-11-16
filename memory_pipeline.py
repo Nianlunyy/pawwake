@@ -490,6 +490,7 @@ async def process_memories_background(
     tool_messages: list = None,
     assistant_tool_calls: list = None,
     assistant_reasoning: str = None,
+    wake_alarm_spec: dict = None,
 ):
     """
     后台异步：存储对话 + 提取记忆（不阻塞主流程）
@@ -512,6 +513,13 @@ async def process_memories_background(
     try:
         user_source_id = None
         assistant_source_id = None
+
+        # 二阶段隐式闹钟协议：正常对话结尾若出现 <next_wake ... />，落库和记忆提取前干净剥离
+        parsed_wake_alarm = None
+        if assistant_msg and "<next_wake" in assistant_msg.lower():
+            import heartbeat_service as _hb_service
+            assistant_msg, parsed_wake_alarm = _hb_service.parse_and_strip_next_wake(assistant_msg)
+        effective_wake_alarm = wake_alarm_spec or parsed_wake_alarm
 
         def mark_latest_context_source(role, source_id):
             if not isinstance(source_id, int) or isinstance(source_id, bool):
@@ -599,6 +607,17 @@ async def process_memories_background(
                     )
 
         mark_latest_context_source("user", user_source_id)
+
+        if effective_wake_alarm and not skip_conversation_log and shared.DATABASE_ENABLED:
+            try:
+                await db_conversations.upsert_wake_alarm(
+                    session_id,
+                    effective_wake_alarm["minutes"],
+                    effective_wake_alarm["reason"],
+                    source_message_id=assistant_source_id,
+                )
+            except Exception as alarm_err:
+                print(f"⚠️  保存自定闹钟失败: {alarm_err}")
 
         # 2. 检查是否需要提取记忆
         if not shared.MEMORY_ENABLED:
