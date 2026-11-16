@@ -106,7 +106,7 @@ def _parse_hhmm(text: str, fallback: tuple[int, int]) -> int:
 
 def is_quiet_hours(now_local: datetime, start_str: str, end_str: str) -> bool:
     """判断当前本地时间是否处于夜间静默时段（支持跨午夜）。"""
-    start_min = _parse_hhmm(start_str, (23, 30))
+    start_min = _parse_hhmm(start_str, (0, 0))
     end_min = _parse_hhmm(end_str, (8, 0))
     if start_min == end_min:
         return False

@@ -50,6 +50,12 @@ class HeartbeatPhase1Tests(unittest.TestCase):
         self.assertFalse(
             heartbeat_service.is_quiet_hours(datetime(2026, 11, 17, 8, 1, tzinfo=tz_utc8), "23:30", "08:00")
         )
+        self.assertTrue(
+            heartbeat_service.is_quiet_hours(datetime(2026, 11, 17, 0, 5, tzinfo=tz_utc8), "00:00", "08:00")
+        )
+        self.assertFalse(
+            heartbeat_service.is_quiet_hours(datetime(2026, 11, 16, 23, 50, tzinfo=tz_utc8), "00:00", "08:00")
+        )
         self.assertEqual(heartbeat_service.classify_user_context_multiplier("晚安啦我睡了")[0], 2.2)
         self.assertEqual(heartbeat_service.classify_user_context_multiplier("你吃了吗？")[0], 0.75)
         self.assertEqual(heartbeat_service.unread_backoff_multiplier(0), 1.0)

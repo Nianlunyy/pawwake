@@ -166,7 +166,7 @@ _nonpartition_round_counter = 0
 # 自主唤醒（Autonomous Heartbeat）配置
 HEARTBEAT_ENABLED = DATABASE_ENABLED and os.getenv("HEARTBEAT_ENABLED", "false").lower() == "true"
 HEARTBEAT_SESSION_ID = os.getenv("HEARTBEAT_SESSION_ID", "")
-HEARTBEAT_QUIET_START = os.getenv("HEARTBEAT_QUIET_START", "23:30")
+HEARTBEAT_QUIET_START = os.getenv("HEARTBEAT_QUIET_START", "00:00")
 HEARTBEAT_QUIET_END = os.getenv("HEARTBEAT_QUIET_END", "08:00")
 HEARTBEAT_MAX_UNREAD = max(1, int(os.getenv("HEARTBEAT_MAX_UNREAD", "5")))
 HEARTBEAT_BASE_COOLDOWN_MINUTES = max(1, int(os.getenv("HEARTBEAT_BASE_COOLDOWN_MINUTES", "45")))
@@ -237,7 +237,7 @@ SETTINGS_TYPES = {
     "RERANK_API_KEY": lambda value: str(value).strip(),
     "HEARTBEAT_ENABLED": lambda value: _parse_bool(value),
     "HEARTBEAT_SESSION_ID": lambda value: str(value).strip(),
-    "HEARTBEAT_QUIET_START": lambda value: str(value).strip() or "23:30",
+    "HEARTBEAT_QUIET_START": lambda value: str(value).strip() or "00:00",
     "HEARTBEAT_QUIET_END": lambda value: str(value).strip() or "08:00",
     "HEARTBEAT_MAX_UNREAD": lambda value: max(1, min(20, int(value))),
     "HEARTBEAT_BASE_COOLDOWN_MINUTES": lambda value: max(1, min(1440, int(value))),
