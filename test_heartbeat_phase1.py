@@ -330,19 +330,34 @@ class HeartbeatPhase1Tests(unittest.TestCase):
         self.assertIn("记得带伞呀", contents)
         self.assertNotIn("看天快下雨了", contents)
 
-    def test_heartbeat_routes(self):
+    def test_heartbeat_routes_and_background_dispatch(self):
+        self.assertLess(heartbeat_service.HEARTBEAT_UPSTREAM_TIMEOUT, 100.0)
+
         async def run_routes():
-            with patch.object(heartbeat_service, "run_heartbeat_tick", new=AsyncMock(return_value={"status": "silent"})), \
+            with patch.object(heartbeat_service, "run_heartbeat_tick", new=AsyncMock(return_value={"status": "silent"})) as mock_run, \
                  patch.object(heartbeat_service, "resolve_target_session_id", new=AsyncMock(return_value="s-main")), \
                  patch.object(db_conversations, "get_proactive_messages_since", new=AsyncMock(return_value=[{"id": 42, "content": "想你了"}])):
                 r_tick = await heartbeat_routes.api_heartbeat_tick()
                 self.assertTrue(r_tick["ok"])
                 self.assertEqual(r_tick["status"], "silent")
+                mock_run.assert_awaited_once()
 
                 r_sync = await heartbeat_routes.api_proactive_messages(after_id=40)
                 self.assertEqual(r_sync["session_id"], "s-main")
                 self.assertEqual(r_sync["latest_id"], 42)
                 self.assertEqual(len(r_sync["messages"]), 1)
+
+            # background=True 放行后立刻返回 accepted 并转后台任务
+            with patch.object(shared, "DATABASE_ENABLED", True), \
+                 patch.object(shared, "HEARTBEAT_ENABLED", True), \
+                 patch.object(heartbeat_service, "resolve_target_session_id", new=AsyncMock(return_value="s-main")), \
+                 patch.object(heartbeat_service, "evaluate_heartbeat_gate", new=AsyncMock(return_value={"allowed": True, "status": "allowed"})), \
+                 patch.object(heartbeat_service, "run_heartbeat_tick", new=AsyncMock(return_value={"status": "delivered"})) as mock_bg_run:
+                r_bg = await heartbeat_routes.api_heartbeat_tick(background=True)
+                self.assertTrue(r_bg["ok"])
+                self.assertEqual(r_bg["status"], "accepted")
+                await asyncio.sleep(0)
+                mock_bg_run.assert_awaited_once()
 
         asyncio.run(run_routes())
 

@@ -11,6 +11,7 @@ Provides:
 import asyncio
 import json
 import logging
+import os
 import random
 import re
 import time
@@ -26,6 +27,12 @@ from routes import chat as chat_routes
 logger = logging.getLogger(__name__)
 
 _active_heartbeat_lock = asyncio.Lock()
+_active_background_tasks: set[asyncio.Task] = set()
+
+# 同步等待上限严格卡在 75s，远离 Cloudflare/Render 100s HTTP 超时线；
+# 后台异步模式（Worker Cron 使用 ?background=1）响应已在 <100ms 提前返回，允许更充裕的思考时间。
+HEARTBEAT_UPSTREAM_TIMEOUT = float(os.getenv("HEARTBEAT_UPSTREAM_TIMEOUT", "75.0"))
+HEARTBEAT_BACKGROUND_TIMEOUT = float(os.getenv("HEARTBEAT_BACKGROUND_TIMEOUT", "150.0"))
 
 _WEATHER_CACHE: dict = {"text": "", "fetched_at": 0.0, "key": ""}
 _WEATHER_TTL_SECONDS = 30 * 60
@@ -388,178 +395,235 @@ async def run_heartbeat_tick(
     *,
     now_utc: datetime | None = None,
     jitter_fn=None,
+    timeout_seconds: float | None = None,
 ) -> dict:
     """执行一次完整的自主唤醒周期（含防重入锁、零成本门卫、缓存复用、乐观锁落库）。"""
     if _active_heartbeat_lock.locked():
         return {"status": "skipped_reentrant"}
 
+    effective_timeout = float(timeout_seconds or HEARTBEAT_UPSTREAM_TIMEOUT)
     async with _active_heartbeat_lock:
-        if not shared.DATABASE_ENABLED:
-            return {"status": "skipped_db_disabled"}
-        if not shared.HEARTBEAT_ENABLED:
-            return {"status": "skipped_disabled"}
-
-        session_id = await resolve_target_session_id()
-        gate = await evaluate_heartbeat_gate(session_id, now_utc=now_utc, jitter_fn=jitter_fn)
-        if not gate.get("allowed"):
-            return {"status": gate["status"], "session_id": session_id}
-
-        stats = gate["stats"]
-        baseline_msg_id = stats.get("latest_id")
-        now_local = gate["now_local"]
-        weather_text = await fetch_local_weather()
-        tail_note = build_heartbeat_tail_note(
-            now_local,
-            gate.get("interaction_gap_minutes", gate["elapsed_minutes"]),
-            weather_text=weather_text,
-            unread_count=gate["unread_proactive_chat"],
+        return await _run_heartbeat_tick_locked(
+            now_utc=now_utc,
+            jitter_fn=jitter_fn,
+            timeout_seconds=effective_timeout,
         )
 
-        envelope = await db_conversations.get_session_envelope_snapshot(session_id) or {}
-        model = envelope.get("model") or shared.DEFAULT_MODEL
-        if not model:
-            return {"status": "skipped_no_model", "session_id": session_id}
 
-        resolved_system_prompt = await shared.get_system_prompt()
-        partition_prompt = resolved_system_prompt
-        if shared.memory_injection_enabled():
-            partition_prompt = (resolved_system_prompt or "") + partition_engine.MEMORY_USAGE_GUIDE
-        client_system_text = (envelope.get("client_system_text") or "").strip()
-        if client_system_text:
-            partition_prompt = ((partition_prompt or "") + "\n\n" + client_system_text).strip()
+async def dispatch_heartbeat_tick(
+    *,
+    background: bool = False,
+    now_utc: datetime | None = None,
+    jitter_fn=None,
+) -> dict:
+    """Cron 调度入口：background=True 时门卫放行后即刻响应 200 并转后台生成，彻底规避 100s 超时。"""
+    if not background:
+        return await run_heartbeat_tick(now_utc=now_utc, jitter_fn=jitter_fn)
 
-        db_msgs = await _load_partition_history_for_heartbeat(session_id)
-        if shared.CACHE_PARTITION_ENABLED:
-            built_messages = await partition_engine.build_partitioned_messages(
-                session_id,
-                db_msgs,
-                partition_prompt,
-                "",
-                allow_rotation=False,
-                temporary_tail_message={"role": "user", "content": tail_note},
-            )
-        else:
-            built_messages = []
-            if partition_prompt:
-                built_messages.append({"role": "system", "content": partition_prompt})
-            built_messages.extend(
-                partition_engine._prepare_zone_messages(db_msgs, drop_tool_calls=False, drop_empty_assistant=False)
-            )
-            partition_engine._append_tail_user_message(built_messages, {"role": "user", "content": tail_note})
-            built_messages = partition_engine.fold_historical_interactive_ui_messages(built_messages)
+    if _active_heartbeat_lock.locked():
+        return {"status": "skipped_reentrant"}
+    if not shared.DATABASE_ENABLED:
+        return {"status": "skipped_db_disabled"}
+    if not shared.HEARTBEAT_ENABLED:
+        return {"status": "skipped_disabled"}
 
-        if shared.CACHE_PARTITION_ENABLED and not partition_engine._is_anthropic_model(model):
-            partition_engine._strip_cache_control(built_messages)
+    session_id = await resolve_target_session_id()
+    gate = await evaluate_heartbeat_gate(session_id, now_utc=now_utc, jitter_fn=jitter_fn)
+    if not gate.get("allowed"):
+        return {"status": gate["status"], "session_id": session_id}
 
-        req_body: dict = {
-            "model": model,
-            "messages": built_messages,
-            "stream": False,
-        }
-        if envelope.get("tools"):
-            req_body["tools"] = envelope["tools"]
-
-        effective_effort = envelope.get("thinking_level") or shared.REASONING_EFFORT
-        if effective_effort:
-            if shared.is_vertex_endpoint():
-                req_body["google"] = {
-                    "thinking_config": {
-                        "thinking_level": effective_effort,
-                        "include_thoughts": True,
-                    }
-                }
-            else:
-                req_body["reasoning_effort"] = effective_effort
-
-        req_id = f"hb{int(time.time()) % 10000:04d}"
+    async def _bg_worker():
         try:
-            chat_routes.diagnose_cache_prefix(
-                session_id,
-                req_body,
-                req_id=req_id,
-                db_history=len(db_msgs),
+            await run_heartbeat_tick(
+                now_utc=now_utc,
+                jitter_fn=jitter_fn,
+                timeout_seconds=HEARTBEAT_BACKGROUND_TIMEOUT,
             )
         except Exception:
-            pass
+            logger.exception("Background heartbeat tick failed")
 
-        async with httpx.AsyncClient(timeout=180) as client:
+    task = asyncio.create_task(_bg_worker())
+    _active_background_tasks.add(task)
+    task.add_done_callback(_active_background_tasks.discard)
+    return {"status": "accepted", "session_id": session_id}
+
+
+async def _run_heartbeat_tick_locked(
+    *,
+    now_utc: datetime | None = None,
+    jitter_fn=None,
+    timeout_seconds: float = HEARTBEAT_UPSTREAM_TIMEOUT,
+) -> dict:
+    if not shared.DATABASE_ENABLED:
+        return {"status": "skipped_db_disabled"}
+    if not shared.HEARTBEAT_ENABLED:
+        return {"status": "skipped_disabled"}
+
+    session_id = await resolve_target_session_id()
+    gate = await evaluate_heartbeat_gate(session_id, now_utc=now_utc, jitter_fn=jitter_fn)
+    if not gate.get("allowed"):
+        return {"status": gate["status"], "session_id": session_id}
+
+    stats = gate["stats"]
+    baseline_msg_id = stats.get("latest_id")
+    now_local = gate["now_local"]
+    weather_text = await fetch_local_weather()
+    tail_note = build_heartbeat_tail_note(
+        now_local,
+        gate.get("interaction_gap_minutes", gate["elapsed_minutes"]),
+        weather_text=weather_text,
+        unread_count=gate["unread_proactive_chat"],
+    )
+
+    envelope = await db_conversations.get_session_envelope_snapshot(session_id) or {}
+    model = envelope.get("model") or shared.DEFAULT_MODEL
+    if not model:
+        return {"status": "skipped_no_model", "session_id": session_id}
+
+    resolved_system_prompt = await shared.get_system_prompt()
+    partition_prompt = resolved_system_prompt
+    if shared.memory_injection_enabled():
+        partition_prompt = (resolved_system_prompt or "") + partition_engine.MEMORY_USAGE_GUIDE
+    client_system_text = (envelope.get("client_system_text") or "").strip()
+    if client_system_text:
+        partition_prompt = ((partition_prompt or "") + "\n\n" + client_system_text).strip()
+
+    db_msgs = await _load_partition_history_for_heartbeat(session_id)
+    if shared.CACHE_PARTITION_ENABLED:
+        built_messages = await partition_engine.build_partitioned_messages(
+            session_id,
+            db_msgs,
+            partition_prompt,
+            "",
+            allow_rotation=False,
+            temporary_tail_message={"role": "user", "content": tail_note},
+        )
+    else:
+        built_messages = []
+        if partition_prompt:
+            built_messages.append({"role": "system", "content": partition_prompt})
+        built_messages.extend(
+            partition_engine._prepare_zone_messages(db_msgs, drop_tool_calls=False, drop_empty_assistant=False)
+        )
+        partition_engine._append_tail_user_message(built_messages, {"role": "user", "content": tail_note})
+        built_messages = partition_engine.fold_historical_interactive_ui_messages(built_messages)
+
+    if shared.CACHE_PARTITION_ENABLED and not partition_engine._is_anthropic_model(model):
+        partition_engine._strip_cache_control(built_messages)
+
+    req_body: dict = {
+        "model": model,
+        "messages": built_messages,
+        "stream": False,
+    }
+    if envelope.get("tools"):
+        req_body["tools"] = envelope["tools"]
+
+    effective_effort = envelope.get("thinking_level") or shared.REASONING_EFFORT
+    if effective_effort:
+        if shared.is_vertex_endpoint():
+            req_body["google"] = {
+                "thinking_config": {
+                    "thinking_level": effective_effort,
+                    "include_thoughts": True,
+                }
+            }
+        else:
+            req_body["reasoning_effort"] = effective_effort
+
+    req_id = f"hb{int(time.time()) % 10000:04d}"
+    try:
+        chat_routes.diagnose_cache_prefix(
+            session_id,
+            req_body,
+            req_id=req_id,
+            db_history=len(db_msgs),
+        )
+    except Exception:
+        pass
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
             response = await chat_routes._post_chat_completion_with_429_retry(
                 client,
                 shared.API_BASE_URL,
                 shared.API_KEY,
                 req_body,
                 tag="自主唤醒",
-                max_retries=1 if shared.is_vertex_endpoint() else 0,
+                max_retries=1 if (shared.is_vertex_endpoint() and timeout_seconds > 100) else 0,
                 req_id=req_id,
             )
+    except httpx.TimeoutException as exc:
+        logger.warning("Heartbeat upstream timeout (%.1fs): %s", timeout_seconds, exc)
+        return {"status": "upstream_timeout", "session_id": session_id}
 
-        if response.status_code != 200:
-            logger.warning("Heartbeat upstream HTTP %s: %s", response.status_code, response.text[:300])
-            return {"status": "upstream_error", "code": response.status_code, "session_id": session_id}
+    if response.status_code != 200:
+        logger.warning("Heartbeat upstream HTTP %s: %s", response.status_code, response.text[:300])
+        return {"status": "upstream_error", "code": response.status_code, "session_id": session_id}
 
-        resp_data = response.json()
-        usage = resp_data.get("usage") or {}
-        try:
-            chat_routes.log_cache_usage(usage, req_id=req_id)
-        except Exception:
-            pass
-        tt = usage.get("total_tokens", 0)
-        if tt > 0:
-            asyncio.create_task(
-                db_conversations.save_token_usage(
-                    session_id,
-                    model,
-                    usage.get("prompt_tokens", 0),
-                    usage.get("completion_tokens", 0),
-                    tt,
-                    usage_type="heartbeat",
-                )
+    resp_data = response.json()
+    usage = resp_data.get("usage") or {}
+    try:
+        chat_routes.log_cache_usage(usage, req_id=req_id)
+    except Exception:
+        pass
+    tt = usage.get("total_tokens", 0)
+    if tt > 0:
+        asyncio.create_task(
+            db_conversations.save_token_usage(
+                session_id,
+                model,
+                usage.get("prompt_tokens", 0),
+                usage.get("completion_tokens", 0),
+                tt,
+                usage_type="heartbeat",
             )
-
-        msg_obj = (resp_data.get("choices") or [{}])[0].get("message") or {}
-        # 禁工具期误调 tools 或输出空正文：一律按 [SILENT] 静默丢弃，绝不写空消息或报错
-        if msg_obj.get("tool_calls"):
-            print(f"🤫 req={req_id} 自主唤醒意外触发 tool_calls，熔断静默丢弃")
-            return {"status": "silent", "reason": "unexpected_tool_calls", "session_id": session_id}
-
-        cleaned_content, is_silent = _strip_thoughts_and_check_silent(msg_obj.get("content") or "")
-        if is_silent:
-            print(f"💤 req={req_id} 自主唤醒选择静默继续睡（零落库）")
-            return {"status": "silent", "reason": "model_silent", "session_id": session_id}
-
-        # 落库前二次校验并发占线与最新 message_id 乐观锁
-        if chat_routes.is_session_chat_busy(session_id):
-            print(f"🛑 req={req_id} 唤醒落库前检测到主聊天占线，静默让路")
-            return {"status": "aborted_conflict", "reason": "chat_busy", "session_id": session_id}
-
-        latest_meta = await db_conversations.get_latest_message_meta(session_id)
-        latest_id = latest_meta.get("id") if latest_meta else None
-        if latest_id != baseline_msg_id:
-            print(f"🛑 req={req_id} 唤醒期间会话出现新消息 ({baseline_msg_id} -> {latest_id})，静默丢弃结果")
-            return {"status": "aborted_conflict", "reason": "baseline_changed", "session_id": session_id}
-
-        reasoning_content = msg_obj.get("reasoning_content") or msg_obj.get("reasoning") or None
-        meta_str = json.dumps({"reasoning_content": reasoning_content}, ensure_ascii=False) if reasoning_content else None
-        proactive_meta = {
-            "trigger_source": "cron",
-            "weather": weather_text,
-            "context_kind": gate.get("context_kind", "normal"),
-        }
-        msg_id = await db_conversations.save_message(
-            session_id,
-            "assistant",
-            cleaned_content,
-            model=model,
-            metadata=meta_str,
-            message_type="proactive_chat",
-            proactive_meta=proactive_meta,
-            skip_memory_extract=False,
-            memory_extracted=False,
         )
-        print(f"💌 req={req_id} 自主唤醒落库成功: id={msg_id}, session={session_id}, len={len(cleaned_content)}")
-        return {
-            "status": "delivered",
-            "session_id": session_id,
-            "message_id": msg_id,
-            "message_type": "proactive_chat",
-        }
+
+    msg_obj = (resp_data.get("choices") or [{}])[0].get("message") or {}
+    # 禁工具期误调 tools 或输出空正文：一律按 [SILENT] 静默丢弃，绝不写空消息或报错
+    if msg_obj.get("tool_calls"):
+        print(f"🤫 req={req_id} 自主唤醒意外触发 tool_calls，熔断静默丢弃")
+        return {"status": "silent", "reason": "unexpected_tool_calls", "session_id": session_id}
+
+    cleaned_content, is_silent = _strip_thoughts_and_check_silent(msg_obj.get("content") or "")
+    if is_silent:
+        print(f"💤 req={req_id} 自主唤醒选择静默继续睡（零落库）")
+        return {"status": "silent", "reason": "model_silent", "session_id": session_id}
+
+    # 落库前二次校验并发占线与最新 message_id 乐观锁
+    if chat_routes.is_session_chat_busy(session_id):
+        print(f"🛑 req={req_id} 唤醒落库前检测到主聊天占线，静默让路")
+        return {"status": "aborted_conflict", "reason": "chat_busy", "session_id": session_id}
+
+    latest_meta = await db_conversations.get_latest_message_meta(session_id)
+    latest_id = latest_meta.get("id") if latest_meta else None
+    if latest_id != baseline_msg_id:
+        print(f"🛑 req={req_id} 唤醒期间会话出现新消息 ({baseline_msg_id} -> {latest_id})，静默丢弃结果")
+        return {"status": "aborted_conflict", "reason": "baseline_changed", "session_id": session_id}
+
+    reasoning_content = msg_obj.get("reasoning_content") or msg_obj.get("reasoning") or None
+    meta_str = json.dumps({"reasoning_content": reasoning_content}, ensure_ascii=False) if reasoning_content else None
+    proactive_meta = {
+        "trigger_source": "cron",
+        "weather": weather_text,
+        "context_kind": gate.get("context_kind", "normal"),
+    }
+    msg_id = await db_conversations.save_message(
+        session_id,
+        "assistant",
+        cleaned_content,
+        model=model,
+        metadata=meta_str,
+        message_type="proactive_chat",
+        proactive_meta=proactive_meta,
+        skip_memory_extract=False,
+        memory_extracted=False,
+    )
+    print(f"💌 req={req_id} 自主唤醒落库成功: id={msg_id}, session={session_id}, len={len(cleaned_content)}")
+    return {
+        "status": "delivered",
+        "session_id": session_id,
+        "message_id": msg_id,
+        "message_type": "proactive_chat",
+    }

@@ -11,10 +11,10 @@ router = APIRouter()
 
 @router.post("/api/heartbeat/tick")
 @router.get("/api/heartbeat/tick")
-async def api_heartbeat_tick():
-    """外部 12 分钟 Cron 保活兼自主唤醒统一入口。"""
+async def api_heartbeat_tick(background: bool = False):
+    """外部 12 分钟 Cron 保活兼自主唤醒统一入口；background=1 时过门卫后即刻响应 200 并转后台生成。"""
     try:
-        result = await heartbeat_service.run_heartbeat_tick()
+        result = await heartbeat_service.dispatch_heartbeat_tick(background=background)
         return {"ok": True, **result}
     except Exception:
         return shared._api_failure("自主唤醒执行失败")
