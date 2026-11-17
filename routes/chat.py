@@ -218,7 +218,11 @@ def _streaming_response(stream, pending_reminder_claims, busy_ref=None) -> Strea
     return StreamingResponse(
         stream,
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
         background=BackgroundTask(_close_stream_and_release, stream, pending_reminder_claims, busy_ref),
     )
 
@@ -1173,6 +1177,11 @@ async def stream_and_capture(
     req_start_time = time.monotonic()
     stream_state = {"terminal": False, "phase": "等上游响应头", "completed": False}
     lease_keeper = _start_reminder_lease_keeper(pending_reminder_claims)
+    yielded_bytes = 0
+    yielded_chunks = 0
+    yielded_done = False
+    done_tail = b""
+    exit_exc = None
     try:
         async for chunk in _stream_and_capture_inner(
             headers,
@@ -1190,13 +1199,40 @@ async def stream_and_capture(
             stream_state,
             req_id=rid,
         ):
+            if chunk:
+                chunk_bytes = (
+                    bytes(chunk)
+                    if isinstance(chunk, (bytes, bytearray))
+                    else str(chunk).encode("utf-8", errors="ignore")
+                )
+                yielded_bytes += len(chunk_bytes)
+                yielded_chunks += 1
+                if not yielded_done:
+                    combined = done_tail + chunk_bytes
+                    if b"data: [DONE]" in combined:
+                        yielded_done = True
+                    done_tail = combined[-20:]
             yield chunk
+    except BaseException as e:
+        exit_exc = e
+        raise
     finally:
         _release_chat_busy(busy_ref)
+        elapsed = time.monotonic() - req_start_time
+        if exit_exc is not None:
+            exit_reason = type(exit_exc).__name__
+        elif stream_state.get("completed"):
+            exit_reason = "normal"
+        else:
+            exit_reason = "closed_early"
+        print(
+            f"📦 {req_prefix}下游发送汇总: chunks={yielded_chunks}, bytes={yielded_bytes}, "
+            f"yielded_done={yielded_done}, exit={exit_reason}, elapsed={elapsed:.1f}s",
+            flush=True,
+        )
         try:
             if not stream_state.get("completed"):
-                elapsed = time.monotonic() - req_start_time
-                exc = sys.exc_info()[1]
+                exc = exit_exc if exit_exc is not None else sys.exc_info()[1]
                 if exc is None or isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
                     print(f"🔌 {req_prefix}客户端断开: 已用时 {elapsed:.1f} 秒, 阶段={stream_state.get('phase', '等上游响应头')}", flush=True)
                 else:
