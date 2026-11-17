@@ -355,6 +355,48 @@ class HeartbeatPhase2Tests(unittest.TestCase):
         })
         self.assertIn("《独自逛贴吧》", header)
 
+    def test_direct_tool_execution_bypasses_cloudflare_access_302(self):
+        async def run_direct():
+            with patch.object(shared, "DATABASE_ENABLED", False), \
+                 patch.object(shared, "HEARTBEAT_TOOL_CONFIG", {}), \
+                 patch.object(
+                     heartbeat_service,
+                     "_execute_tavily_direct",
+                     new=AsyncMock(return_value='{"items":[{"id":"c1","title":"新闻"}]}'),
+                 ) as mock_tavily, \
+                 patch.object(
+                     heartbeat_service,
+                     "_call_mcp_session",
+                     new=AsyncMock(return_value="论坛早报内容"),
+                 ) as mock_mcp:
+                await heartbeat_service.save_heartbeat_tool_config({
+                    "tavily_api_key": "tvly-direct-123",
+                    "mcp_tool_routes": {"lutopia_cli": "https://lutopia.app/mcp/abc/sse"},
+                    "mcp_servers": [{"name": "Lutopia", "url": "https://lutopia.app/mcp/abc/sse", "token": "lut-tok"}],
+                })
+
+                # 1) search_web 直接走 Tavily，不走 tool_executor_origin（彻底绕过 CF Access 302）
+                r_search = await heartbeat_service.execute_background_tool_call(
+                    {"id": "t1", "function": {"name": "search_web", "arguments": '{"query":"寂静之地3"}'}},
+                    tool_executor_origin="https://cuplivo-web.nianlunyy2000.workers.dev",
+                )
+                self.assertIn("新闻", r_search)
+                mock_tavily.assert_awaited_once_with("寂静之地3", "tvly-direct-123", timeout=20.0)
+
+                # 2) lutopia_cli 直接连外部 MCP SSE，携带对应 Bearer token
+                r_mcp = await heartbeat_service.execute_background_tool_call(
+                    {"id": "t2", "function": {"name": "lutopia_cli", "arguments": '{"cmd":"home"}'}},
+                    tool_executor_origin="https://cuplivo-web.nianlunyy2000.workers.dev",
+                )
+                self.assertEqual(r_mcp, "论坛早报内容")
+                mock_mcp.assert_awaited_once()
+                call_args, call_kwargs = mock_mcp.await_args
+                self.assertEqual(call_args[0], "https://lutopia.app/mcp/abc/sse")
+                self.assertEqual(call_args[1]["Authorization"], "Bearer lut-tok")
+                self.assertEqual(call_kwargs["tool_name"], "lutopia_cli")
+
+        asyncio.run(run_direct())
+
 
 if __name__ == "__main__":
     unittest.main()

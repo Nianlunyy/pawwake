@@ -10,6 +10,8 @@ Provides:
 """
 
 import asyncio
+import html as html_lib
+import ipaddress
 import json
 import logging
 import os
@@ -17,12 +19,14 @@ import random
 import re
 import time
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 
 import httpx
 
 import partition_engine
 import shared
 from db import conversations as db_conversations
+from db import core as db_core
 from routes import chat as chat_routes
 
 logger = logging.getLogger(__name__)
@@ -474,13 +478,312 @@ def _resolve_tool_executor_origin(envelope: dict | None = None) -> str:
     return os.getenv("CUPLIVO_ORIGIN", "").strip().rstrip("/")
 
 
+async def save_heartbeat_tool_config(raw_config: dict) -> None:
+    """持久化 Cuplivo Worker 随 Cron 同步过来的工具直连配置，绕开 Cloudflare Access 302。"""
+    if not isinstance(raw_config, dict):
+        return
+    normalized = {
+        "tavily_api_key": str(raw_config.get("tavily_api_key") or "").strip(),
+        "mcp_tool_routes": {
+            str(k).strip(): str(v).strip()
+            for k, v in (raw_config.get("mcp_tool_routes") or {}).items()
+            if str(k).strip() and str(v).strip()
+        },
+        "mcp_servers": [
+            {
+                "name": str(s.get("name") or "").strip(),
+                "url": str(s.get("url") or "").strip(),
+                "token": str(s.get("token") or "").strip(),
+            }
+            for s in (raw_config.get("mcp_servers") or [])
+            if isinstance(s, dict) and str(s.get("url") or "").strip()
+        ],
+    }
+    prev = getattr(shared, "HEARTBEAT_TOOL_CONFIG", None) or {}
+    shared.HEARTBEAT_TOOL_CONFIG = normalized
+    if shared.DATABASE_ENABLED and normalized != prev:
+        try:
+            await db_core.set_gateway_config(
+                "heartbeat_tool_config",
+                json.dumps(normalized, ensure_ascii=False),
+            )
+        except Exception as exc:
+            logger.debug("Failed to persist heartbeat_tool_config: %s", exc)
+
+
+async def get_effective_tool_config() -> dict:
+    """读取后台工具直连配置（内存 -> PostgreSQL -> 环境变量）。"""
+    cfg = getattr(shared, "HEARTBEAT_TOOL_CONFIG", None)
+    if isinstance(cfg, dict) and (
+        cfg.get("tavily_api_key") or cfg.get("mcp_tool_routes") or cfg.get("mcp_servers")
+    ):
+        return cfg
+    if shared.DATABASE_ENABLED:
+        try:
+            raw = await db_core.get_gateway_config("heartbeat_tool_config", "")
+            if raw:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    shared.HEARTBEAT_TOOL_CONFIG = parsed
+                    return parsed
+        except Exception as exc:
+            logger.debug("Failed to load heartbeat_tool_config: %s", exc)
+    return {}
+
+
+def _format_mcp_auth_header(token: str) -> str | None:
+    trimmed = str(token or "").strip()
+    if not trimmed:
+        return None
+    if trimmed.lower().startswith("bearer "):
+        return trimmed
+    return f"Bearer {trimmed}"
+
+
+def _extract_mcp_result_text(call_result) -> str:
+    content = getattr(call_result, "content", None)
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            txt = getattr(item, "text", None)
+            if txt is not None:
+                parts.append(str(txt))
+            elif isinstance(item, dict) and "text" in item:
+                parts.append(str(item["text"]))
+            else:
+                parts.append(str(item))
+        return "\n".join(parts)
+    if hasattr(call_result, "model_dump"):
+        return json.dumps(call_result.model_dump(), ensure_ascii=False)
+    return str(call_result)
+
+
+def _is_local_pawwake_mcp_url(server_url: str) -> bool:
+    parsed = urlsplit(str(server_url or "").strip())
+    path = (parsed.path or "").rstrip("/")
+    if path != "/mcp":
+        return False
+    public_base = shared.get_public_base_url().rstrip("/") if hasattr(shared, "get_public_base_url") else ""
+    if public_base and server_url.rstrip("/").startswith(public_base):
+        return True
+    host = (parsed.hostname or "").lower()
+    return host.endswith(".onrender.com") or host in ("127.0.0.1", "localhost")
+
+
+async def _call_mcp_session(server_url: str, headers: dict, *, tool_name: str | None = None, arguments: dict | None = None, list_only: bool = False, timeout: float = 20.0):
+    import httpx2
+    from mcp import ClientSession
+    from mcp.client.sse import sse_client
+    from mcp.client.streamable_http import streamable_http_client
+
+    async def _run_sse():
+        async with sse_client(
+            server_url,
+            headers=headers or None,
+            timeout=min(12.0, float(timeout)),
+            sse_read_timeout=min(25.0, float(timeout) + 5.0),
+        ) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                if list_only:
+                    listed = await session.list_tools()
+                    return [t.name for t in (getattr(listed, "tools", None) or []) if getattr(t, "name", None)]
+                res = await session.call_tool(tool_name, arguments=arguments or {})
+                return _extract_mcp_result_text(res)
+
+    async def _run_streamable_http():
+        http_client = httpx2.AsyncClient(
+            headers=headers or None,
+            timeout=min(18.0, float(timeout)),
+            follow_redirects=True,
+        )
+        async with streamable_http_client(server_url, http_client=http_client) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                if list_only:
+                    listed = await session.list_tools()
+                    return [t.name for t in (getattr(listed, "tools", None) or []) if getattr(t, "name", None)]
+                res = await session.call_tool(tool_name, arguments=arguments or {})
+                return _extract_mcp_result_text(res)
+
+    prefer_sse = server_url.rstrip("/").lower().endswith("/sse")
+    transports = (_run_sse, _run_streamable_http) if prefer_sse else (_run_streamable_http, _run_sse)
+    last_err = None
+    for runner in transports:
+        try:
+            return await runner()
+        except Exception as exc:
+            last_err = exc
+    raise last_err
+
+
+async def _execute_mcp_direct(tool_name: str, parsed_args: dict, tool_config: dict, timeout: float = 20.0) -> str | None:
+    routes = tool_config.get("mcp_tool_routes") or {}
+    servers = tool_config.get("mcp_servers") or []
+    target_url = str(routes.get(tool_name) or "").strip()
+
+    if not target_url and servers:
+        for srv in servers:
+            srv_url = str(srv.get("url") or "").strip()
+            if not srv_url:
+                continue
+            hdrs = {}
+            auth_val = _format_mcp_auth_header(srv.get("token", ""))
+            if auth_val:
+                hdrs["Authorization"] = auth_val
+            try:
+                names = await _call_mcp_session(srv_url, hdrs, list_only=True, timeout=min(12.0, timeout))
+                for n in names:
+                    routes[n] = srv_url
+                if tool_name in names:
+                    target_url = srv_url
+                    break
+            except Exception as exc:
+                logger.debug("MCP probe failed (%s): %s", srv_url, exc)
+
+    if not target_url:
+        return None
+
+    headers: dict[str, str] = {}
+    if _is_local_pawwake_mcp_url(target_url):
+        target_url = f"http://127.0.0.1:{shared.PORT}/mcp/"
+        if shared.GATEWAY_SECRET:
+            headers["X-Gateway-Key"] = shared.GATEWAY_SECRET
+    else:
+        matched = next((s for s in servers if str(s.get("url") or "").strip().rstrip("/") == target_url.rstrip("/")), None)
+        if matched and matched.get("token"):
+            auth_val = _format_mcp_auth_header(matched["token"])
+            if auth_val:
+                headers["Authorization"] = auth_val
+
+    try:
+        return await _call_mcp_session(target_url, headers, tool_name=tool_name, arguments=parsed_args, timeout=timeout)
+    except Exception as exc:
+        logger.warning("Direct MCP call failed (%s -> %s): %s", tool_name, target_url, exc)
+        return json.dumps({"error": f"MCP 工具调用失败: {exc}"}, ensure_ascii=False)
+
+
+async def _execute_tavily_direct(query: str, api_key: str, timeout: float = 20.0) -> str:
+    try:
+        async with httpx.AsyncClient(timeout=min(20.0, float(timeout)), follow_redirects=True) as client:
+            resp = await client.post(
+                "https://api.tavily.com/search",
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+                json={"query": query, "max_results": 8, "search_depth": "basic", "include_answer": True},
+            )
+        if resp.status_code != 200:
+            return json.dumps({"error": f"Tavily HTTP {resp.status_code}: {resp.text[:200]}"}, ensure_ascii=False)
+        data = resp.json()
+        items = [
+            {
+                "index": idx + 1,
+                "id": f"c{idx + 1}",
+                "title": r.get("title") or "No Title",
+                "url": r.get("url") or "",
+                "text": r.get("content") or "",
+            }
+            for idx, r in enumerate(data.get("results") or [])
+        ]
+        payload = {"answer": data["answer"], "items": items} if data.get("answer") else {"items": items}
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        return json.dumps({"error": f"搜索请求异常: {exc}"}, ensure_ascii=False)
+
+
+def _is_safe_public_url(raw_url: str) -> str:
+    candidate = str(raw_url or "").strip()
+    if not candidate:
+        raise ValueError("缺少网页链接参数 url")
+    if candidate.startswith("//"):
+        candidate = f"https:{candidate}"
+    elif not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", candidate):
+        candidate = f"https://{candidate}"
+    parsed = urlsplit(candidate)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("仅支持 http/https 公开网页链接")
+    host = parsed.hostname.lower()
+    if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1") or host.endswith((".local", ".internal")):
+        raise ValueError("不支持访问本地或内网地址")
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            raise ValueError("不支持访问私网地址")
+    except ValueError as err:
+        if "不支持" in str(err):
+            raise
+    return parsed.geturl()
+
+
+async def _execute_fetch_url_direct(raw_url: str, start_index: int, tavily_key: str, timeout: float = 20.0) -> str:
+    try:
+        target_url = _is_safe_public_url(raw_url)
+    except ValueError as err:
+        return json.dumps({"error": str(err)}, ensure_ascii=False)
+
+    content = ""
+    title = ""
+    if tavily_key:
+        try:
+            async with httpx.AsyncClient(timeout=min(15.0, float(timeout))) as client:
+                r = await client.post(
+                    "https://api.tavily.com/extract",
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {tavily_key}"},
+                    json={"urls": [target_url]},
+                )
+            if r.status_code == 200:
+                res_list = (r.json() or {}).get("results") or []
+                if res_list and res_list[0].get("raw_content"):
+                    content = str(res_list[0]["raw_content"])
+        except Exception:
+            pass
+
+    if not content:
+        try:
+            async with httpx.AsyncClient(timeout=min(15.0, float(timeout)), follow_redirects=True) as client:
+                r = await client.get(f"https://r.jina.ai/{target_url}", headers={"Accept": "text/plain"})
+            if r.status_code == 200 and r.text.strip():
+                content = r.text
+        except Exception:
+            pass
+
+    if not content:
+        try:
+            async with httpx.AsyncClient(timeout=min(15.0, float(timeout)), follow_redirects=True) as client:
+                r = await client.get(target_url, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code == 200:
+                raw_html = r.text
+                title_m = re.search(r"<title[^>]*>([\s\S]*?)</title>", raw_html, re.IGNORECASE)
+                if title_m:
+                    title = html_lib.unescape(re.sub(r"\s+", " ", title_m.group(1))).strip()
+                cleaned = re.sub(r"<(script|style|noscript|svg)[^>]*>[\s\S]*?</\1>", " ", raw_html, flags=re.IGNORECASE)
+                cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+                content = html_lib.unescape(re.sub(r"\s+", " ", cleaned)).strip()
+        except Exception as exc:
+            return json.dumps({"error": f"网页读取失败: {exc}"}, ensure_ascii=False)
+
+    if not content:
+        return json.dumps({"error": "未能读取到网页正文"}, ensure_ascii=False)
+
+    page_size = 10000
+    start = max(0, int(start_index or 0))
+    slice_text = content[start:start + page_size]
+    return json.dumps({
+        "url": target_url,
+        "title": title,
+        "start_index": start,
+        "total_length": len(content),
+        "has_more": (start + len(slice_text)) < len(content),
+        "content": slice_text,
+    }, ensure_ascii=False)
+
+
 async def execute_background_tool_call(
     tool_call: dict,
     *,
     tool_executor_origin: str = "",
     timeout: float = 20.0,
 ) -> str:
-    """通过 Cuplivo Worker /api/heartbeat/tool-exec 安全执行单个后台 MCP/搜索/阅读工具。"""
+    """执行后台 MCP/搜索/网页阅读工具（优先从 Pawwake 直连执行以避开 Cloudflare Access 302）。"""
     fn = tool_call.get("function") if isinstance(tool_call, dict) else {}
     tool_name = str((fn or {}).get("name") or "").strip()
     raw_args = (fn or {}).get("arguments")
@@ -496,10 +799,31 @@ async def execute_background_tool_call(
 
     if not tool_name:
         return json.dumps({"error": "工具名缺失"}, ensure_ascii=False)
+
+    tool_config = await get_effective_tool_config()
+    tavily_key = str(tool_config.get("tavily_api_key") or os.getenv("TAVILY_API_KEY") or "").strip()
+
+    # 1. 优先直连执行（完全绕开入站 Cloudflare Access 302 登录拦截）
+    if tool_name in ("search_web", "tavily_search"):
+        if tavily_key:
+            query = str(parsed_args.get("query") or parsed_args.get("q") or parsed_args.get("input") or "")
+            res_text = await _execute_tavily_direct(query, tavily_key, timeout=timeout)
+            return res_text[:24000] + ("\n...(内容过长已截断)" if len(res_text) > 24000 else "")
+    elif tool_name == "fetch_url":
+        target_u = str(parsed_args.get("url") or parsed_args.get("link") or "")
+        start_idx = int(parsed_args.get("start_index") or 0)
+        res_text = await _execute_fetch_url_direct(target_u, start_idx, tavily_key, timeout=timeout)
+        return res_text[:24000] + ("\n...(内容过长已截断)" if len(res_text) > 24000 else "")
+    else:
+        direct_mcp_res = await _execute_mcp_direct(tool_name, parsed_args, tool_config, timeout=timeout)
+        if direct_mcp_res is not None:
+            return direct_mcp_res[:24000] + ("\n...(内容过长已截断)" if len(direct_mcp_res) > 24000 else "")
+
+    # 2. 回退到 Cuplivo Worker /api/heartbeat/tool-exec（支持可选 Cloudflare Access Service Token）
     if not tool_executor_origin:
         return json.dumps(
             {
-                "error": "未获取到 Cuplivo 工具执行地址 (tool_executor_origin)",
+                "error": "未获取到 Cuplivo 工具执行配置",
                 "notice": "当前暂无法联网或访问 MCP 工具，请直接基于现有记忆判断或保持静默。",
             },
             ensure_ascii=False,
@@ -509,6 +833,11 @@ async def execute_background_tool_call(
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if shared.GATEWAY_SECRET:
         headers["X-Gateway-Key"] = shared.GATEWAY_SECRET
+    cf_id = os.getenv("CF_ACCESS_CLIENT_ID", "").strip()
+    cf_secret = os.getenv("CF_ACCESS_CLIENT_SECRET", "").strip()
+    if cf_id and cf_secret:
+        headers["CF-Access-Client-Id"] = cf_id
+        headers["CF-Access-Client-Secret"] = cf_secret
 
     payload = {
         "tool_name": tool_name,
@@ -516,8 +845,18 @@ async def execute_background_tool_call(
         "tool_call_id": str(tool_call.get("id") or ""),
     }
     try:
-        async with httpx.AsyncClient(timeout=max(5.0, float(timeout))) as client:
+        async with httpx.AsyncClient(timeout=max(5.0, float(timeout)), follow_redirects=False) as client:
             resp = await client.post(exec_url, headers=headers, json=payload)
+        if resp.status_code in (301, 302, 303, 307, 308):
+            loc = resp.headers.get("location", "")
+            return json.dumps(
+                {
+                    "error": f"工具网关被重定向拦截 HTTP {resp.status_code}",
+                    "location": loc[:200],
+                    "notice": "对方开启了 Zero Trust 登录墙，请直连同步工具配置或稍后再试。",
+                },
+                ensure_ascii=False,
+            )
         if resp.status_code != 200:
             err_preview = resp.text[:300] if hasattr(resp, "text") else ""
             return json.dumps(
@@ -667,13 +1006,20 @@ async def _run_heartbeat_tick_locked(
     weather_text = await fetch_local_weather()
     snapshot_tools = envelope.get("tools") or []
     tool_executor_origin = _resolve_tool_executor_origin(envelope)
+    tool_config = await get_effective_tool_config()
+    has_direct_tools = bool(
+        tool_config.get("tavily_api_key")
+        or tool_config.get("mcp_tool_routes")
+        or tool_config.get("mcp_servers")
+        or os.getenv("TAVILY_API_KEY")
+    )
     tail_note = build_heartbeat_tail_note(
         now_local,
         gate.get("interaction_gap_minutes", gate["elapsed_minutes"]),
         weather_text=weather_text,
         unread_count=gate["unread_proactive_chat"],
         due_alarm_reason=due_alarm_reason,
-        tools_enabled=bool(snapshot_tools and tool_executor_origin),
+        tools_enabled=bool(snapshot_tools and (has_direct_tools or tool_executor_origin)),
     )
 
     resolved_system_prompt = await shared.get_system_prompt()

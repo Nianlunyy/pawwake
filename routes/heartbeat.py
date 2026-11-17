@@ -18,6 +18,16 @@ async def api_heartbeat_tick(request: Request = None, background: bool = False):
             cuplivo_origin = str(request.headers.get("X-Cuplivo-Origin") or "").strip().rstrip("/")
             if cuplivo_origin:
                 shared.CUPLIVO_ORIGIN = cuplivo_origin
+            if request.method == "POST":
+                try:
+                    raw_body = await request.body()
+                    if raw_body:
+                        import json as _json
+                        body = _json.loads(raw_body)
+                        if isinstance(body, dict) and isinstance(body.get("tool_config"), dict):
+                            await heartbeat_service.save_heartbeat_tool_config(body["tool_config"])
+                except Exception:
+                    pass
         result = await heartbeat_service.dispatch_heartbeat_tick(background=background)
         return {"ok": True, **result}
     except Exception:
