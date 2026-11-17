@@ -968,6 +968,63 @@ async def dispatch_heartbeat_tick(
     return {"status": "accepted", "session_id": session_id}
 
 
+def _extract_cached_tokens(usage: dict) -> int:
+    if not isinstance(usage, dict):
+        return 0
+    pt_details = usage.get("prompt_tokens_details")
+    if isinstance(pt_details, dict) and isinstance(pt_details.get("cached_tokens"), (int, float)):
+        return int(pt_details["cached_tokens"])
+    for key in ("cached_tokens", "cache_read_input_tokens", "prompt_cache_hit_tokens", "cached_content_token_count"):
+        val = usage.get(key)
+        if isinstance(val, (int, float)):
+            return int(val)
+    return 0
+
+
+def _extract_reasoning_tokens(usage: dict) -> int:
+    if not isinstance(usage, dict):
+        return 0
+    ct_details = usage.get("completion_tokens_details")
+    if isinstance(ct_details, dict) and isinstance(ct_details.get("reasoning_tokens"), (int, float)):
+        return int(ct_details["reasoning_tokens"])
+    val = usage.get("reasoning_tokens")
+    return int(val) if isinstance(val, (int, float)) else 0
+
+
+def _aggregate_heartbeat_usage(step_usages: list[dict]) -> dict | None:
+    """汇总单次自主唤醒全部步数的 token 消耗，输出与 Cuplivo 前端兼容的标准 usage 结构。"""
+    if not step_usages:
+        return None
+    prompt_sum = 0
+    cached_sum = 0
+    completion_sum = 0
+    reasoning_sum = 0
+    total_sum = 0
+    for u in step_usages:
+        if not isinstance(u, dict):
+            continue
+        pt = int(u.get("prompt_tokens") or 0)
+        ct = int(u.get("completion_tokens") or 0)
+        tt = int(u.get("total_tokens") or (pt + ct))
+        prompt_sum += pt
+        cached_sum += _extract_cached_tokens(u)
+        completion_sum += ct
+        reasoning_sum += _extract_reasoning_tokens(u)
+        total_sum += tt
+    if prompt_sum == 0 and completion_sum == 0 and total_sum == 0:
+        return None
+    agg: dict = {
+        "prompt_tokens": prompt_sum,
+        "completion_tokens": completion_sum,
+        "total_tokens": total_sum,
+    }
+    if cached_sum > 0:
+        agg["prompt_tokens_details"] = {"cached_tokens": cached_sum}
+    if reasoning_sum > 0:
+        agg["completion_tokens_details"] = {"reasoning_tokens": reasoning_sum}
+    return agg
+
+
 async def _run_heartbeat_tick_locked(
     *,
     now_utc: datetime | None = None,
@@ -1092,6 +1149,7 @@ async def _run_heartbeat_tick_locked(
     forced_wrap_up = False
     tools_used: list[str] = []
     reasoning_parts: list[str] = []
+    step_usages: list[dict] = []
     final_msg_obj: dict = {}
 
     while True:
@@ -1130,6 +1188,8 @@ async def _run_heartbeat_tick_locked(
 
         resp_data = response.json()
         usage = resp_data.get("usage") or {}
+        if isinstance(usage, dict) and usage:
+            step_usages.append(usage)
         try:
             chat_routes.log_cache_usage(usage, req_id=req_id)
         except Exception:
@@ -1242,7 +1302,20 @@ async def _run_heartbeat_tick_locked(
         return {"status": "aborted_conflict", "reason": "baseline_changed", "session_id": session_id}
 
     combined_reasoning = "\n\n---\n\n".join(r for r in reasoning_parts if r) or None
-    meta_str = json.dumps({"reasoning_content": combined_reasoning}, ensure_ascii=False) if combined_reasoning else None
+    agg_usage = _aggregate_heartbeat_usage(step_usages)
+    elapsed_ms = max(0, round((time.monotonic() - tick_start) * 1000))
+    timing_obj: dict = {"total_ms": elapsed_ms}
+    if effective_effort:
+        timing_obj["thinking_level"] = effective_effort
+
+    meta_dict: dict = {}
+    if combined_reasoning:
+        meta_dict["reasoning_content"] = combined_reasoning
+    if agg_usage:
+        meta_dict["usage"] = agg_usage
+    if timing_obj:
+        meta_dict["timing"] = timing_obj
+    meta_str = json.dumps(meta_dict, ensure_ascii=False) if meta_dict else None
     base_proactive_meta: dict = {
         "trigger_source": "alarm" if gate.get("has_due_alarm") else "cron",
         "weather": weather_text,

@@ -1481,6 +1481,8 @@ async def get_proactive_messages_since(session_id: str, after_id: int = 0, limit
     for r in rows:
         meta = _decode_json_field(r.get("metadata"))
         reasoning = meta.get("reasoning_content") if isinstance(meta, dict) else None
+        usage = meta.get("usage") if isinstance(meta, dict) else None
+        timing = meta.get("timing") if isinstance(meta, dict) else None
         p_meta = _decode_json_field(r.get("proactive_meta"))
         results.append({
             "id": r["id"],
@@ -1488,6 +1490,8 @@ async def get_proactive_messages_since(session_id: str, after_id: int = 0, limit
             "role": r["role"],
             "content": r["content"] or "",
             "reasoning": reasoning or "",
+            "usage": usage,
+            "timing": timing,
             "model": r["model"] or "",
             "message_type": r["message_type"],
             "proactive_meta": p_meta,

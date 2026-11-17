@@ -231,7 +231,7 @@ class HeartbeatPhase2Tests(unittest.TestCase):
         saved_calls = []
 
         async def fake_save_msg(session_id, role, content, model="", metadata=None, **kwargs):
-            saved_calls.append({"content": content, **kwargs})
+            saved_calls.append({"content": content, "metadata": metadata, **kwargs})
             return 200 + len(saved_calls)
 
         async def run_loop():
@@ -284,6 +284,19 @@ class HeartbeatPhase2Tests(unittest.TestCase):
         self.assertEqual(saved_calls[1]["content"], "刚才顺便逛了圈论坛，你安全到家了没？")
         self.assertNotIn("<next_wake", saved_calls[1]["content"])
         self.assertNotIn("<event_capsule", saved_calls[1]["content"])
+        chat_meta = json.loads(saved_calls[1]["metadata"])
+        self.assertEqual(chat_meta["usage"]["prompt_tokens"], 230)
+        self.assertEqual(chat_meta["usage"]["completion_tokens"], 60)
+        self.assertEqual(chat_meta["usage"]["total_tokens"], 290)
+        self.assertEqual(chat_meta["timing"]["thinking_level"], "high")
+
+        # 验证 cached_tokens / reasoning_tokens 规范化聚合为前端标准格式
+        agg_norm = heartbeat_service._aggregate_heartbeat_usage([
+            {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120, "cached_tokens": 80, "reasoning_tokens": 10},
+            {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150, "prompt_tokens_details": {"cached_tokens": 90}},
+        ])
+        self.assertEqual(agg_norm["prompt_tokens_details"]["cached_tokens"], 170)
+        self.assertEqual(agg_norm["completion_tokens_details"]["reasoning_tokens"], 10)
 
     def test_60s_time_budget_circuit_breaker_and_partition_event_title(self):
         # 1) 验证时间超 60s 熔断不执行新工具、不删顶层 tools，直接拦截返回
