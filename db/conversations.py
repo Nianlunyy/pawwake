@@ -1367,7 +1367,7 @@ async def get_heartbeat_session_stats(session_id: str) -> dict:
             session_id,
         )
         surf_row = await conn.fetchrow(
-            """SELECT daily_surf_date, daily_surf_count
+            """SELECT last_proactive_at, daily_surf_date, daily_surf_count
                FROM session_cache_state
                WHERE session_id = $1""",
             session_id,
@@ -1387,6 +1387,7 @@ async def get_heartbeat_session_stats(session_id: str) -> dict:
         "last_proactive_chat_at": unread_row["last_proactive_chat_at"] if unread_row else None,
         "last_proactive_event_at": unread_row["last_proactive_event_at"] if unread_row else None,
         "pending_alarm": dict(alarm_row) if alarm_row else None,
+        "last_proactive_at": surf_row["last_proactive_at"] if surf_row else None,
         "daily_surf_date": surf_row["daily_surf_date"] if surf_row else None,
         "daily_surf_count": int(surf_row["daily_surf_count"] or 0) if surf_row else 0,
     }
@@ -1530,6 +1531,30 @@ async def increment_daily_surf_count(session_id: str, today_local_date: date) ->
             today_local_date,
         )
     return max(0, int(val or 0))
+
+
+async def record_heartbeat_attempt(
+    session_id: str,
+    now_utc: datetime | None = None,
+) -> None:
+    """记录最近一次实际触发上游模型的唤醒时间戳（含 [SILENT] 与异常中断），推进门卫冷却锚点。"""
+    if not session_id:
+        return
+    now_ts = now_utc or datetime.now(dt_timezone.utc)
+    if now_ts.tzinfo is None:
+        now_ts = now_ts.replace(tzinfo=dt_timezone.utc)
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO session_cache_state AS scs (
+                   session_id, summary, a_start_round, last_proactive_at, updated_at
+               ) VALUES ($1, '', 0, $2, NOW())
+               ON CONFLICT (session_id) DO UPDATE
+               SET last_proactive_at = $2,
+                   updated_at = NOW()""",
+            session_id,
+            now_ts,
+        )
 
 
 async def upsert_proactive_topic(

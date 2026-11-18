@@ -201,6 +201,7 @@ class HeartbeatPhase3Tests(unittest.TestCase):
                  patch.object(db_conversations, "upsert_proactive_topic", new=AsyncMock()) as mock_upsert_topic, \
                  patch.object(db_conversations, "save_message", side_effect=fake_save), \
                  patch.object(heartbeat_service, "fetch_local_weather", new=AsyncMock(return_value="南京 晴 20°C")), \
+                 patch.object(heartbeat_service, "TOOL_STEP_PACING_SECONDS", 0.0), \
                  patch.object(heartbeat_service, "execute_background_tool_call", new=AsyncMock(return_value="{\"posts\": []}")) as mock_exec, \
                  patch.object(shared, "post_chat_completion", side_effect=fake_post_5_steps):
 
@@ -266,6 +267,7 @@ class HeartbeatPhase3Tests(unittest.TestCase):
                  patch.object(db_conversations, "upsert_proactive_topic", new=AsyncMock()), \
                  patch.object(db_conversations, "save_message", new=AsyncMock(return_value=501)), \
                  patch.object(heartbeat_service, "fetch_local_weather", new=AsyncMock(return_value="")), \
+                 patch.object(heartbeat_service, "TOOL_STEP_PACING_SECONDS", 0.0), \
                  patch.object(heartbeat_service, "execute_background_tool_call", new=AsyncMock(return_value="{\"items\": []}")) as mock_exec_light, \
                  patch.object(shared, "post_chat_completion", side_effect=fake_post_light):
 
@@ -489,6 +491,137 @@ class HeartbeatPhase3Tests(unittest.TestCase):
             self.assertTrue(res["cooling_topics"][0]["is_cooling"])
 
         asyncio.run(run_status())
+
+    def test_anti_429_silent_cooldown_pacing_and_error_recovery(self):
+        now = datetime(2026, 11, 18, 6, 0, tzinfo=timezone.utc)
+
+        # 1) DB 层 record_heartbeat_attempt 更新 last_proactive_at
+        fake_conn = MagicMock()
+        fake_conn.execute = AsyncMock()
+        fake_pool = _make_fake_pool(fake_conn)
+
+        async def run_all():
+            with patch.object(db_core, "get_pool", new=AsyncMock(return_value=fake_pool)):
+                await db_conversations.record_heartbeat_attempt("s1", now_utc=now)
+                fake_conn.execute.assert_awaited_once()
+                self.assertIn("last_proactive_at", fake_conn.execute.await_args.args[0])
+
+            # 2) [SILENT] 推进 last_proactive_at 后，12 分钟后门卫必须按冷却拦截（绝不每 12 分钟连刷）
+            stats_after_silent = {
+                "latest_id": 10,
+                "last_normal_at": now - timedelta(hours=3),
+                "last_user_content": "去忙啦",
+                "unread_proactive_chat": 0,
+                "unread_proactive_event": 0,
+                "last_proactive_at": now - timedelta(minutes=12),
+                "last_proactive_chat_at": None,
+                "last_proactive_event_at": None,
+                "pending_alarm": None,
+            }
+            with patch.object(shared, "DATABASE_ENABLED", True), \
+                 patch.object(shared, "HEARTBEAT_ENABLED", True), \
+                 patch.object(shared, "API_KEY", "k"), \
+                 patch.object(shared, "HEARTBEAT_BASE_COOLDOWN_MINUTES", 45), \
+                 patch.object(db_conversations, "get_heartbeat_session_stats", new=AsyncMock(return_value=stats_after_silent)):
+                g_silent_cooldown = await heartbeat_service.evaluate_heartbeat_gate("s1", now_utc=now, jitter_fn=lambda: 1.0)
+                self.assertFalse(g_silent_cooldown["allowed"])
+                self.assertEqual(g_silent_cooldown["status"], "skipped_cooldown")
+
+            # [SILENT] 返回路径也会调用 record_heartbeat_attempt
+            stats_ready = {
+                **stats_after_silent,
+                "last_proactive_at": now - timedelta(minutes=120),
+            }
+            snapshot = {
+                "client_system_text": "",
+                "tools": [{"type": "function", "function": {"name": "search_web"}}],
+                "model": "google/gemini-3.5-flash",
+                "tool_executor_origin": "https://cuplivo.test",
+            }
+            db_rows = [{"id": 10, "role": "assistant", "content": "嗯嗯", "created_at": now - timedelta(hours=3), "message_type": "normal"}]
+
+            async def fake_post_silent(client, url, api_key, body):
+                return FakeResponse(200, {"choices": [{"message": {"content": "[SILENT]"}}]})
+
+            with patch.object(shared, "DATABASE_ENABLED", True), \
+                 patch.object(shared, "HEARTBEAT_ENABLED", True), \
+                 patch.object(shared, "HEARTBEAT_SESSION_ID", "s1"), \
+                 patch.object(shared, "API_KEY", "k"), \
+                 patch.object(shared, "CACHE_PARTITION_ENABLED", False), \
+                 patch.object(shared, "get_system_prompt", new=AsyncMock(return_value="人设")), \
+                 patch.object(db_conversations, "get_heartbeat_session_stats", new=AsyncMock(return_value=stats_ready)), \
+                 patch.object(db_conversations, "get_session_envelope_snapshot", new=AsyncMock(return_value=snapshot)), \
+                 patch.object(db_conversations, "get_partition_conversation_messages", new=AsyncMock(return_value=(db_rows, None, 0, False))), \
+                 patch.object(db_conversations, "get_latest_message_meta", new=AsyncMock(return_value={"id": 10})), \
+                 patch.object(db_conversations, "get_active_proactive_topics", new=AsyncMock(return_value=[])), \
+                 patch.object(db_conversations, "record_heartbeat_attempt", new=AsyncMock()) as mock_rec_silent, \
+                 patch.object(heartbeat_service, "fetch_local_weather", new=AsyncMock(return_value="")), \
+                 patch.object(shared, "post_chat_completion", side_effect=fake_post_silent):
+                res_s = await heartbeat_service.run_heartbeat_tick(now_utc=now, jitter_fn=lambda: 1.0)
+                self.assertEqual(res_s["status"], "silent")
+                mock_rec_silent.assert_awaited_once_with("s1", now_utc=now)
+
+            # 3) 非 Vertex 接口也执行工具轮间 pacing，且 2 轮工具后遇上游 429 会记冷却、消闹钟、扣冲浪额度
+            stats_due = {
+                **stats_ready,
+                "pending_alarm": {
+                    "id": 77,
+                    "due_at": now - timedelta(minutes=1),
+                    "reason": "记得看一眼",
+                },
+            }
+            step_idx = 0
+
+            async def fake_post_429_mid_surf(client, url, api_key, body):
+                nonlocal step_idx
+                step_idx += 1
+                if step_idx <= 2:
+                    return FakeResponse(200, {
+                        "choices": [{
+                            "message": {
+                                "content": "",
+                                "tool_calls": [{"id": f"tc_{step_idx}", "function": {"name": "search_web", "arguments": "{}"}}],
+                            }
+                        }],
+                    })
+                return FakeResponse(429, {"error": {"message": "Rate limit reached"}})
+
+            real_sleep = asyncio.sleep
+            sleep_calls = []
+
+            async def fake_sleep(sec):
+                sleep_calls.append(sec)
+                await real_sleep(0)
+
+            with patch.object(shared, "DATABASE_ENABLED", True), \
+                 patch.object(shared, "HEARTBEAT_ENABLED", True), \
+                 patch.object(shared, "HEARTBEAT_SESSION_ID", "s1"), \
+                 patch.object(shared, "API_KEY", "k"), \
+                 patch.object(shared, "CACHE_PARTITION_ENABLED", False), \
+                 patch.object(shared, "is_vertex_endpoint", return_value=False), \
+                 patch.object(shared, "get_system_prompt", new=AsyncMock(return_value="人设")), \
+                 patch.object(db_conversations, "get_heartbeat_session_stats", new=AsyncMock(return_value=stats_due)), \
+                 patch.object(db_conversations, "get_session_envelope_snapshot", new=AsyncMock(return_value=snapshot)), \
+                 patch.object(db_conversations, "get_partition_conversation_messages", new=AsyncMock(return_value=(db_rows, None, 0, False))), \
+                 patch.object(db_conversations, "get_latest_message_meta", new=AsyncMock(return_value={"id": 10})), \
+                 patch.object(db_conversations, "get_active_proactive_topics", new=AsyncMock(return_value=[])), \
+                 patch.object(db_conversations, "record_heartbeat_attempt", new=AsyncMock()) as mock_rec_err, \
+                 patch.object(db_conversations, "consume_wake_alarm", new=AsyncMock(return_value=True)) as mock_consume_err, \
+                 patch.object(db_conversations, "increment_daily_surf_count", new=AsyncMock()) as mock_inc_err, \
+                 patch.object(heartbeat_service, "TOOL_STEP_PACING_SECONDS", 2.5), \
+                 patch.object(heartbeat_service, "fetch_local_weather", new=AsyncMock(return_value="")), \
+                 patch.object(heartbeat_service, "execute_background_tool_call", new=AsyncMock(return_value="{\"ok\":true}")), \
+                 patch.object(heartbeat_service.asyncio, "sleep", side_effect=fake_sleep), \
+                 patch.object(shared, "post_chat_completion", side_effect=fake_post_429_mid_surf):
+                res_err = await heartbeat_service.run_heartbeat_tick(now_utc=now, jitter_fn=lambda: 1.0)
+                self.assertEqual(res_err["status"], "upstream_error")
+                self.assertEqual(res_err["code"], 429)
+                self.assertEqual(sleep_calls, [2.5, 2.5])
+                mock_rec_err.assert_awaited_once_with("s1", now_utc=now)
+                mock_consume_err.assert_awaited_once_with(77, consumed_message_id=None)
+                mock_inc_err.assert_awaited_once()
+
+        asyncio.run(run_all())
 
 
 if __name__ == "__main__":

@@ -42,6 +42,7 @@ HEARTBEAT_BACKGROUND_TIMEOUT = float(os.getenv("HEARTBEAT_BACKGROUND_TIMEOUT", "
 # 二阶段/三阶段后台工具探索步数与耗时熔断阈值（不篡改顶层 tools，靠 tool_result 系统强提示优雅收尾）
 MAX_TOOL_STEPS = 3
 TOOL_TIME_BUDGET_SECONDS = 60.0
+TOOL_STEP_PACING_SECONDS = float(os.getenv("HEARTBEAT_TOOL_STEP_PACING_SECONDS", "2.5"))
 MIN_WAKE_MINUTES = 12
 MAX_WAKE_MINUTES = 720
 LONG_TERM_ALARM_LEAD_MINUTES = 45
@@ -604,6 +605,8 @@ async def evaluate_heartbeat_gate(
         }
 
     ref_candidates = [stats["last_normal_at"]]
+    if stats.get("last_proactive_at"):
+        ref_candidates.append(stats["last_proactive_at"])
     if unread_chat > 0 and stats.get("last_proactive_chat_at"):
         ref_candidates.append(stats["last_proactive_chat_at"])
     if stats.get("last_proactive_event_at"):
@@ -1227,6 +1230,13 @@ def _aggregate_heartbeat_usage(step_usages: list[dict]) -> dict | None:
     return agg
 
 
+async def _record_heartbeat_attempt_safe(session_id: str, now_utc: datetime | None = None) -> None:
+    try:
+        await db_conversations.record_heartbeat_attempt(session_id, now_utc=now_utc)
+    except Exception as exc:
+        logger.debug("Record heartbeat attempt skipped: %s", exc)
+
+
 async def _run_heartbeat_tick_locked(
     *,
     now_utc: datetime | None = None,
@@ -1371,14 +1381,24 @@ async def _run_heartbeat_tick_locked(
     step_usages: list[dict] = []
     final_msg_obj: dict = {}
 
+    async def _finalize_failed_tick():
+        await _record_heartbeat_attempt_safe(session_id, gate["now_utc"])
+        await _consume_due_alarm(None)
+        if tool_round >= 2:
+            try:
+                await db_conversations.increment_daily_surf_count(session_id, now_local.date())
+            except Exception as exc:
+                logger.debug("Increment daily surf count on failure skipped: %s", exc)
+
     while True:
         remaining_budget = deadline_mono - time.monotonic()
         if remaining_budget <= 2.0:
             logger.warning("Heartbeat total time budget exhausted before upstream step %s", tool_round)
+            await _finalize_failed_tick()
             return {"status": "upstream_timeout", "session_id": session_id}
 
-        if loop_messages and loop_messages[-1].get("role") == "tool" and shared.is_vertex_endpoint():
-            sleep_sec = min(1.0, max(0.0, remaining_budget - 10.0))
+        if loop_messages and loop_messages[-1].get("role") == "tool" and TOOL_STEP_PACING_SECONDS > 0:
+            sleep_sec = min(TOOL_STEP_PACING_SECONDS, max(0.0, remaining_budget - 10.0))
             if sleep_sec > 0:
                 await asyncio.sleep(sleep_sec)
 
@@ -1399,10 +1419,12 @@ async def _run_heartbeat_tick_locked(
                 )
         except httpx.TimeoutException as exc:
             logger.warning("Heartbeat upstream timeout (%.1fs): %s", step_timeout, exc)
+            await _finalize_failed_tick()
             return {"status": "upstream_timeout", "session_id": session_id}
 
         if response.status_code != 200:
             logger.warning("Heartbeat upstream HTTP %s: %s", response.status_code, response.text[:300])
+            await _finalize_failed_tick()
             return {"status": "upstream_error", "code": response.status_code, "session_id": session_id}
 
         resp_data = response.json()
@@ -1500,6 +1522,7 @@ async def _run_heartbeat_tick_locked(
     cleaned_chat, chat_is_silent = _strip_thoughts_and_check_silent(remaining_text)
     if final_msg_obj.get("tool_calls") and not capsules and chat_is_silent:
         print(f"🤫 req={req_id} 工具熔断后无有效正文或胶囊，静默收尾")
+        await _record_heartbeat_attempt_safe(session_id, gate["now_utc"])
         await _consume_due_alarm(None)
         if next_wake_spec:
             await db_conversations.upsert_wake_alarm(
@@ -1509,6 +1532,7 @@ async def _run_heartbeat_tick_locked(
 
     if not capsules and chat_is_silent:
         print(f"💤 req={req_id} 自主唤醒选择静默继续睡（零落库）")
+        await _record_heartbeat_attempt_safe(session_id, gate["now_utc"])
         await _consume_due_alarm(None)
         if next_wake_spec:
             await db_conversations.upsert_wake_alarm(
@@ -1586,6 +1610,7 @@ async def _run_heartbeat_tick_locked(
         )
 
     primary_msg_id = saved_chat_id or (saved_event_ids[-1] if saved_event_ids else None)
+    await _record_heartbeat_attempt_safe(session_id, gate["now_utc"])
     await _consume_due_alarm(primary_msg_id)
     if next_wake_spec:
         await db_conversations.upsert_wake_alarm(
