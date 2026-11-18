@@ -35,16 +35,23 @@ async def api_heartbeat_tick(request: Request = None, background: bool = False):
 
 
 @router.get("/api/proactive/messages")
-async def api_proactive_messages(session_id: str = "", after_id: int = 0, limit: int = 50):
-    """按自增 ID 增量拉取自主唤醒消息，供 Cuplivo 无弹窗同步。"""
+async def api_proactive_messages(
+    session_id: str = "",
+    after_id: int = 0,
+    limit: int = 50,
+    recover_since_ms: int = 0,
+):
+    """按自增 ID 增量拉取自主唤醒消息，供 Cuplivo 无弹窗同步（断流恢复时带 recover_since_ms）。"""
     try:
         target_sid = (session_id or "").strip() or await heartbeat_service.resolve_target_session_id()
         if not target_sid:
             return {"status": "ok", "session_id": "", "messages": [], "latest_id": after_id}
+        extra_kwargs = {"recover_since_ms": recover_since_ms} if recover_since_ms and recover_since_ms > 0 else {}
         msgs = await db_conversations.get_proactive_messages_since(
             target_sid,
             after_id=after_id,
             limit=limit,
+            **extra_kwargs,
         )
         latest_id = msgs[-1]["id"] if msgs else after_id
         return {

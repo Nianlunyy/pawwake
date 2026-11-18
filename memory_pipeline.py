@@ -491,6 +491,7 @@ async def process_memories_background(
     assistant_tool_calls: list = None,
     assistant_reasoning: str = None,
     wake_alarm_spec: dict = None,
+    assistant_usage: dict = None,
 ):
     """
     后台异步：存储对话 + 提取记忆（不阻塞主流程）
@@ -542,6 +543,8 @@ async def process_memories_background(
                 ast_meta_dict["tool_calls"] = assistant_tool_calls
             if assistant_reasoning:
                 ast_meta_dict["reasoning_content"] = assistant_reasoning
+            if assistant_usage and isinstance(assistant_usage, dict):
+                ast_meta_dict["usage"] = assistant_usage
             assistant_meta = json.dumps(ast_meta_dict) if ast_meta_dict else None
 
         # 1. 存储对话记录（除非明确跳过）
@@ -586,8 +589,9 @@ async def process_memories_background(
                         ),
                         None,
                     )
+                    reroll_kwargs = {"metadata": assistant_meta} if assistant_meta is not None else {}
                     assistant_source_id = await db_conversations.update_last_assistant_message(
-                        session_id, assistant_msg, model
+                        session_id, assistant_msg, model, **reroll_kwargs
                     )
                     if assistant_source_id:
                         print(f"🔄 检测到re-roll，已覆盖最后一条assistant回复")

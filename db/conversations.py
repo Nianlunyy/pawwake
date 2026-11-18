@@ -163,7 +163,7 @@ async def get_last_user_content(session_id: str) -> str:
         return row['content'] if row else ""
 
 
-async def update_last_assistant_message(session_id: str, new_content: str, model: str = ""):
+async def update_last_assistant_message(session_id: str, new_content: str, model: str = "", metadata: str = None):
     """覆盖指定session最后一条常规assistant消息的content（用于re-roll去重，绝不误覆主动唤醒消息）"""
     pool = await db_core.get_pool()
     async with pool.acquire() as conn:
@@ -181,15 +181,27 @@ async def update_last_assistant_message(session_id: str, new_content: str, model
                 if shared.CONVERSATION_RECALL_ENABLED
                 else None
             )
-            await conn.execute(
-                f"""UPDATE conversations
-                   SET content = $1,
-                       model = $2,
-                       content_tsv = array_to_tsvector(string_to_array($3, ' ')),
-                       {embedding_column} = NULL
-                   WHERE id = $4 AND deleted_at IS NULL""",
-                new_content, model, tsv_text, row['id']
-            )
+            if metadata is not None:
+                await conn.execute(
+                    f"""UPDATE conversations
+                       SET content = $1,
+                           model = $2,
+                           content_tsv = array_to_tsvector(string_to_array($3, ' ')),
+                           metadata = $4,
+                           {embedding_column} = NULL
+                       WHERE id = $5 AND deleted_at IS NULL""",
+                    new_content, model, tsv_text, metadata, row['id']
+                )
+            else:
+                await conn.execute(
+                    f"""UPDATE conversations
+                       SET content = $1,
+                           model = $2,
+                           content_tsv = array_to_tsvector(string_to_array($3, ' ')),
+                           {embedding_column} = NULL
+                       WHERE id = $4 AND deleted_at IS NULL""",
+                    new_content, model, tsv_text, row['id']
+                )
             if (
                 shared.CONVERSATION_RECALL_ENABLED
                 and shared.EMBEDDING_API_KEY
@@ -1458,25 +1470,57 @@ async def consume_wake_alarm(
     return str(res).endswith("1")
 
 
-async def get_proactive_messages_since(session_id: str, after_id: int = 0, limit: int = 50) -> list[dict]:
-    """按自增 ID 正向拉取增量自主唤醒消息，供 Cuplivo 增量同步。"""
+async def get_proactive_messages_since(
+    session_id: str,
+    after_id: int = 0,
+    limit: int = 50,
+    recover_since_ms: int = 0,
+) -> list[dict]:
+    """按自增 ID 正向拉取增量自主唤醒消息；recover_since_ms>0 时同时纳入断流恢复窗口内的常规 assistant 回复。"""
     pool = await db_core.get_pool()
+    recover_ms = int(recover_since_ms or 0)
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """SELECT id, session_id, role, content, model, metadata,
-                      COALESCE(message_type, 'normal') AS message_type,
-                      proactive_meta, created_at
-               FROM conversations
-               WHERE session_id = $1
-                 AND deleted_at IS NULL
-                 AND id > $2
-                 AND COALESCE(message_type, 'normal') IN ('proactive_chat', 'proactive_event')
-               ORDER BY id ASC
-               LIMIT $3""",
-            session_id,
-            max(0, int(after_id)),
-            max(1, min(200, int(limit))),
-        )
+        if recover_ms > 0:
+            since_window_ms = max(0, recover_ms - 15000)
+            rows = await conn.fetch(
+                """SELECT id, session_id, role, content, model, metadata,
+                          COALESCE(message_type, 'normal') AS message_type,
+                          proactive_meta, created_at
+                   FROM conversations
+                   WHERE session_id = $1
+                     AND deleted_at IS NULL
+                     AND id > $2
+                     AND (
+                       COALESCE(message_type, 'normal') IN ('proactive_chat', 'proactive_event')
+                       OR (
+                         role = 'assistant'
+                         AND COALESCE(message_type, 'normal') = 'normal'
+                         AND created_at >= to_timestamp($4 / 1000.0)
+                       )
+                     )
+                   ORDER BY id ASC
+                   LIMIT $3""",
+                session_id,
+                max(0, int(after_id)),
+                max(1, min(200, int(limit))),
+                since_window_ms,
+            )
+        else:
+            rows = await conn.fetch(
+                """SELECT id, session_id, role, content, model, metadata,
+                          COALESCE(message_type, 'normal') AS message_type,
+                          proactive_meta, created_at
+                   FROM conversations
+                   WHERE session_id = $1
+                     AND deleted_at IS NULL
+                     AND id > $2
+                     AND COALESCE(message_type, 'normal') IN ('proactive_chat', 'proactive_event')
+                   ORDER BY id ASC
+                   LIMIT $3""",
+                session_id,
+                max(0, int(after_id)),
+                max(1, min(200, int(limit))),
+            )
     results = []
     for r in rows:
         meta = _decode_json_field(r.get("metadata"))

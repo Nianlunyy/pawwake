@@ -369,6 +369,79 @@ class HeartbeatPhase1Tests(unittest.TestCase):
 
         asyncio.run(run_routes())
 
+    def test_stream_disconnect_recovery_sync_and_usage_persistence(self):
+        fake_conn = MagicMock()
+        fake_conn.fetch = AsyncMock(return_value=[
+            {
+                "id": 201,
+                "session_id": "s-main",
+                "role": "assistant",
+                "content": "完整回复",
+                "model": "gemini-4-hydrogen",
+                "metadata": json.dumps({
+                    "reasoning_content": "完整思维链",
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+                }),
+                "message_type": "normal",
+                "proactive_meta": None,
+                "created_at": datetime(2026, 11, 18, 2, 56, 55, tzinfo=timezone.utc),
+            }
+        ])
+        fake_acquire = MagicMock()
+        fake_acquire.__aenter__ = AsyncMock(return_value=fake_conn)
+        fake_acquire.__aexit__ = AsyncMock(return_value=None)
+        fake_pool = MagicMock()
+        fake_pool.acquire.return_value = fake_acquire
+
+        async def run_recovery_checks():
+            # 1) recover_since_ms=0 走原有仅 proactive 的 SQL；>0 带上常规 assistant 窗口条件
+            with patch.object(db_core, "get_pool", new=AsyncMock(return_value=fake_pool)):
+                await db_conversations.get_proactive_messages_since("s-main", after_id=100, limit=50)
+                sql_default = fake_conn.fetch.await_args.args[0]
+                self.assertNotIn("to_timestamp", sql_default)
+
+                rows = await db_conversations.get_proactive_messages_since(
+                    "s-main", after_id=100, limit=50, recover_since_ms=1794970475267
+                )
+                sql_recover = fake_conn.fetch.await_args.args[0]
+                self.assertIn("to_timestamp($4 / 1000.0)", sql_recover)
+                self.assertEqual(fake_conn.fetch.await_args.args[4], 1794970475267 - 15000)
+                self.assertEqual(rows[0]["reasoning"], "完整思维链")
+                self.assertEqual(rows[0]["usage"]["total_tokens"], 150)
+
+            # 2) api_proactive_messages 仅在 recover_since_ms > 0 时透传该参数
+            with patch.object(heartbeat_service, "resolve_target_session_id", new=AsyncMock(return_value="s-main")), \
+                 patch.object(db_conversations, "get_proactive_messages_since", new=AsyncMock(return_value=[])) as mock_get:
+                await heartbeat_routes.api_proactive_messages(after_id=100)
+                self.assertNotIn("recover_since_ms", mock_get.await_args.kwargs)
+
+                await heartbeat_routes.api_proactive_messages(after_id=100, recover_since_ms=1794970475267)
+                self.assertEqual(mock_get.await_args.kwargs["recover_since_ms"], 1794970475267)
+
+            # 3) process_memories_background 将 assistant_usage 写入 metadata
+            saved_calls = []
+            async def fake_save(sid, role, content, model="", metadata=None, **kwargs):
+                saved_calls.append({"role": role, "metadata": metadata})
+                return len(saved_calls)
+
+            with patch.object(memory_pipeline.shared, "MEMORY_ENABLED", False), \
+                 patch.object(memory_pipeline.db_conversations, "get_last_user_content", new=AsyncMock(return_value="上一句")), \
+                 patch.object(memory_pipeline.db_conversations, "save_message", side_effect=fake_save):
+                await memory_pipeline.process_memories_background(
+                    session_id="s-main",
+                    user_msg="新问题",
+                    assistant_msg="新回复",
+                    model="test-model",
+                    assistant_reasoning="思考",
+                    assistant_usage={"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+                )
+            ast_saved = [c for c in saved_calls if c["role"] == "assistant"][0]
+            meta_obj = json.loads(ast_saved["metadata"])
+            self.assertEqual(meta_obj["reasoning_content"], "思考")
+            self.assertEqual(meta_obj["usage"]["total_tokens"], 30)
+
+        asyncio.run(run_recovery_checks())
+
 
 if __name__ == "__main__":
     unittest.main()

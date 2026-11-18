@@ -1050,6 +1050,7 @@ async def _chat_completions_body(request: Request, pending_reminder_claims: list
                     delivered_ok = True
 
                     if shared.conversation_persistence_enabled() and (user_message or tool_messages):
+                        nonstream_usage = resp_data.get("usage") if isinstance(resp_data.get("usage"), dict) else None
                         asyncio.create_task(
                             memory_pipeline.process_memories_background(session_id, user_message, assistant_msg, model,
                                                         context_messages=extraction_context_messages,
@@ -1057,7 +1058,8 @@ async def _chat_completions_body(request: Request, pending_reminder_claims: list
                                                         skip_conversation_log=skip_conversation_log,
                                                         tool_messages=tool_messages, assistant_tool_calls=assistant_tool_calls,
                                                         assistant_reasoning=assistant_reasoning,
-                                                        wake_alarm_spec=parsed_wake_alarm)
+                                                        wake_alarm_spec=parsed_wake_alarm,
+                                                        assistant_usage=nonstream_usage)
                         )
 
                     return JSONResponse(status_code=200, content=resp_data)
@@ -1835,7 +1837,8 @@ async def _stream_and_capture_inner(
                                         context_round_count=extraction_round_count,
                                         skip_conversation_log=skip_conversation_log,
                                         tool_messages=tool_messages, assistant_tool_calls=assistant_tool_calls,
-                                        assistant_reasoning=assistant_reasoning)
+                                        assistant_reasoning=assistant_reasoning,
+                                        assistant_usage=stream_usage if stream_usage else None)
         )
 
     if stream_state is not None:
