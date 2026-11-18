@@ -1031,9 +1031,10 @@ async def _chat_completions_body(request: Request, pending_reminder_claims: list
                     try:
                         msg_obj = resp_data["choices"][0]["message"]
                         raw_assistant_msg = msg_obj.get("content") or ""
-                        if "<next_wake" in raw_assistant_msg.lower():
+                        if "<next_wake" in raw_assistant_msg.lower() or "<topic" in raw_assistant_msg.lower():
                             import heartbeat_service as _hb_service
                             assistant_msg, parsed_wake_alarm = _hb_service.parse_and_strip_next_wake(raw_assistant_msg)
+                            assistant_msg, _ = _hb_service.parse_and_strip_topic(assistant_msg)
                             msg_obj["content"] = assistant_msg
                         else:
                             assistant_msg = raw_assistant_msg

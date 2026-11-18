@@ -749,6 +749,28 @@
                         <label>感知城市 (HEARTBEAT_WEATHER_CITY)</label>
                         <input type="text" id="set-HEARTBEAT_WEATHER_CITY" class="input" placeholder="南京">
                     </div>
+                    <div class="settings-field">
+                        <label>每日深度冲浪配额 (HEARTBEAT_SURF_DAILY_LIMIT)</label>
+                        <input type="number" id="set-HEARTBEAT_SURF_DAILY_LIMIT" class="input" min="0" max="10">
+                        <small class="form-hint">每天最多允许模型连续多轮调用论坛/搜索工具的次数（0~10，默认 2）；配额用尽后自动切为 1 步轻量唤醒</small>
+                    </div>
+                    <div class="settings-field">
+                        <label>单次冲浪最大工具步数 (HEARTBEAT_SURF_MAX_STEPS)</label>
+                        <input type="number" id="set-HEARTBEAT_SURF_MAX_STEPS" class="input" min="2" max="10">
+                        <small class="form-hint">额度充足时单次唤醒允许的最大工具步数（代码内受 min(配置, 5) 与 60 秒耗时红线双约束）</small>
+                    </div>
+                    <div class="settings-field" style="margin-top:16px; padding:12px 14px; border-radius:10px; background:var(--bg-soft, rgba(128,128,128,0.08)); border:1px solid var(--border-color, rgba(128,128,128,0.18));">
+                        <div style="display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px;">
+                            <strong style="font-size:13px;">实时心跳状态概览</strong>
+                            <button type="button" class="btn btn-secondary" onclick="loadHeartbeatStatus()" id="refresh-hb-status-btn" style="padding:4px 10px; font-size:12px;">刷新状态</button>
+                        </div>
+                        <div style="font-size:12px; line-height:1.7; color:var(--text-secondary, #666);">
+                            <div>门卫与会话：<span id="hb-status-gate">加载中...</span></div>
+                            <div>未读与配额：<span id="hb-status-quotas">-</span></div>
+                            <div>待触发闹钟：<span id="hb-status-alarm">无</span></div>
+                            <div>96h 冷却话题：<span id="hb-status-topics">无</span></div>
+                        </div>
+                    </div>
                 </div>
 
                 <!-- 其他 -->
@@ -786,6 +808,6 @@
         </main>
     </div>
 
-    <script src="/static/js/dashboard.js?v=4.3.0"></script>
+    <script src="/static/js/dashboard.js?v=4.4.0"></script>
 </body>
 </html>

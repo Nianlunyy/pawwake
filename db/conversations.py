@@ -2,7 +2,7 @@
 
 import json
 import logging
-from datetime import datetime, timedelta, timezone as dt_timezone
+from datetime import date, datetime, timedelta, timezone as dt_timezone
 
 import shared
 from db import core as db_core
@@ -1366,6 +1366,12 @@ async def get_heartbeat_session_stats(session_id: str) -> dict:
                LIMIT 1""",
             session_id,
         )
+        surf_row = await conn.fetchrow(
+            """SELECT daily_surf_date, daily_surf_count
+               FROM session_cache_state
+               WHERE session_id = $1""",
+            session_id,
+        )
 
     return {
         "latest_id": latest["id"] if latest else None,
@@ -1381,6 +1387,8 @@ async def get_heartbeat_session_stats(session_id: str) -> dict:
         "last_proactive_chat_at": unread_row["last_proactive_chat_at"] if unread_row else None,
         "last_proactive_event_at": unread_row["last_proactive_event_at"] if unread_row else None,
         "pending_alarm": dict(alarm_row) if alarm_row else None,
+        "daily_surf_date": surf_row["daily_surf_date"] if surf_row else None,
+        "daily_surf_count": int(surf_row["daily_surf_count"] or 0) if surf_row else 0,
     }
 
 
@@ -1468,6 +1476,190 @@ async def consume_wake_alarm(
             consumed_message_id,
         )
     return str(res).endswith("1")
+
+
+async def get_daily_surf_state(session_id: str, today_local_date: date) -> int:
+    """读取今日深度冲浪次数；若已跨自然日（按本地日期）则自动归零并刷新日期。"""
+    if not session_id:
+        return 0
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT daily_surf_date, daily_surf_count
+               FROM session_cache_state
+               WHERE session_id = $1""",
+            session_id,
+        )
+        if not row:
+            return 0
+        stored_date = row["daily_surf_date"]
+        if stored_date != today_local_date:
+            await conn.execute(
+                """UPDATE session_cache_state
+                   SET daily_surf_date = $2,
+                       daily_surf_count = 0,
+                       updated_at = NOW()
+                   WHERE session_id = $1""",
+                session_id,
+                today_local_date,
+            )
+            return 0
+        return max(0, int(row["daily_surf_count"] or 0))
+
+
+async def increment_daily_surf_count(session_id: str, today_local_date: date) -> int:
+    """累加今日深度冲浪计数（跨自然日自动重置为 1）。"""
+    if not session_id:
+        return 0
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        val = await conn.fetchval(
+            """INSERT INTO session_cache_state AS scs (
+                   session_id, summary, a_start_round,
+                   daily_surf_date, daily_surf_count, updated_at
+               ) VALUES ($1, '', 0, $2, 1, NOW())
+               ON CONFLICT (session_id) DO UPDATE
+               SET daily_surf_count = CASE
+                       WHEN scs.daily_surf_date = $2 THEN COALESCE(scs.daily_surf_count, 0) + 1
+                       ELSE 1
+                   END,
+                   daily_surf_date = $2,
+                   updated_at = NOW()
+               RETURNING daily_surf_count""",
+            session_id,
+            today_local_date,
+        )
+    return max(0, int(val or 0))
+
+
+async def upsert_proactive_topic(
+    session_id: str,
+    topic_key: str,
+    topic_summary: str = "",
+    now_utc: datetime | None = None,
+) -> dict | None:
+    """登记或刷新 96 小时反刍翻篇主题账本（96h 内命中 >= 2 次自动触发 96h 冷却锁）。"""
+    norm_key = (topic_key or "").strip()[:64]
+    norm_summary = (topic_summary or norm_key or "").strip()[:120]
+    if not session_id or not norm_key:
+        return None
+    now_ts = now_utc or datetime.now(dt_timezone.utc)
+    if now_ts.tzinfo is None:
+        now_ts = now_ts.replace(tzinfo=dt_timezone.utc)
+
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        existing = await conn.fetchrow(
+            """SELECT id, topic_key, topic_summary, hit_count, first_seen_at, last_seen_at, cooldown_until
+               FROM proactive_topics
+               WHERE session_id = $1 AND topic_key = $2""",
+            session_id,
+            norm_key,
+        )
+        reset_window = True
+        if existing and existing["last_seen_at"] is not None:
+            last_seen = existing["last_seen_at"]
+            if last_seen.tzinfo is None:
+                last_seen = last_seen.replace(tzinfo=dt_timezone.utc)
+            if (now_ts - last_seen) <= timedelta(hours=96):
+                reset_window = False
+
+        if not existing:
+            row = await conn.fetchrow(
+                """INSERT INTO proactive_topics (
+                       session_id, topic_key, topic_summary, hit_count,
+                       first_seen_at, last_seen_at, cooldown_until
+                   ) VALUES ($1, $2, $3, 1, $4, $4, NULL)
+                   RETURNING id, session_id, topic_key, topic_summary, hit_count,
+                             first_seen_at, last_seen_at, cooldown_until""",
+                session_id,
+                norm_key,
+                norm_summary,
+                now_ts,
+            )
+        elif reset_window:
+            row = await conn.fetchrow(
+                """UPDATE proactive_topics
+                   SET topic_summary = $3,
+                       hit_count = 1,
+                       first_seen_at = $4,
+                       last_seen_at = $4,
+                       cooldown_until = NULL
+                   WHERE session_id = $1 AND topic_key = $2
+                   RETURNING id, session_id, topic_key, topic_summary, hit_count,
+                             first_seen_at, last_seen_at, cooldown_until""",
+                session_id,
+                norm_key,
+                norm_summary,
+                now_ts,
+            )
+        else:
+            new_hits = max(1, int(existing["hit_count"] or 1)) + 1
+            new_cooldown = (now_ts + timedelta(hours=96)) if new_hits >= 2 else existing["cooldown_until"]
+            final_summary = norm_summary or existing["topic_summary"] or norm_key
+            row = await conn.fetchrow(
+                """UPDATE proactive_topics
+                   SET topic_summary = $3,
+                       hit_count = $4,
+                       last_seen_at = $5,
+                       cooldown_until = $6
+                   WHERE session_id = $1 AND topic_key = $2
+                   RETURNING id, session_id, topic_key, topic_summary, hit_count,
+                             first_seen_at, last_seen_at, cooldown_until""",
+                session_id,
+                norm_key,
+                final_summary,
+                new_hits,
+                now_ts,
+                new_cooldown,
+            )
+    return dict(row) if row else None
+
+
+async def get_active_proactive_topics(
+    session_id: str,
+    now_utc: datetime | None = None,
+    limit: int = 8,
+) -> list[dict]:
+    """查询近 96 小时内聊过或正在 96 小时冷却锁内的自主唤醒话题。"""
+    if not session_id:
+        return []
+    now_ts = now_utc or datetime.now(dt_timezone.utc)
+    if now_ts.tzinfo is None:
+        now_ts = now_ts.replace(tzinfo=dt_timezone.utc)
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT topic_key, topic_summary, hit_count, first_seen_at, last_seen_at, cooldown_until
+               FROM proactive_topics
+               WHERE session_id = $1
+                 AND (
+                   (cooldown_until IS NOT NULL AND cooldown_until > $2)
+                   OR last_seen_at >= $2 - INTERVAL '96 hours'
+                 )
+               ORDER BY (cooldown_until IS NOT NULL AND cooldown_until > $2) DESC,
+                        hit_count DESC,
+                        last_seen_at DESC
+               LIMIT $3""",
+            session_id,
+            now_ts,
+            max(1, min(20, int(limit))),
+        )
+    items = []
+    for r in rows:
+        cooldown_until = r["cooldown_until"]
+        if cooldown_until is not None and cooldown_until.tzinfo is None:
+            cooldown_until = cooldown_until.replace(tzinfo=dt_timezone.utc)
+        items.append({
+            "topic_key": r["topic_key"],
+            "topic_summary": r["topic_summary"] or r["topic_key"],
+            "hit_count": int(r["hit_count"] or 1),
+            "first_seen_at": r["first_seen_at"],
+            "last_seen_at": r["last_seen_at"],
+            "cooldown_until": cooldown_until,
+            "is_cooling": bool(cooldown_until is not None and cooldown_until > now_ts),
+        })
+    return items
 
 
 async def get_proactive_messages_since(

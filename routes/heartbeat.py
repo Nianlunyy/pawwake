@@ -66,7 +66,7 @@ async def api_proactive_messages(
 
 @router.get("/api/heartbeat/status")
 async def api_heartbeat_status():
-    """查看自主唤醒开关、锁定主会话与当前门卫状态。"""
+    """查看自主唤醒开关、锁定主会话、配额水位、待触发闹钟与 96h 冷却话题。"""
     try:
         target_sid = await heartbeat_service.resolve_target_session_id()
         gate = (
@@ -75,6 +75,12 @@ async def api_heartbeat_status():
             else {"allowed": False, "status": "skipped_no_session"}
         )
         stats = gate.get("stats") or {}
+        if not stats and target_sid and shared.DATABASE_ENABLED:
+            try:
+                stats = await db_conversations.get_heartbeat_session_stats(target_sid)
+            except Exception:
+                stats = {}
+
         pending_alarm = stats.get("pending_alarm")
         alarm_info = None
         if isinstance(pending_alarm, dict):
@@ -85,6 +91,41 @@ async def api_heartbeat_status():
                 "reason": pending_alarm.get("reason", ""),
                 "status": pending_alarm.get("status", "pending"),
             }
+
+        now_local = heartbeat_service._to_local_dt()
+        if "daily_surf_count" in gate:
+            daily_surf_count = int(gate.get("daily_surf_count") or 0)
+        else:
+            raw_surf_date = stats.get("daily_surf_date")
+            if hasattr(raw_surf_date, "date") and callable(raw_surf_date.date):
+                raw_surf_date = raw_surf_date.date()
+            daily_surf_count = (
+                int(stats.get("daily_surf_count") or 0)
+                if (raw_surf_date is None or raw_surf_date == now_local.date())
+                else 0
+            )
+        surf_daily_limit = max(0, min(10, int(shared.HEARTBEAT_SURF_DAILY_LIMIT)))
+        surf_max_steps = max(2, min(10, int(shared.HEARTBEAT_SURF_MAX_STEPS)))
+        surf_quota_remaining = max(0, surf_daily_limit - daily_surf_count)
+
+        cooling_topics = []
+        if target_sid and shared.DATABASE_ENABLED:
+            try:
+                raw_topics = await db_conversations.get_active_proactive_topics(target_sid)
+                for item in raw_topics:
+                    cooldown_dt = item.get("cooldown_until")
+                    last_seen_dt = item.get("last_seen_at")
+                    cooling_topics.append({
+                        "topic_key": item.get("topic_key", ""),
+                        "topic_summary": item.get("topic_summary", ""),
+                        "hit_count": int(item.get("hit_count") or 1),
+                        "is_cooling": bool(item.get("is_cooling")),
+                        "last_seen_at": last_seen_dt.isoformat() if hasattr(last_seen_dt, "isoformat") else str(last_seen_dt or ""),
+                        "cooldown_until": cooldown_dt.isoformat() if hasattr(cooldown_dt, "isoformat") else (str(cooldown_dt) if cooldown_dt else None),
+                    })
+            except Exception:
+                cooling_topics = []
+
         return {
             "status": "ok",
             "enabled": shared.HEARTBEAT_ENABLED,
@@ -96,6 +137,11 @@ async def api_heartbeat_status():
             "base_cooldown_minutes": shared.HEARTBEAT_BASE_COOLDOWN_MINUTES,
             "quiet_hours": f"{shared.HEARTBEAT_QUIET_START}-{shared.HEARTBEAT_QUIET_END}",
             "pending_alarm": alarm_info,
+            "daily_surf_count": daily_surf_count,
+            "surf_daily_limit": surf_daily_limit,
+            "surf_max_steps": surf_max_steps,
+            "surf_quota_remaining": surf_quota_remaining,
+            "cooling_topics": cooling_topics,
         }
     except Exception:
         return shared._api_failure("获取自主唤醒状态失败")

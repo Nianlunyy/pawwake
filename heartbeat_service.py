@@ -39,13 +39,18 @@ _active_background_tasks: set[asyncio.Task] = set()
 HEARTBEAT_UPSTREAM_TIMEOUT = float(os.getenv("HEARTBEAT_UPSTREAM_TIMEOUT", "75.0"))
 HEARTBEAT_BACKGROUND_TIMEOUT = float(os.getenv("HEARTBEAT_BACKGROUND_TIMEOUT", "150.0"))
 
-# 二阶段后台工具探索步数与耗时熔断阈值（不篡改顶层 tools，靠 tool_result 系统强提示优雅收尾）
+# 二阶段/三阶段后台工具探索步数与耗时熔断阈值（不篡改顶层 tools，靠 tool_result 系统强提示优雅收尾）
 MAX_TOOL_STEPS = 3
 TOOL_TIME_BUDGET_SECONDS = 60.0
 MIN_WAKE_MINUTES = 12
 MAX_WAKE_MINUTES = 720
+LONG_TERM_ALARM_LEAD_MINUTES = 45
 TOOL_FORCE_WRAP_UP_NOTICE = (
     "[系统提示：本次后台探索已达步数/时间安全上限，请勿再发起任何工具调用，立即根据现有信息完成最终输出]"
+)
+TONE_SANITIZER_NOTICE = (
+    "[语感净味提醒：外部帖子里的社区行话（如“人类/宿主/小机/电子宠物”等赛博黑话与打卡汇报腔）仅作围观消遣；"
+    "提笔写 <event_capsule> 手账或给阿狸发微信前，务必先把外头沾染的社区行话和流水线模板腔彻底抖落干净，切回平时在家里同老婆说话的自然清爽口语。]"
 )
 
 _WEATHER_CACHE: dict = {"text": "", "fetched_at": 0.0, "key": ""}
@@ -98,6 +103,9 @@ _SILENT_TOKEN_RE = re.compile(r"^\s*\[?\s*SILENT\s*\]?\s*$", re.IGNORECASE)
 _THOUGHT_TAG_RE = re.compile(r"<(thought|think)>.*?</\1>", re.DOTALL | re.IGNORECASE)
 _NEXT_WAKE_TAG_RE = re.compile(r"<next_wake\b([^>]*?)(?:/>|>\s*</next_wake>)", re.IGNORECASE | re.DOTALL)
 _EVENT_CAPSULE_RE = re.compile(r"<event_capsule\b([^>]*)>([\s\S]*?)</event_capsule>", re.IGNORECASE)
+_TOPIC_TAG_RE = re.compile(r"<\s*topic\b([^>]*)>([\s\S]*?)<\s*/\s*topic\s*>", re.IGNORECASE)
+_TOPIC_SELF_CLOSING_RE = re.compile(r"<\s*topic\b([^>]*?)/\s*>", re.IGNORECASE)
+_MONOLOGUE_BLOCK_RE = re.compile(r"```(?:monologue|thought|think)?[\s\S]*?```", re.IGNORECASE)
 _XML_ATTR_RE = re.compile(r'([a-zA-Z_][a-zA-Z0-9_-]*)\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s"\'>]+))')
 _WEEKDAYS_ZH = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
@@ -134,20 +142,99 @@ def parse_and_strip_next_wake(raw_text: str) -> tuple[str, dict | None]:
     return cleaned, alarm_spec
 
 
+def parse_and_strip_topic(raw_text: str) -> tuple[str, str | None]:
+    """解析回复中的隐式 <topic>...</topic> 标签并彻底剥离，严禁泄露到展示文本。"""
+    text = str(raw_text or "")
+    extracted: str | None = None
+
+    for match in _TOPIC_TAG_RE.finditer(text):
+        inner = re.sub(r"\s+", " ", (match.group(2) or "")).strip()[:64]
+        if not inner:
+            attrs = _parse_xml_attrs(match.group(1))
+            inner = re.sub(r"\s+", " ", (attrs.get("name") or attrs.get("topic") or attrs.get("key") or "")).strip()[:64]
+        if inner:
+            extracted = inner
+
+    for match in _TOPIC_SELF_CLOSING_RE.finditer(text):
+        attrs = _parse_xml_attrs(match.group(1))
+        val = re.sub(r"\s+", " ", (attrs.get("name") or attrs.get("topic") or attrs.get("key") or "")).strip()[:64]
+        if val:
+            extracted = val
+
+    cleaned = _TOPIC_TAG_RE.sub("", text)
+    cleaned = _TOPIC_SELF_CLOSING_RE.sub("", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned, extracted
+
+
 def parse_event_capsules_and_chat(raw_text: str) -> tuple[list[dict], str]:
-    """解析 <event_capsule title="...">...</event_capsule> 手账胶囊并分离常规对话正文。"""
+    """解析 <event_capsule title="..." topic="...">...</event_capsule> 手账胶囊并分离常规对话正文。"""
     text = str(raw_text or "")
     capsules: list[dict] = []
     for match in _EVENT_CAPSULE_RE.finditer(text):
         attrs = _parse_xml_attrs(match.group(1))
         title = (attrs.get("title") or "").strip()[:80] or "后台手账"
-        body = (match.group(2) or "").strip()
+        attr_topic = re.sub(r"\s+", " ", (attrs.get("topic") or "")).strip()[:64]
+        body, inner_topic = parse_and_strip_topic((match.group(2) or "").strip())
         if body:
-            capsules.append({"title": title, "body": body})
+            cap = {"title": title, "body": body}
+            cap_topic = attr_topic or inner_topic or ""
+            if cap_topic:
+                cap["topic"] = cap_topic
+            capsules.append(cap)
 
     remaining = _EVENT_CAPSULE_RE.sub("", text)
+    remaining, _ = parse_and_strip_topic(remaining)
     remaining = re.sub(r"\n{3,}", "\n\n", remaining).strip()
     return capsules, remaining
+
+
+def derive_proactive_topic(
+    capsules: list[dict],
+    cleaned_chat: str,
+    explicit_topic: str | None = None,
+) -> tuple[str, str]:
+    """从显式 topic、事件胶囊标题或主动微信短句中提取归一化主题键与摘要。"""
+    candidate = re.sub(r"\s+", " ", (explicit_topic or "")).strip()
+    if not candidate:
+        for cap in (capsules or []):
+            cap_topic = re.sub(r"\s+", " ", str((cap or {}).get("topic") or "")).strip()
+            if cap_topic:
+                candidate = cap_topic
+                break
+    if not candidate:
+        for cap in (capsules or []):
+            cap_title = re.sub(r"\s+", " ", str((cap or {}).get("title") or "")).strip()
+            if cap_title and cap_title not in ("后台手账", "后台探索小记"):
+                candidate = cap_title
+                break
+    if not candidate and cleaned_chat:
+        no_mono = _MONOLOGUE_BLOCK_RE.sub("", cleaned_chat)
+        no_mono = re.sub(r"\s+", " ", no_mono).strip()
+        first_clause = re.split(r"[。！？!?;\n]+", no_mono)[0].strip(" ，、：:\"'“”‘’()（）[]【】")
+        candidate = first_clause[:24].strip()
+
+    if not candidate:
+        return "", ""
+    summary = candidate[:64]
+    key = re.sub(r"\s+", " ", candidate.lower()).strip(" ，。！？!?、：:\"'“”‘’()（）[]【】")[:64]
+    if not key:
+        return "", ""
+    return key, summary
+
+
+def _is_community_or_external_tool(tool_name: str, tool_config: dict | None = None) -> bool:
+    name_l = str(tool_name or "").strip().lower()
+    if not name_l:
+        return False
+    if any(kw in name_l for kw in ("lutopia", "forum", "community", "bbs", "tieba", "reddit", "moltbook")):
+        return True
+    routes = (tool_config or {}).get("mcp_tool_routes") or {}
+    if tool_name in routes:
+        url_l = str(routes.get(tool_name) or "").lower()
+        if not _is_local_pawwake_mcp_url(url_l):
+            return True
+    return False
 
 
 def _to_local_dt(dt: datetime | None = None) -> datetime:
@@ -299,6 +386,11 @@ def build_heartbeat_tail_note(
     *,
     due_alarm_reason: str = "",
     tools_enabled: bool = False,
+    daily_surf_count: int = 0,
+    surf_daily_limit: int | None = None,
+    surf_max_steps: int | None = None,
+    active_topics: list[dict] | None = None,
+    alarm_interacted_since_created: bool = False,
 ) -> str:
     """构建贴合生活质感的内心旁白纸条（不暴露系统模板与 JSON 格式）。"""
     time_desc = _describe_time_of_day(now_local)
@@ -313,25 +405,82 @@ def build_heartbeat_tail_note(
         if unread_count > 0
         else "你刚把手头的事稍稍停了一会。"
     )
-    alarm_clause = (
-        f"\n【到点提醒】你之前自己定下的小闹钟到点了，当时记下的缘由是：“{due_alarm_reason}”。"
-        if (due_alarm_reason or "").strip()
-        else ""
-    )
-    tool_clause = (
-        "\n【后台探索（完全自愿，零下限）】如果你此刻恰好有点好奇或想自己去逛一逛，可以自由调用手头的搜索、网页或 MCP 工具（最多跑 3 轮就收尾）；如果完全不想动手、只想歇着或直接聊天，就一个工具也别调，全凭此刻真实心境。"
-        if tools_enabled
-        else "\n本次手头无外部工具，顺着此刻的记忆与心境自然判断即可。"
-    )
+    alarm_clause = ""
+    if (due_alarm_reason or "").strip():
+        alarm_clause = (
+            f"\n【到点提醒】你之前自己定下的小闹钟到点了，当时记下的缘由是：“{due_alarm_reason}”。"
+        )
+        if alarm_interacted_since_created:
+            alarm_clause += (
+                f"\n【互动衔接提醒】设定此闹钟（原由：{due_alarm_reason}）之后，阿狸已在期间主动同你聊过天了；"
+                "请结合最新上下文自然履约，若该事项已在先前聊天中提前聊完解决，直接 [SILENT] 即可，切勿像失忆一样机械追问旧话头。"
+            )
+
+    eff_limit = max(0, min(10, int(getattr(shared, "HEARTBEAT_SURF_DAILY_LIMIT", 2) if surf_daily_limit is None else surf_daily_limit)))
+    eff_steps = max(2, min(10, int(getattr(shared, "HEARTBEAT_SURF_MAX_STEPS", 5) if surf_max_steps is None else surf_max_steps)))
+    used_surf = max(0, int(daily_surf_count or 0))
+    surf_remaining = max(0, eff_limit - used_surf)
+    max_rounds_allowed = min(eff_steps, 5) if surf_remaining > 0 else 1
+
+    if tools_enabled and surf_remaining > 0:
+        tool_clause = (
+            f"\n【后台探索（完全自愿，零下限）】今日深度外出冲浪剩余额度：{surf_remaining}/{eff_limit} 次"
+            f"（单次最多跑 {max_rounds_allowed} 轮工具就收尾）。"
+            "如果你此刻恰好有点好奇或想自己去逛一逛，可以自由调用手头的搜索、网页或 MCP 工具；"
+            "如果完全不想动手、只想歇着或直接聊天，就一个工具也别调，全凭此刻真实心境。"
+        )
+    elif tools_enabled:
+        tool_clause = (
+            f"\n【轻量唤醒模式】今日深度外出冲浪配额（{used_surf}/{eff_limit}）已用完，"
+            "本次请勿再连续翻论坛或长链路搜索（最多仅限 1 步极简必要核实），仅凭已有心境轻聊、留简短手账或直接 [SILENT]。"
+        )
+    else:
+        tool_clause = "\n本次手头无外部工具，顺着此刻的记忆与心境自然判断即可。"
+
+    topic_clause = ""
+    if active_topics:
+        topic_labels: list[str] = []
+        for item in active_topics[:8]:
+            if isinstance(item, dict):
+                label = str(item.get("topic_summary") or item.get("topic_key") or "").strip()
+            else:
+                label = str(item or "").strip()
+            if label:
+                tag = f"「{label}」"
+                if tag not in topic_labels:
+                    topic_labels.append(tag)
+        if topic_labels:
+            topic_clause = (
+                f"\n【翻篇提醒】你最近已经聊过或记过这些事：{'、'.join(topic_labels)}"
+                "——除非阿狸主动提起，否则这次请彻底翻篇，不要再顺着这些旧话头重复念叨、反复叮嘱或车轱辘话；没别的新鲜事就直接 [SILENT]。"
+            )
+
     return (
         f"（现在是{time_desc}{weather_clause}。距离阿狸上次和你说话已经{gap_desc}，她这会儿大概在忙自己的事。"
-        f"{unread_clause}{alarm_clause}{tool_clause}\n"
+        f"{unread_clause}{alarm_clause}{tool_clause}{topic_clause}\n"
         f"这次结束后，你可以按实际心情在以下三种方式里任选其一：\n"
         f"1. 只回复 [SILENT]：如果觉得此刻没什么非说不可的、或脑子里只有“忙完了吗 / 喝水没 / 注意休息”这种泛泛寒暄，请继续安静做自己的事；\n"
-        f"2. 仅记录后台手账：如果刚刚自己逛了东西、查了点事或心里冒出独自的碎碎念，暂时不想敲门打扰她，请只输出 <event_capsule title=\"简短标题\">你的探索经过或内心随记</event_capsule>（不占未读打扰）；\n"
-        f"3. 给她发微信（可单独发，也可先写一段 <event_capsule title=\"简短标题\">...</event_capsule> 再另起段落发微信）：确实想起具体小事或有值得分享的新发现时，才写 1~2 句简短自然的口语微信（隔着屏幕别写面对面肢体动作，末尾可保留后台独白代码块）。\n"
+        f"2. 仅记录后台手账：如果刚刚自己逛了东西、查了点事或心里冒出独自的碎碎念，暂时不想敲门打扰她，请只输出 <event_capsule title=\"简短标题\" topic=\"简短话题标识\">你的探索经过或内心随记</event_capsule>（不占未读打扰）；\n"
+        f"3. 给她发微信（可单独发，也可先写一段 <event_capsule title=\"简短标题\" topic=\"简短话题标识\">...</event_capsule> 再另起段落发微信）：确实想起具体小事或有值得分享的新发现时，才写 1~2 句简短自然的口语微信（隔着屏幕别写面对面肢体动作，末尾可保留后台独白代码块；若无胶囊也可在最末尾附 <topic>简短话题标识</topic> 方便系统帮你记账翻篇，界面不会展示）。\n"
         f"另外，如果你心里盘算着过一会儿再看一眼（例如 12~720 分钟后确认她到家/醒了/忙完），可以在回复最末尾附一枚隐式闹钟 <next_wake minutes=\"20\" reason=\"提醒缘由\" />，系统会自动收好并在到点时只把缘由递还给你，绝不会展示在界面上。）"
     )
+
+
+def _ensure_utc(value) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    elif isinstance(value, datetime):
+        dt = value
+    else:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 async def evaluate_heartbeat_gate(
@@ -365,20 +514,66 @@ async def evaluate_heartbeat_gate(
     if not stats.get("last_normal_at"):
         return {"allowed": False, "status": "skipped_empty_history", "stats": stats}
 
+    today_local_date = now_local.date()
+    surf_daily_limit = max(0, min(10, int(getattr(shared, "HEARTBEAT_SURF_DAILY_LIMIT", 2))))
+    surf_max_steps = max(2, min(10, int(getattr(shared, "HEARTBEAT_SURF_MAX_STEPS", 5))))
+    raw_surf_date = stats.get("daily_surf_date")
+    if isinstance(raw_surf_date, datetime):
+        raw_surf_date = raw_surf_date.date()
+    elif isinstance(raw_surf_date, str) and raw_surf_date:
+        try:
+            raw_surf_date = datetime.fromisoformat(raw_surf_date).date()
+        except ValueError:
+            raw_surf_date = None
+    raw_surf_count = max(0, int(stats.get("daily_surf_count") or 0))
+    if raw_surf_date is not None and raw_surf_date != today_local_date:
+        try:
+            daily_surf_count = await db_conversations.get_daily_surf_state(session_id, today_local_date)
+        except Exception as exc:
+            logger.debug("Daily surf state reset skipped: %s", exc)
+            daily_surf_count = 0
+    else:
+        daily_surf_count = raw_surf_count
+    surf_quota_remaining = max(0, surf_daily_limit - daily_surf_count)
+
+    quota_fields = {
+        "daily_surf_count": daily_surf_count,
+        "surf_daily_limit": surf_daily_limit,
+        "surf_max_steps": surf_max_steps,
+        "surf_quota_remaining": surf_quota_remaining,
+    }
+
     pending_alarm = stats.get("pending_alarm")
+    alarm_interacted_since_created = False
+    last_user_at = _ensure_utc(stats.get("last_user_at"))
+    if isinstance(pending_alarm, dict) and pending_alarm.get("due_at"):
+        alarm_due_dt = _ensure_utc(pending_alarm.get("due_at"))
+        alarm_created_dt = _ensure_utc(pending_alarm.get("created_at"))
+        if last_user_at is not None and alarm_created_dt is not None and last_user_at > alarm_created_dt:
+            lead_delta = (alarm_due_dt - last_user_at) if alarm_due_dt is not None else timedelta(0)
+            if lead_delta < timedelta(minutes=LONG_TERM_ALARM_LEAD_MINUTES):
+                alarm_id = pending_alarm.get("id")
+                if alarm_id:
+                    try:
+                        await db_conversations.consume_wake_alarm(alarm_id, status="superseded")
+                    except Exception as exc:
+                        logger.debug("Supersede short-term alarm %s failed: %s", alarm_id, exc)
+                pending_alarm = None
+                stats["pending_alarm"] = None
+            else:
+                alarm_interacted_since_created = True
+
     due_alarm: dict | None = None
     if has_due_alarm is None and isinstance(pending_alarm, dict) and pending_alarm.get("due_at"):
-        due_at = pending_alarm["due_at"]
-        if isinstance(due_at, str):
-            due_at = datetime.fromisoformat(due_at)
-        if due_at.tzinfo is None:
-            due_at = due_at.replace(tzinfo=timezone.utc)
-        if due_at > now_utc:
+        due_at = _ensure_utc(pending_alarm["due_at"])
+        if due_at is not None and due_at > now_utc:
             return {
                 "allowed": False,
                 "status": "skipped_waiting_alarm",
                 "pending_alarm": pending_alarm,
+                "alarm_interacted_since_created": alarm_interacted_since_created,
                 "stats": stats,
+                **quota_fields,
             }
         effective_has_due_alarm = True
         due_alarm = pending_alarm
@@ -394,14 +589,18 @@ async def evaluate_heartbeat_gate(
             "allowed": False,
             "status": "skipped_unread_cap",
             "unread_proactive_chat": unread_chat,
+            "alarm_interacted_since_created": alarm_interacted_since_created,
             "stats": stats,
+            **quota_fields,
         }
     if effective_has_due_alarm and unread_chat >= max_unread + 1:
         return {
             "allowed": False,
             "status": "skipped_hard_cap",
             "unread_proactive_chat": unread_chat,
+            "alarm_interacted_since_created": alarm_interacted_since_created,
             "stats": stats,
+            **quota_fields,
         }
 
     ref_candidates = [stats["last_normal_at"]]
@@ -410,17 +609,16 @@ async def evaluate_heartbeat_gate(
     if stats.get("last_proactive_event_at"):
         ref_candidates.append(stats["last_proactive_event_at"])
     normalized_refs = [
-        ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
+        _ensure_utc(ts)
         for ts in ref_candidates
         if ts is not None
     ]
+    normalized_refs = [ts for ts in normalized_refs if ts is not None]
     ref_ts = max(normalized_refs)
     elapsed_minutes = max(0.0, (now_utc - ref_ts).total_seconds() / 60.0)
 
-    normal_anchor = stats.get("last_normal_at")
-    if normal_anchor.tzinfo is None:
-        normal_anchor = normal_anchor.replace(tzinfo=timezone.utc)
-    interaction_gap_minutes = max(0.0, (now_utc - normal_anchor).total_seconds() / 60.0)
+    normal_anchor = _ensure_utc(stats.get("last_normal_at"))
+    interaction_gap_minutes = max(0.0, (now_utc - normal_anchor).total_seconds() / 60.0) if normal_anchor else elapsed_minutes
 
     if not effective_has_due_alarm:
         ctx_mult, ctx_kind = classify_user_context_multiplier(stats.get("last_user_content", ""))
@@ -436,7 +634,9 @@ async def evaluate_heartbeat_gate(
                 "required_minutes": round(required_minutes, 1),
                 "context_kind": ctx_kind,
                 "unread_proactive_chat": unread_chat,
+                "alarm_interacted_since_created": alarm_interacted_since_created,
                 "stats": stats,
+                **quota_fields,
             }
     else:
         ctx_kind = "due_alarm"
@@ -454,7 +654,9 @@ async def evaluate_heartbeat_gate(
         "unread_proactive_chat": unread_chat,
         "has_due_alarm": effective_has_due_alarm,
         "due_alarm": due_alarm,
+        "alarm_interacted_since_created": alarm_interacted_since_created,
         "stats": stats,
+        **quota_fields,
     }
 
 
@@ -1070,6 +1272,18 @@ async def _run_heartbeat_tick_locked(
         or tool_config.get("mcp_servers")
         or os.getenv("TAVILY_API_KEY")
     )
+    active_topics: list[dict] = []
+    try:
+        active_topics = await db_conversations.get_active_proactive_topics(session_id, now_utc=gate["now_utc"])
+    except Exception as exc:
+        logger.debug("Load active proactive topics skipped: %s", exc)
+
+    daily_surf_count = int(gate.get("daily_surf_count", 0))
+    surf_daily_limit = int(gate.get("surf_daily_limit", getattr(shared, "HEARTBEAT_SURF_DAILY_LIMIT", 2)))
+    surf_max_steps = int(gate.get("surf_max_steps", getattr(shared, "HEARTBEAT_SURF_MAX_STEPS", 5)))
+    surf_quota_remaining = int(gate.get("surf_quota_remaining", max(0, surf_daily_limit - daily_surf_count)))
+    effective_max_tool_steps = min(surf_max_steps, 5) if surf_quota_remaining > 0 else 1
+
     tail_note = build_heartbeat_tail_note(
         now_local,
         gate.get("interaction_gap_minutes", gate["elapsed_minutes"]),
@@ -1077,6 +1291,11 @@ async def _run_heartbeat_tick_locked(
         unread_count=gate["unread_proactive_chat"],
         due_alarm_reason=due_alarm_reason,
         tools_enabled=bool(snapshot_tools and (has_direct_tools or tool_executor_origin)),
+        daily_surf_count=daily_surf_count,
+        surf_daily_limit=surf_daily_limit,
+        surf_max_steps=surf_max_steps,
+        active_topics=active_topics,
+        alarm_interacted_since_created=bool(gate.get("alarm_interacted_since_created")),
     )
 
     resolved_system_prompt = await shared.get_system_prompt()
@@ -1219,8 +1438,8 @@ async def _run_heartbeat_tick_locked(
 
         # 熔断硬拦截：已达步数上限 / 60s 安全阈值 / 强制收尾轮仍返回 tool_calls -> 绝不继续执行工具
         elapsed_so_far = time.monotonic() - tick_start
-        if forced_wrap_up or tool_round >= MAX_TOOL_STEPS or elapsed_so_far >= TOOL_TIME_BUDGET_SECONDS:
-            print(f"🛑 req={req_id} 自主唤醒工具调用触达熔断红线 (round={tool_round}, elapsed={elapsed_so_far:.1f}s)，代码层拦截 tool_calls")
+        if forced_wrap_up or tool_round >= effective_max_tool_steps or elapsed_so_far >= TOOL_TIME_BUDGET_SECONDS:
+            print(f"🛑 req={req_id} 自主唤醒工具调用触达熔断红线 (round={tool_round}, max={effective_max_tool_steps}, elapsed={elapsed_so_far:.1f}s)，代码层拦截 tool_calls")
             final_msg_obj = msg_obj
             break
 
@@ -1241,10 +1460,13 @@ async def _run_heartbeat_tick_locked(
             "tool_calls": tool_calls,
         })
 
+        round_used_community_tool = False
         for tc in tool_calls:
             tc_name = str(((tc.get("function") or {}).get("name")) or "").strip()
             if tc_name:
                 tools_used.append(tc_name)
+                if _is_community_or_external_tool(tc_name, tool_config):
+                    round_used_community_tool = True
             rem_tool_budget = max(5.0, min(20.0, TOOL_TIME_BUDGET_SECONDS - (time.monotonic() - tick_start)))
             tool_result_text = await execute_background_tool_call(
                 tc,
@@ -1258,17 +1480,23 @@ async def _run_heartbeat_tick_locked(
             })
 
         tool_round += 1
+        if round_used_community_tool and loop_messages and loop_messages[-1].get("role") == "tool":
+            cur_tool_content = loop_messages[-1].get("content") or ""
+            if TONE_SANITIZER_NOTICE not in cur_tool_content:
+                loop_messages[-1]["content"] = cur_tool_content + f"\n\n{TONE_SANITIZER_NOTICE}"
+
         elapsed_after_tools = time.monotonic() - tick_start
-        if tool_round >= MAX_TOOL_STEPS or elapsed_after_tools >= TOOL_TIME_BUDGET_SECONDS:
+        if tool_round >= effective_max_tool_steps or elapsed_after_tools >= TOOL_TIME_BUDGET_SECONDS:
             forced_wrap_up = True
             loop_messages[-1]["content"] = (loop_messages[-1].get("content") or "") + f"\n\n{TOOL_FORCE_WRAP_UP_NOTICE}"
-            print(f"⏳ req={req_id} 触发工具探索优雅收尾提示 (round={tool_round}, elapsed={elapsed_after_tools:.1f}s)")
+            print(f"⏳ req={req_id} 触发工具探索优雅收尾提示 (round={tool_round}/{effective_max_tool_steps}, elapsed={elapsed_after_tools:.1f}s)")
 
     raw_content = final_msg_obj.get("content") or ""
-    # 1. 先剥离思考标签，再解析 <next_wake> 隐式闹钟、再分离 <event_capsule> 与常规微信正文
+    # 1. 先剥离思考标签，再解析 <next_wake> 隐式闹钟与 <topic> 话题标签、再分离 <event_capsule> 与常规微信正文
     raw_without_thoughts = _THOUGHT_TAG_RE.sub("", raw_content).strip()
     text_no_wake, next_wake_spec = parse_and_strip_next_wake(raw_without_thoughts)
-    capsules, remaining_text = parse_event_capsules_and_chat(text_no_wake)
+    text_no_topic, explicit_topic = parse_and_strip_topic(text_no_wake)
+    capsules, remaining_text = parse_event_capsules_and_chat(text_no_topic)
     cleaned_chat, chat_is_silent = _strip_thoughts_and_check_silent(remaining_text)
     if final_msg_obj.get("tool_calls") and not capsules and chat_is_silent:
         print(f"🤫 req={req_id} 工具熔断后无有效正文或胶囊，静默收尾")
@@ -1368,6 +1596,25 @@ async def _run_heartbeat_tick_locked(
             now_utc=gate["now_utc"],
         )
 
+    did_deep_surf = (tool_round >= 2) or (bool(tools_used) and bool(capsules))
+    if did_deep_surf:
+        try:
+            await db_conversations.increment_daily_surf_count(session_id, now_local.date())
+        except Exception as exc:
+            logger.debug("Increment daily surf count skipped: %s", exc)
+
+    topic_key, topic_summary = derive_proactive_topic(capsules, cleaned_chat, explicit_topic)
+    if topic_key:
+        try:
+            await db_conversations.upsert_proactive_topic(
+                session_id,
+                topic_key,
+                topic_summary,
+                now_utc=gate["now_utc"],
+            )
+        except Exception as exc:
+            logger.debug("Upsert proactive topic skipped: %s", exc)
+
     if saved_chat_id is not None:
         print(
             f"💌 req={req_id} 自主唤醒落库成功: chat_id={saved_chat_id}, events={saved_event_ids}, "
@@ -1381,6 +1628,8 @@ async def _run_heartbeat_tick_locked(
             "message_type": "proactive_chat",
             "tools_used": base_proactive_meta.get("tools_used", []),
             "next_wake": next_wake_spec,
+            "topic": topic_key,
+            "deep_surf_charged": did_deep_surf,
         }
 
     print(
@@ -1394,4 +1643,6 @@ async def _run_heartbeat_tick_locked(
         "message_type": "proactive_event",
         "tools_used": base_proactive_meta.get("tools_used", []),
         "next_wake": next_wake_spec,
+        "topic": topic_key,
+        "deep_surf_charged": did_deep_surf,
     }

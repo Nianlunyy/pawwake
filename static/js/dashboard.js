@@ -2683,7 +2683,7 @@ const _SETTINGS_FIELDS = {
           'CACHE_SUMMARY_MODEL', 'CACHE_TTL', 'CACHE_PARTITION_TRIGGER', 'EMBEDDING_API_KEY', 'EMBEDDING_BASE_URL', 'EMBEDDING_MODEL', 'REASONING_EFFORT', 'RERANK_MODEL', 'RERANK_BASE_URL', 'RERANK_API_KEY',
           'HEARTBEAT_SESSION_ID', 'HEARTBEAT_QUIET_START', 'HEARTBEAT_QUIET_END', 'HEARTBEAT_WEATHER_CITY'],
     int: ['MAX_MEMORIES_INJECT', 'MAX_CONVERSATIONS_INJECT', 'MEMORY_EXTRACT_INTERVAL', 'CACHE_PARTITION_X', 'CACHE_PARTITION_WINDOW', 'CACHE_SUMMARY_BUDGET_CHARS', 'EMBEDDING_DIM',
-          'HEARTBEAT_MAX_UNREAD', 'HEARTBEAT_BASE_COOLDOWN_MINUTES'],
+          'HEARTBEAT_MAX_UNREAD', 'HEARTBEAT_BASE_COOLDOWN_MINUTES', 'HEARTBEAT_SURF_DAILY_LIMIT', 'HEARTBEAT_SURF_MAX_STEPS'],
     float: ['MIN_SCORE_THRESHOLD', 'CONVERSATION_MIN_SCORE_THRESHOLD',
             'MEMORY_SEEN_TTL_HOURS', 'CONVERSATION_SEEN_TTL_HOURS'],
     bool: ['MEMORY_ENABLED', 'MEMORY_SOURCE_DEDUPE_ENABLED', 'CONVERSATION_RECALL_ENABLED', 'CACHE_PARTITION_ENABLED', 'MEMORY_VECTOR_ENABLED', 'FORCE_STREAM', 'MEMORY_RERANK_ENABLED', 'CONVERSATION_RERANK_ENABLED',
@@ -2808,8 +2808,62 @@ async function loadSettings() {
         // 加载模型列表（首次）
         if (!_settingsLoaded) loadModelList();
         _settingsLoaded = true;
+        loadHeartbeatStatus();
     } catch (e) {
         showSettingsMsg('error', '加载设置失败: ' + e.message);
+    }
+}
+
+async function loadHeartbeatStatus() {
+    const gateEl = document.getElementById('hb-status-gate');
+    const quotasEl = document.getElementById('hb-status-quotas');
+    const alarmEl = document.getElementById('hb-status-alarm');
+    const topicsEl = document.getElementById('hb-status-topics');
+    const btn = document.getElementById('refresh-hb-status-btn');
+    if (!gateEl) return;
+    if (btn) btn.disabled = true;
+    try {
+        const resp = await fetch('/api/heartbeat/status');
+        const data = await resp.json();
+        if (data.error) {
+            gateEl.textContent = '读取失败: ' + data.error;
+            return;
+        }
+        const sid = data.session_id || '(未锁定)';
+        const gateText = data.gate_status || (data.enabled ? 'unknown' : 'skipped_disabled');
+        gateEl.textContent = `${gateText} · 会话: ${sid}`;
+
+        const unreadChat = data.unread_proactive_chat ?? 0;
+        const maxUnread = data.max_unread ?? 5;
+        const surfUsed = data.daily_surf_count ?? 0;
+        const surfLimit = data.surf_daily_limit ?? 2;
+        quotasEl.textContent = `未读主动消息 ${unreadChat}/${maxUnread} · 今日深度冲浪 ${surfUsed}/${surfLimit}`;
+
+        const alarm = data.pending_alarm;
+        if (alarm && alarm.due_at) {
+            let dueText = alarm.due_at;
+            try {
+                dueText = new Date(alarm.due_at).toLocaleString('zh-CN', { hour12: false });
+            } catch (_) {}
+            alarmEl.textContent = `${dueText} — ${alarm.reason || '按约定来看看'}`;
+        } else {
+            alarmEl.textContent = '无';
+        }
+
+        const topics = Array.isArray(data.cooling_topics) ? data.cooling_topics : [];
+        if (topics.length === 0) {
+            topicsEl.textContent = '无';
+        } else {
+            topicsEl.textContent = topics.map(t => {
+                const label = t.topic_summary || t.topic_key || '';
+                const tag = t.is_cooling ? '冷却中' : `命中${t.hit_count || 1}次`;
+                return `${label}(${tag})`;
+            }).join('、');
+        }
+    } catch (e) {
+        gateEl.textContent = '状态加载异常: ' + e.message;
+    } finally {
+        if (btn) btn.disabled = false;
     }
 }
 

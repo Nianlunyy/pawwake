@@ -238,6 +238,7 @@ class HeartbeatPhase2Tests(unittest.TestCase):
             with patch.object(shared, "DATABASE_ENABLED", True), \
                  patch.object(shared, "HEARTBEAT_ENABLED", True), \
                  patch.object(shared, "HEARTBEAT_SESSION_ID", "main-s"), \
+                 patch.object(shared, "HEARTBEAT_SURF_MAX_STEPS", 3), \
                  patch.object(shared, "API_KEY", "test-key"), \
                  patch.object(shared, "CACHE_PARTITION_ENABLED", True), \
                  patch.object(shared, "get_system_prompt", new=AsyncMock(return_value="人设")), \
@@ -338,6 +339,7 @@ class HeartbeatPhase2Tests(unittest.TestCase):
             with patch.object(shared, "DATABASE_ENABLED", True), \
                  patch.object(shared, "HEARTBEAT_ENABLED", True), \
                  patch.object(shared, "HEARTBEAT_SESSION_ID", "main-s"), \
+                 patch.object(shared, "HEARTBEAT_SURF_MAX_STEPS", 3), \
                  patch.object(shared, "API_KEY", "test-key"), \
                  patch.object(shared, "CACHE_PARTITION_ENABLED", False), \
                  patch.object(shared, "get_system_prompt", new=AsyncMock(return_value="")), \

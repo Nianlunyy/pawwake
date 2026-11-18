@@ -515,11 +515,12 @@ async def process_memories_background(
         user_source_id = None
         assistant_source_id = None
 
-        # 二阶段隐式闹钟协议：正常对话结尾若出现 <next_wake ... />，落库和记忆提取前干净剥离
+        # 二/三阶段隐式标签协议：正常对话结尾若出现 <next_wake ... /> 或 <topic>...</topic>，落库和记忆提取前干净剥离
         parsed_wake_alarm = None
-        if assistant_msg and "<next_wake" in assistant_msg.lower():
+        if assistant_msg and ("<next_wake" in assistant_msg.lower() or "<topic" in assistant_msg.lower()):
             import heartbeat_service as _hb_service
             assistant_msg, parsed_wake_alarm = _hb_service.parse_and_strip_next_wake(assistant_msg)
+            assistant_msg, _ = _hb_service.parse_and_strip_topic(assistant_msg)
         effective_wake_alarm = wake_alarm_spec or parsed_wake_alarm
 
         def mark_latest_context_source(role, source_id):
@@ -622,6 +623,22 @@ async def process_memories_background(
                 )
             except Exception as alarm_err:
                 print(f"⚠️  保存自定闹钟失败: {alarm_err}")
+        elif user_msg and not skip_conversation_log and shared.DATABASE_ENABLED:
+            # 三阶段闹钟防误杀闭环：用户主动发来新消息后，距离到期不足 45 分钟的短期跟进闹钟自动作废；
+            # >= 45 分钟的远期预约闹钟继续保留待触发
+            try:
+                pending_alarm = await db_conversations.get_pending_wake_alarm(session_id)
+                if isinstance(pending_alarm, dict) and pending_alarm.get("id") and pending_alarm.get("due_at"):
+                    due_at = pending_alarm["due_at"]
+                    if isinstance(due_at, str):
+                        due_at = datetime.fromisoformat(due_at)
+                    if due_at.tzinfo is None:
+                        due_at = due_at.replace(tzinfo=timezone.utc)
+                    now_utc = datetime.now(timezone.utc)
+                    if (due_at - now_utc) < timedelta(minutes=45):
+                        await db_conversations.consume_wake_alarm(pending_alarm["id"], status="superseded")
+            except Exception:
+                pass
 
         # 2. 检查是否需要提取记忆
         if not shared.MEMORY_ENABLED:
