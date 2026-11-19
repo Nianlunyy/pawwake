@@ -1366,12 +1366,33 @@ async def get_heartbeat_session_stats(session_id: str) -> dict:
                LIMIT 1""",
             session_id,
         )
-        surf_row = await conn.fetchrow(
-            """SELECT last_proactive_at, daily_surf_date, daily_surf_count
-               FROM session_cache_state
-               WHERE session_id = $1""",
-            session_id,
-        )
+        try:
+            surf_row = await conn.fetchrow(
+                """SELECT last_proactive_at, daily_surf_date, daily_surf_count
+                   FROM session_cache_state
+                   WHERE session_id = $1""",
+                session_id,
+            )
+        except Exception as exc:
+            logger.warning("session_cache_state heartbeat columns missing, self-healing: %s", exc)
+            await conn.execute(
+                """ALTER TABLE session_cache_state
+                   ADD COLUMN IF NOT EXISTS last_proactive_at TIMESTAMPTZ DEFAULT NULL;"""
+            )
+            await conn.execute(
+                """ALTER TABLE session_cache_state
+                   ADD COLUMN IF NOT EXISTS daily_surf_date DATE DEFAULT NULL;"""
+            )
+            await conn.execute(
+                """ALTER TABLE session_cache_state
+                   ADD COLUMN IF NOT EXISTS daily_surf_count INTEGER NOT NULL DEFAULT 0;"""
+            )
+            surf_row = await conn.fetchrow(
+                """SELECT last_proactive_at, daily_surf_date, daily_surf_count
+                   FROM session_cache_state
+                   WHERE session_id = $1""",
+                session_id,
+            )
 
     return {
         "latest_id": latest["id"] if latest else None,

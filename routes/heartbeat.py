@@ -30,8 +30,8 @@ async def api_heartbeat_tick(request: Request = None, background: bool = False):
                     pass
         result = await heartbeat_service.dispatch_heartbeat_tick(background=background)
         return {"ok": True, **result}
-    except Exception:
-        return shared._api_failure("自主唤醒执行失败")
+    except Exception as exc:
+        return shared._api_failure("自主唤醒执行失败", error_type=type(exc).__name__)
 
 
 @router.get("/api/proactive/messages")
