@@ -293,6 +293,10 @@ async def init_tables():
             ALTER TABLE session_cache_state
             ADD COLUMN IF NOT EXISTS daily_surf_count INTEGER NOT NULL DEFAULT 0;
         """)
+        await conn.execute("""
+            ALTER TABLE session_cache_state
+            ADD COLUMN IF NOT EXISTS last_proactive_at TIMESTAMPTZ DEFAULT NULL;
+        """)
 
         # 自定唤醒闹钟表（Phase 2 启用，一次性建表避免后续改表）
         await conn.execute("""

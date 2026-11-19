@@ -495,7 +495,12 @@ class HeartbeatPhase3Tests(unittest.TestCase):
     def test_anti_429_silent_cooldown_pacing_and_error_recovery(self):
         now = datetime(2026, 11, 18, 6, 0, tzinfo=timezone.utc)
 
-        # 1) DB 层 record_heartbeat_attempt 更新 last_proactive_at
+        # 1) DB 层 record_heartbeat_attempt 更新 last_proactive_at，且 db/core.py 建表迁移必须包含该列
+        with open("/Users/nianlunyy/pawwake/db/core.py", "r", encoding="utf-8") as f:
+            schema_sql = f.read()
+        for col in ("last_proactive_at", "daily_surf_date", "daily_surf_count", "proactive_topics"):
+            self.assertIn(col, schema_sql)
+
         fake_conn = MagicMock()
         fake_conn.execute = AsyncMock()
         fake_pool = _make_fake_pool(fake_conn)
