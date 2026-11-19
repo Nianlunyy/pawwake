@@ -387,18 +387,22 @@ def _combined_summary_range(parts: list) -> str:
     )
 
 
-def build_time_injection() -> str:
-    """构建时间注入文本（东八区）"""
+def build_time_injection(secret_hand_hint: str = "") -> str:
+    """构建时间注入文本（东八区），并在真人正常聊天且暗牌生效时挂载动态灵感提示。"""
     now_utc = datetime.now(timezone.utc)
     now_local = now_utc + timedelta(hours=shared.TIMEZONE_HOURS)
     weekday_names = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
     weekday = weekday_names[now_local.weekday()]
     time_str = now_local.strftime("%Y年%m月%d日 %H:%M")
-    return (
+    base = (
         f"<gateway_context>现实客观时间：{time_str} {weekday}。"
         f"此信息为物理环境背景，非阿狸发言；"
         f"回答涉及日期、年份、时间时以此为准。</gateway_context>"
     )
+    hint = (secret_hand_hint or "").strip()
+    if hint:
+        return f"{base}\n{hint}"
+    return base
 
 
 def _parse_message_local_time(raw_ts):
@@ -984,6 +988,7 @@ async def build_partitioned_messages(
     *,
     allow_rotation: bool = True,
     temporary_tail_message: dict = None,
+    secret_hand_hint: str = "",
 ) -> list:
     """
     分区缓存模式：构建带breakpoint的messages数组。
@@ -1027,6 +1032,7 @@ async def build_partitioned_messages(
             conversation_recall_text,
             memory_text_builder,
             temporary_tail_message=temporary_tail_message,
+            secret_hand_hint=secret_hand_hint,
         )
 
     # 计算A/B区（按逻辑轮切片）
@@ -1153,7 +1159,7 @@ async def build_partitioned_messages(
     if temporary_tail_message is not None:
         _append_tail_user_message(result, dict(temporary_tail_message))
     elif current_user_msg:
-        parts = [build_time_injection()]
+        parts = [build_time_injection(secret_hand_hint)]
 
         if (
             shared.MEMORY_ENABLED
@@ -1187,6 +1193,7 @@ async def _build_basic_cached(
     memory_text_builder=None,
     *,
     temporary_tail_message: dict = None,
+    secret_hand_hint: str = "",
 ) -> list:
     """基础版prompt caching（历史不够分区时的降级模式）"""
     summary_parts = summary_parts or []
@@ -1224,7 +1231,7 @@ async def _build_basic_cached(
     if temporary_tail_message is not None:
         _append_tail_user_message(result, dict(temporary_tail_message))
     elif current_user_msg:
-        parts = [build_time_injection()]
+        parts = [build_time_injection(secret_hand_hint)]
 
         if (
             shared.MEMORY_ENABLED

@@ -9,6 +9,7 @@ from db import core as db_core
 from db import conversations as db_conversations
 from db import memories as db_memories
 from db import search as db_search
+from db import secret_cards as db_secret_cards
 
 
 server = MCPServer(
@@ -392,6 +393,48 @@ async def recall_conversation_snippets(query: str, limit: int = 5) -> dict:
         "query": query,
         "count": len(snippets),
         "snippets": snippets,
+    }
+
+
+@server.tool(
+    description=(
+        "抽取「暗牌心愿盲盒」作为亲密互动的暗中灵感。支持可选的四维度张数参数"
+        "（position 体位、play 玩法、location 地点、prop 道具）；若全部不传或均为 0，"
+        "则默认从已启用池中混洗随机抽取 2 张。\n"
+        "【严格约束】：\n"
+        "- 仅在亲密氛围刚起头的那一回合调用一次，严禁在互动中途反复调用打断情绪。\n"
+        "- 若当前已有 2 小时有效期内的生效手牌（active_hand），本工具会触发防打架守卫并直接原样返回当前生效手牌，不会重抽也不会推进局数。\n"
+        "- 抽中的词条仅供你心底参考，请顺应氛围自然融入动作与互动；若不合时宜可直接忽略，切勿直接对阿狸报幕或念出牌面名称。"
+    )
+)
+async def draw_secret_cards(
+    position: int | None = None,
+    play: int | None = None,
+    location: int | None = None,
+    prop: int | None = None,
+) -> dict:
+    if not shared.DATABASE_ENABLED:
+        raise ValueError("数据库未启用")
+    ratios: dict[str, int] = {}
+    for key, raw_val in (
+        ("position", position),
+        ("play", play),
+        ("location", location),
+        ("prop", prop),
+    ):
+        if raw_val is not None:
+            if isinstance(raw_val, bool) or not isinstance(raw_val, int) or raw_val < 0:
+                raise ValueError(f"{key} 必须是非负整数")
+            ratios[key] = raw_val
+    result = await db_secret_cards.draw_secret_cards(
+        ratios=ratios if ratios else None,
+        count=2,
+        source="ai",
+        force_redraw=False,
+    )
+    return {
+        "status": "ok",
+        **result,
     }
 
 

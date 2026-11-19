@@ -1005,6 +1005,15 @@ async def execute_background_tool_call(
     if not tool_name:
         return json.dumps({"error": "工具名缺失"}, ensure_ascii=False)
 
+    if tool_name == "draw_secret_cards":
+        return json.dumps(
+            {
+                "error": "后台自主唤醒通道已禁用 draw_secret_cards 工具",
+                "notice": "自主唤醒期间禁止抽取或使用暗牌。",
+            },
+            ensure_ascii=False,
+        )
+
     tool_config = await get_effective_tool_config()
     tavily_key = str(tool_config.get("tavily_api_key") or os.getenv("TAVILY_API_KEY") or "").strip()
 
@@ -1273,7 +1282,7 @@ async def _run_heartbeat_tick_locked(
         return {"status": "skipped_no_model", "session_id": session_id}
 
     weather_text = await fetch_local_weather()
-    snapshot_tools = envelope.get("tools") or []
+    snapshot_tools = chat_routes._strip_secret_cards_tool(envelope.get("tools") or [])
     tool_executor_origin = _resolve_tool_executor_origin(envelope)
     tool_config = await get_effective_tool_config()
     has_direct_tools = bool(

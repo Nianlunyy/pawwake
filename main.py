@@ -37,6 +37,7 @@ from routes.conversations import router as conversations_router
 from routes.partition import router as partition_router
 from routes.oauth_mcp import router as oauth_mcp_router
 from routes.heartbeat import router as heartbeat_router
+from routes.secret_cards import router as secret_cards_router
 from mcp_server import http_app as mcp_http_app, server as mcp_server
 
 # ============================================================
@@ -193,6 +194,7 @@ app.include_router(conversations_router, dependencies=database_dependencies)
 app.include_router(partition_router, dependencies=database_dependencies)
 app.include_router(memories_maintenance_router, dependencies=database_dependencies)
 app.include_router(heartbeat_router, dependencies=database_dependencies)
+app.include_router(secret_cards_router, dependencies=database_dependencies)
 app.include_router(settings_router)
 
 # ============================================================

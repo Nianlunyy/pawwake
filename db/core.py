@@ -338,6 +338,35 @@ async def init_tables():
             CREATE UNIQUE INDEX IF NOT EXISTS idx_proactive_topics_session_key
             ON proactive_topics (session_id, topic_key);
         """)
+
+        # 暗牌心愿盲盒词库表与全局牌局状态表
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS secret_cards (
+                id                SERIAL PRIMARY KEY,
+                dimension         TEXT NOT NULL CHECK (dimension IN ('position', 'play', 'location', 'prop')),
+                content           TEXT NOT NULL,
+                enabled           BOOLEAN NOT NULL DEFAULT TRUE,
+                last_drawn_round  INTEGER NOT NULL DEFAULT 0,
+                created_at        TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_secret_cards_dim_enabled
+            ON secret_cards (dimension, enabled);
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS secret_deck_state (
+                id             INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+                current_round  INTEGER NOT NULL DEFAULT 0,
+                active_hand    JSONB DEFAULT NULL,
+                updated_at     TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        await conn.execute("""
+            INSERT INTO secret_deck_state (id, current_round, active_hand)
+            VALUES (1, 0, NULL)
+            ON CONFLICT (id) DO NOTHING;
+        """)
         await conn.execute("""
             UPDATE session_cache_state AS scs
             SET seen_fragment_times = (

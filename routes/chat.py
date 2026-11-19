@@ -1,6 +1,7 @@
 """Core OpenAI-compatible chat routes."""
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -23,6 +24,7 @@ from db import core as db_core
 from db import search as db_search
 from db import conversations as db_conversations
 from db import memories as db_memories
+from db import secret_cards as db_secret_cards
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -583,6 +585,95 @@ def log_cache_usage(usage: dict, req_id: str = ""):
         logger.warning("Cache usage diagnostic failed: %s", e)
 
 
+_AUTO_WAKE_SOURCE_VALUES = frozenset({
+    "cron",
+    "heartbeat",
+    "proactive",
+    "auto_wake",
+    "autonomous",
+    "background_heartbeat",
+})
+_TRUTHY_HEADER_VALUES = frozenset({"1", "true", "yes", "on"})
+
+
+def _is_auto_wake_request(request: Request, body: dict) -> bool:
+    """识别后台 Cron / Pawwake 自动唤醒通道请求，确保与真人正常聊天绝对隔离。"""
+    if request is not None and getattr(request, "headers", None) is not None:
+        for hdr in ("X-Pawwake-Source", "X-Request-Source", "X-Trigger-Source"):
+            val = request.headers.get(hdr, "")
+            if isinstance(val, str) and val.strip().lower() in _AUTO_WAKE_SOURCE_VALUES:
+                return True
+        for hdr in ("X-Heartbeat", "X-Cron", "X-Auto-Wake"):
+            val = request.headers.get(hdr, "")
+            if isinstance(val, str) and val.strip().lower() in _TRUTHY_HEADER_VALUES:
+                return True
+    if isinstance(body, dict):
+        if any(body.get(k) is True for k in ("is_heartbeat", "is_proactive", "auto_wake")):
+            return True
+        for k in ("trigger_source", "source"):
+            val = body.get(k)
+            if isinstance(val, str) and val.strip().lower() in _AUTO_WAKE_SOURCE_VALUES:
+                return True
+    return False
+
+
+def _strip_secret_cards_tool(tools):
+    """从 tools 定义列表移除 draw_secret_cards，防止自动唤醒通道看见或误触暗牌工具。"""
+    if not isinstance(tools, list):
+        return tools
+    filtered = []
+    for tool in tools:
+        if isinstance(tool, dict):
+            fn = tool.get("function")
+            name = (fn.get("name") if isinstance(fn, dict) else None) or tool.get("name")
+            if isinstance(name, str) and name.strip() == "draw_secret_cards":
+                continue
+        filtered.append(tool)
+    return filtered
+
+
+def _decode_secret_hand_header(raw_header) -> tuple[bool, dict | None]:
+    if not isinstance(raw_header, str):
+        return False, None
+    raw = raw_header.strip()
+    if not raw:
+        return False, None
+    if raw.lower() in ("none", "clear", "empty"):
+        return True, None
+    try:
+        padded = raw + "=" * (-len(raw) % 4)
+        decoded = base64.b64decode(padded.encode("ascii")).decode("utf-8")
+        parsed = json.loads(decoded)
+        if isinstance(parsed, dict):
+            return True, parsed
+    except Exception:
+        pass
+    return False, None
+
+
+async def _resolve_secret_hand_hint_for_chat(
+    request: Request,
+    *,
+    skip_conversation_log: bool,
+    is_auto_wake: bool,
+) -> str:
+    if skip_conversation_log or is_auto_wake:
+        return ""
+    if request is not None and getattr(request, "headers", None) is not None:
+        has_hdr, hdr_hand = _decode_secret_hand_header(request.headers.get("X-Secret-Active-Hand", ""))
+        if has_hdr:
+            if hdr_hand is None:
+                return ""
+            return db_secret_cards.format_active_hand_hint(hdr_hand)
+    if not shared.DATABASE_ENABLED:
+        return ""
+    try:
+        return await db_secret_cards.get_active_hand_hint()
+    except Exception as exc:
+        logger.debug("Resolve secret active hand hint skipped: %s", exc)
+        return ""
+
+
 async def _chat_completions_inner(request: Request, pending_reminder_claims: list = None):
     busy_ref = [None]
     try:
@@ -626,6 +717,20 @@ async def _chat_completions_body(request: Request, pending_reminder_claims: list
     skip_conversation_log = explicit_skip or auxiliary_title_request
     if auxiliary_title_request:
         print("⏭️  检测到标题生成请求：跳过分区缓存、记忆注入、对话存储和会话 Token 统计")
+
+    # ---------- 自动唤醒通道绝对隔离：屏蔽暗牌注入与 draw_secret_cards 工具 ----------
+    is_auto_wake = _is_auto_wake_request(request, body)
+    if is_auto_wake and isinstance(body.get("tools"), list):
+        filtered_tools = _strip_secret_cards_tool(body["tools"])
+        if filtered_tools:
+            body["tools"] = filtered_tools
+        else:
+            body.pop("tools", None)
+    secret_hand_hint = await _resolve_secret_hand_hint_for_chat(
+        request,
+        skip_conversation_log=skip_conversation_log,
+        is_auto_wake=is_auto_wake,
+    )
 
     # ---------- 提取用户最新消息 ----------
     user_message = ""
@@ -813,6 +918,7 @@ async def _chat_completions_body(request: Request, pending_reminder_claims: list
                 user_message,
                 conversation_recall_text,
                 build_session_memory_text,
+                secret_hand_hint=secret_hand_hint,
             )
         except Exception as e:
             print(f"❌ 分区缓存不可用：读取轮转状态失败: {e}")
@@ -849,6 +955,15 @@ async def _chat_completions_body(request: Request, pending_reminder_claims: list
                             break
                 else:
                     messages.insert(0, {"role": "system", "content": enhanced_prompt})
+
+        if secret_hand_hint:
+            for i in range(len(messages) - 1, -1, -1):
+                if isinstance(messages[i], dict) and messages[i].get("role") == "user":
+                    messages[i] = partition_engine._assemble_current_user_message(
+                        [partition_engine.build_time_injection(secret_hand_hint)],
+                        messages[i].get("content", ""),
+                    )
+                    break
 
         body["messages"] = messages
 
@@ -961,7 +1076,7 @@ async def _chat_completions_body(request: Request, pending_reminder_claims: list
             effective_origin = cuplivo_origin or shared.CUPLIVO_ORIGIN
             snapshot_obj = {
                 "client_system_text": captured_client_system_text,
-                "tools": body.get("tools") or [],
+                "tools": _strip_secret_cards_tool(body.get("tools") or []),
                 "thinking_level": effective_effort or "",
                 "model": model,
             }
