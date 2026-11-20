@@ -167,6 +167,7 @@ async def _settle_reminder_claims(lease_keeper, pending_reminder_claims, deliver
 # =========================================================================
 _ACTIVE_CHAT_COUNTS: dict[str, int] = {}
 _LAST_ENVELOPE_HASH: dict[str, str] = {}
+_LAST_NONEMPTY_TOOLS: dict[str, list] = {}
 
 
 def is_session_chat_busy(session_id: str) -> bool:
@@ -1074,9 +1075,15 @@ async def _chat_completions_body(request: Request, pending_reminder_claims: list
             if cuplivo_origin:
                 shared.CUPLIVO_ORIGIN = cuplivo_origin
             effective_origin = cuplivo_origin or shared.CUPLIVO_ORIGIN
+            raw_tools = _strip_secret_cards_tool(body.get("tools") or [])
+            if isinstance(raw_tools, list) and raw_tools:
+                _LAST_NONEMPTY_TOOLS[session_id] = raw_tools
+                effective_snapshot_tools = raw_tools
+            else:
+                effective_snapshot_tools = _LAST_NONEMPTY_TOOLS.get(session_id) or []
             snapshot_obj = {
                 "client_system_text": captured_client_system_text,
-                "tools": _strip_secret_cards_tool(body.get("tools") or []),
+                "tools": effective_snapshot_tools,
                 "thinking_level": effective_effort or "",
                 "model": model,
             }

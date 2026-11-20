@@ -683,28 +683,84 @@ def _resolve_tool_executor_origin(envelope: dict | None = None) -> str:
     return os.getenv("CUPLIVO_ORIGIN", "").strip().rstrip("/")
 
 
-async def save_heartbeat_tool_config(raw_config: dict) -> None:
-    """持久化 Cuplivo Worker 随 Cron 同步过来的工具直连配置，绕开 Cloudflare Access 302。"""
+async def save_heartbeat_tool_config(raw_config: dict) -> dict | None:
+    """局部合并并持久化 Cuplivo Worker 同步过来的工具直连配置，避免空字段误覆盖已有密钥。"""
     if not isinstance(raw_config, dict):
-        return
-    normalized = {
-        "tavily_api_key": str(raw_config.get("tavily_api_key") or "").strip(),
-        "mcp_tool_routes": {
+        return None
+    prev = dict(await get_effective_tool_config() or {})
+    prev_key = str(prev.get("tavily_api_key") or "").strip()
+    if raw_config.get("clear_tavily_api_key") is True:
+        next_key = ""
+    elif "tavily_api_key" in raw_config:
+        incoming_key = str(raw_config.get("tavily_api_key") or "").strip()
+        next_key = incoming_key if incoming_key else prev_key
+    else:
+        next_key = prev_key
+
+    next_max_results: int | None = None
+    prev_max = prev.get("tavily_max_results")
+    if isinstance(prev_max, (int, float)) and not isinstance(prev_max, bool):
+        pm = int(prev_max)
+        if 1 <= pm <= 50:
+            next_max_results = pm
+    if "tavily_max_results" in raw_config and raw_config.get("tavily_max_results") not in (None, ""):
+        try:
+            im = int(raw_config.get("tavily_max_results"))
+            if 1 <= im <= 50:
+                next_max_results = im
+        except (TypeError, ValueError):
+            pass
+
+    prev_routes = {
+        str(k).strip(): str(v).strip()
+        for k, v in (prev.get("mcp_tool_routes") or {}).items()
+        if str(k).strip() and str(v).strip()
+    }
+    if raw_config.get("clear_mcp_tool_routes") is True:
+        next_routes = {}
+    elif "mcp_tool_routes" in raw_config and isinstance(raw_config.get("mcp_tool_routes"), dict):
+        incoming_routes = {
             str(k).strip(): str(v).strip()
-            for k, v in (raw_config.get("mcp_tool_routes") or {}).items()
+            for k, v in raw_config["mcp_tool_routes"].items()
             if str(k).strip() and str(v).strip()
-        },
-        "mcp_servers": [
+        }
+        next_routes = incoming_routes if (incoming_routes or not prev_routes) else prev_routes
+    else:
+        next_routes = prev_routes
+
+    prev_servers = [
+        {
+            "name": str(s.get("name") or "").strip(),
+            "url": str(s.get("url") or "").strip(),
+            "token": str(s.get("token") or "").strip(),
+        }
+        for s in (prev.get("mcp_servers") or [])
+        if isinstance(s, dict) and str(s.get("url") or "").strip()
+    ]
+    if raw_config.get("clear_mcp_servers") is True:
+        next_servers = []
+    elif "mcp_servers" in raw_config and isinstance(raw_config.get("mcp_servers"), list):
+        incoming_servers = [
             {
                 "name": str(s.get("name") or "").strip(),
                 "url": str(s.get("url") or "").strip(),
                 "token": str(s.get("token") or "").strip(),
             }
-            for s in (raw_config.get("mcp_servers") or [])
+            for s in raw_config["mcp_servers"]
             if isinstance(s, dict) and str(s.get("url") or "").strip()
-        ],
+        ]
+        next_servers = incoming_servers if (incoming_servers or not prev_servers) else prev_servers
+    else:
+        next_servers = prev_servers
+
+    normalized: dict = {
+        "tavily_api_key": next_key,
+        "mcp_tool_routes": next_routes,
+        "mcp_servers": next_servers,
     }
-    prev = getattr(shared, "HEARTBEAT_TOOL_CONFIG", None) or {}
+    if next_max_results is not None:
+        normalized["tavily_max_results"] = next_max_results
+
     shared.HEARTBEAT_TOOL_CONFIG = normalized
     if shared.DATABASE_ENABLED and normalized != prev:
         try:
@@ -714,13 +770,28 @@ async def save_heartbeat_tool_config(raw_config: dict) -> None:
             )
         except Exception as exc:
             logger.debug("Failed to persist heartbeat_tool_config: %s", exc)
+    return normalized
+
+
+def get_tavily_key_status(tool_config: dict | None = None) -> tuple[bool, str]:
+    """返回 Tavily 密钥可用性与来源（绝不返回明文密钥）。"""
+    cfg_key = str((tool_config or {}).get("tavily_api_key") or "").strip()
+    if cfg_key:
+        return True, "config"
+    env_key = str(os.getenv("TAVILY_API_KEY") or "").strip()
+    if env_key:
+        return True, "env"
+    return False, "none"
 
 
 async def get_effective_tool_config() -> dict:
     """读取后台工具直连配置（内存 -> PostgreSQL -> 环境变量）。"""
     cfg = getattr(shared, "HEARTBEAT_TOOL_CONFIG", None)
     if isinstance(cfg, dict) and (
-        cfg.get("tavily_api_key") or cfg.get("mcp_tool_routes") or cfg.get("mcp_servers")
+        cfg.get("tavily_api_key")
+        or cfg.get("mcp_tool_routes")
+        or cfg.get("mcp_servers")
+        or cfg.get("tavily_max_results")
     ):
         return cfg
     if shared.DATABASE_ENABLED:
@@ -868,26 +939,39 @@ async def _execute_mcp_direct(tool_name: str, parsed_args: dict, tool_config: di
         return json.dumps({"error": f"MCP 工具调用失败: {exc}"}, ensure_ascii=False)
 
 
-async def _execute_tavily_direct(query: str, api_key: str, timeout: float = 20.0) -> str:
+async def _execute_tavily_direct(
+    query: str,
+    api_key: str,
+    timeout: float = 20.0,
+    *,
+    start_index: int = 1,
+    max_results: int = 8,
+) -> str:
+    clean_query = str(query or "").strip()
+    if not clean_query:
+        return json.dumps({"error": "缺少查询参数 query"}, ensure_ascii=False)
+    limit = max(1, min(10, int(max_results or 8)))
+    base_idx = max(1, int(start_index or 1))
     try:
         async with httpx.AsyncClient(timeout=min(20.0, float(timeout)), follow_redirects=True) as client:
             resp = await client.post(
                 "https://api.tavily.com/search",
                 headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
-                json={"query": query, "max_results": 8, "search_depth": "basic", "include_answer": True},
+                json={"query": clean_query, "max_results": limit, "search_depth": "basic", "include_answer": True},
             )
         if resp.status_code != 200:
             return json.dumps({"error": f"Tavily HTTP {resp.status_code}: {resp.text[:200]}"}, ensure_ascii=False)
         data = resp.json()
+        raw_results = (data.get("results") or [])[:limit]
         items = [
             {
-                "index": idx + 1,
-                "id": f"c{idx + 1}",
+                "index": base_idx + idx,
+                "id": f"c{base_idx + idx}",
                 "title": r.get("title") or "No Title",
                 "url": r.get("url") or "",
                 "text": r.get("content") or "",
             }
-            for idx, r in enumerate(data.get("results") or [])
+            for idx, r in enumerate(raw_results)
         ]
         payload = {"answer": data["answer"], "items": items} if data.get("answer") else {"items": items}
         return json.dumps(payload, ensure_ascii=False, indent=2)
@@ -972,14 +1056,52 @@ async def _execute_fetch_url_direct(raw_url: str, start_index: int, tavily_key: 
     page_size = 10000
     start = max(0, int(start_index or 0))
     slice_text = content[start:start + page_size]
-    return json.dumps({
+    end = start + len(slice_text)
+    has_more = end < len(content)
+    result_payload = {
         "url": target_url,
         "title": title,
         "start_index": start,
         "total_length": len(content),
-        "has_more": (start + len(slice_text)) < len(content),
+        "has_more": has_more,
         "content": slice_text,
-    }, ensure_ascii=False)
+    }
+    if has_more:
+        result_payload["next_start_index"] = end
+    return json.dumps(result_payload, ensure_ascii=False)
+
+
+def _collect_search_citations(tool_result_text: str, citations_out: dict, *, max_entries: int = 24) -> int:
+    """从搜索工具 JSON 结果中提取精简来源链接，供前台引用角标点击跳转。"""
+    if not tool_result_text or not isinstance(citations_out, dict):
+        return 0
+    try:
+        data = json.loads(tool_result_text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return 0
+    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+        return 0
+    items = data["items"]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        if not re.match(r"^https?://", url, re.IGNORECASE):
+            continue
+        raw_idx = item.get("index")
+        if isinstance(raw_idx, (int, float)) and not isinstance(raw_idx, bool) and int(raw_idx) > 0:
+            idx = int(raw_idx)
+        else:
+            idx = len(citations_out) + 1
+        cid = str(item.get("id") or f"c{idx}").strip() or f"c{idx}"
+        if len(citations_out) < max_entries and cid not in citations_out:
+            citations_out[cid] = {
+                "id": cid,
+                "index": idx,
+                "title": str(item.get("title") or url).strip()[:160],
+                "url": url[:1000],
+            }
+    return len(items)
 
 
 async def execute_background_tool_call(
@@ -987,6 +1109,8 @@ async def execute_background_tool_call(
     *,
     tool_executor_origin: str = "",
     timeout: float = 20.0,
+    search_start_index: int = 1,
+    search_max_results: int | None = None,
 ) -> str:
     """执行后台 MCP/搜索/网页阅读工具（优先从 Pawwake 直连执行以避开 Cloudflare Access 302）。"""
     fn = tool_call.get("function") if isinstance(tool_call, dict) else {}
@@ -1019,13 +1143,37 @@ async def execute_background_tool_call(
 
     # 1. 优先直连执行（完全绕开入站 Cloudflare Access 302 登录拦截）
     if tool_name in ("search_web", "tavily_search"):
+        if search_max_results is not None and int(search_max_results) <= 0:
+            return json.dumps(
+                {
+                    "items": [],
+                    "notice": "本次唤醒搜索结果已达累计上限，请勿再继续搜索，直接结合已有信息完成输出或保持静默。",
+                },
+                ensure_ascii=False,
+            )
         if tavily_key:
             query = str(parsed_args.get("query") or parsed_args.get("q") or parsed_args.get("input") or "")
-            res_text = await _execute_tavily_direct(query, tavily_key, timeout=timeout)
+            tavily_kwargs: dict = {"timeout": timeout}
+            if int(search_start_index or 1) != 1:
+                tavily_kwargs["start_index"] = int(search_start_index)
+            if search_max_results is not None:
+                eff_max = max(1, min(8, int(search_max_results)))
+            else:
+                cfg_max = tool_config.get("tavily_max_results")
+                if isinstance(cfg_max, (int, float)) and not isinstance(cfg_max, bool) and int(cfg_max) > 0:
+                    eff_max = max(1, min(8, int(cfg_max)))
+                else:
+                    eff_max = 8
+            if eff_max != 8:
+                tavily_kwargs["max_results"] = eff_max
+            res_text = await _execute_tavily_direct(query, tavily_key, **tavily_kwargs)
             return res_text[:24000] + ("\n...(内容过长已截断)" if len(res_text) > 24000 else "")
     elif tool_name == "fetch_url":
         target_u = str(parsed_args.get("url") or parsed_args.get("link") or "")
-        start_idx = int(parsed_args.get("start_index") or 0)
+        try:
+            start_idx = max(0, int(parsed_args.get("start_index") or 0))
+        except (TypeError, ValueError):
+            start_idx = 0
         res_text = await _execute_fetch_url_direct(target_u, start_idx, tavily_key, timeout=timeout)
         return res_text[:24000] + ("\n...(内容过长已截断)" if len(res_text) > 24000 else "")
     else:
@@ -1285,6 +1433,11 @@ async def _run_heartbeat_tick_locked(
     snapshot_tools = chat_routes._strip_secret_cards_tool(envelope.get("tools") or [])
     tool_executor_origin = _resolve_tool_executor_origin(envelope)
     tool_config = await get_effective_tool_config()
+    raw_turn_max = tool_config.get("tavily_max_results")
+    if isinstance(raw_turn_max, (int, float)) and not isinstance(raw_turn_max, bool) and int(raw_turn_max) >= 1:
+        heartbeat_search_turn_budget = max(1, min(50, int(raw_turn_max)))
+    else:
+        heartbeat_search_turn_budget = 20
     has_direct_tools = bool(
         tool_config.get("tavily_api_key")
         or tool_config.get("mcp_tool_routes")
@@ -1386,6 +1539,8 @@ async def _run_heartbeat_tick_locked(
     tool_round = 0
     forced_wrap_up = False
     tools_used: list[str] = []
+    search_citations: dict[str, dict] = {}
+    search_item_count = 0
     reasoning_parts: list[str] = []
     step_usages: list[dict] = []
     final_msg_obj: dict = {}
@@ -1499,11 +1654,37 @@ async def _run_heartbeat_tick_locked(
                 if _is_community_or_external_tool(tc_name, tool_config):
                     round_used_community_tool = True
             rem_tool_budget = max(5.0, min(20.0, TOOL_TIME_BUDGET_SECONDS - (time.monotonic() - tick_start)))
-            tool_result_text = await execute_background_tool_call(
-                tc,
-                tool_executor_origin=tool_executor_origin,
-                timeout=rem_tool_budget,
-            )
+            if tc_name in ("search_web", "tavily_search"):
+                remaining_search_budget = max(0, heartbeat_search_turn_budget - search_item_count)
+                if remaining_search_budget <= 0:
+                    tool_result_text = json.dumps(
+                        {
+                            "items": [],
+                            "notice": (
+                                f"本次唤醒搜索结果已达累计上限（累计最多 {heartbeat_search_turn_budget} 条），"
+                                "请勿再继续搜索，直接结合已有信息完成输出或保持静默。"
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+                else:
+                    exec_kwargs: dict = {
+                        "tool_executor_origin": tool_executor_origin,
+                        "timeout": rem_tool_budget,
+                    }
+                    if search_item_count > 0:
+                        exec_kwargs["search_start_index"] = search_item_count + 1
+                    call_limit = min(8, remaining_search_budget)
+                    if call_limit < 8:
+                        exec_kwargs["search_max_results"] = call_limit
+                    tool_result_text = await execute_background_tool_call(tc, **exec_kwargs)
+                    search_item_count += _collect_search_citations(tool_result_text, search_citations)
+            else:
+                tool_result_text = await execute_background_tool_call(
+                    tc,
+                    tool_executor_origin=tool_executor_origin,
+                    timeout=rem_tool_budget,
+                )
             loop_messages.append({
                 "role": "tool",
                 "tool_call_id": tc.get("id") or f"hb_tc_{len(loop_messages)}",
@@ -1586,6 +1767,8 @@ async def _run_heartbeat_tick_locked(
         base_proactive_meta["due_alarm_reason"] = due_alarm_reason
     if tools_used:
         base_proactive_meta["tools_used"] = list(dict.fromkeys(tools_used))
+    if search_citations:
+        base_proactive_meta["citations"] = search_citations
 
     saved_event_ids: list[int] = []
     for cap in capsules:

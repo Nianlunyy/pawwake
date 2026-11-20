@@ -2817,6 +2817,7 @@ async function loadSettings() {
 async function loadHeartbeatStatus() {
     const gateEl = document.getElementById('hb-status-gate');
     const quotasEl = document.getElementById('hb-status-quotas');
+    const toolsEl = document.getElementById('hb-status-tools');
     const alarmEl = document.getElementById('hb-status-alarm');
     const topicsEl = document.getElementById('hb-status-topics');
     const btn = document.getElementById('refresh-hb-status-btn');
@@ -2827,6 +2828,7 @@ async function loadHeartbeatStatus() {
         const data = await resp.json();
         if (data.error) {
             gateEl.textContent = '读取失败: ' + data.error;
+            if (toolsEl) toolsEl.textContent = '-';
             return;
         }
         const sid = data.session_id || '(未锁定)';
@@ -2838,6 +2840,17 @@ async function loadHeartbeatStatus() {
         const surfUsed = data.daily_surf_count ?? 0;
         const surfLimit = data.surf_daily_limit ?? 2;
         quotasEl.textContent = `未读主动消息 ${unreadChat}/${maxUnread} · 今日深度冲浪 ${surfUsed}/${surfLimit}`;
+
+        if (toolsEl) {
+            const keySourceLabel = data.tavily_key_source === 'config'
+                ? 'Tavily 就绪(同步)'
+                : (data.tavily_key_source === 'env' ? 'Tavily 就绪(环境变量)' : 'Tavily 未配 Key');
+            const snapTools = Array.isArray(data.snapshot_tool_names) ? data.snapshot_tool_names.filter(Boolean) : [];
+            const snapLabel = snapTools.length > 0
+                ? `镜像工具(${snapTools.length}): ${snapTools.join(', ')}`
+                : '镜像工具为空，请先发送一条纯文本聊天';
+            toolsEl.textContent = `${keySourceLabel} · ${snapLabel}`;
+        }
 
         const alarm = data.pending_alarm;
         if (alarm && alarm.due_at) {

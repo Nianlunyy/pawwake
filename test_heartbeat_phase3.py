@@ -472,9 +472,17 @@ class HeartbeatPhase3Tests(unittest.TestCase):
                  patch.object(shared, "HEARTBEAT_ENABLED", True), \
                  patch.object(shared, "HEARTBEAT_SURF_DAILY_LIMIT", 3), \
                  patch.object(shared, "HEARTBEAT_SURF_MAX_STEPS", 5), \
+                 patch.object(shared, "HEARTBEAT_TOOL_CONFIG", {"tavily_api_key": "tvly-hidden-key"}), \
                  patch.object(heartbeat_service, "resolve_target_session_id", new=AsyncMock(return_value="s-main")), \
                  patch.object(heartbeat_service, "evaluate_heartbeat_gate", new=AsyncMock(return_value={"allowed": False, "status": "skipped_quiet"})), \
                  patch.object(db_conversations, "get_heartbeat_session_stats", new=AsyncMock(return_value=fake_stats)), \
+                 patch.object(db_conversations, "get_session_envelope_snapshot", new=AsyncMock(return_value={
+                     "tools": [
+                         {"type": "function", "function": {"name": "search_web"}},
+                         {"type": "function", "function": {"name": "fetch_url"}},
+                         {"type": "function", "function": {"name": "draw_secret_cards"}},
+                     ]
+                 })), \
                  patch.object(db_conversations, "get_active_proactive_topics", new=AsyncMock(return_value=fake_topics)), \
                  patch.object(heartbeat_service, "_to_local_dt", return_value=heartbeat_service._to_local_dt(now)):
                 res = await heartbeat_routes.api_heartbeat_status()
@@ -489,6 +497,12 @@ class HeartbeatPhase3Tests(unittest.TestCase):
             self.assertEqual(res["pending_alarm"]["reason"], "记得喝水")
             self.assertEqual(len(res["cooling_topics"]), 1)
             self.assertTrue(res["cooling_topics"][0]["is_cooling"])
+            self.assertTrue(res["tavily_ready"])
+            self.assertEqual(res["tavily_key_source"], "config")
+            self.assertEqual(res["snapshot_tool_names"], ["search_web", "fetch_url"])
+            self.assertTrue(res["search_tool_ready"])
+            self.assertTrue(res["fetch_tool_ready"])
+            self.assertNotIn("tvly-hidden-key", json.dumps(res))
 
         asyncio.run(run_status())
 

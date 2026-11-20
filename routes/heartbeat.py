@@ -1,12 +1,64 @@
 """Autonomous Heartbeat routes: Cron tick & incremental proactive message sync."""
 
+import json
+
 from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 
 import heartbeat_service
 import shared
 from db import conversations as db_conversations
+from routes import chat as chat_routes
 
 router = APIRouter()
+
+
+@router.post("/api/heartbeat/tool-config")
+async def api_heartbeat_tool_config(request: Request):
+    """供 Cuplivo Worker 在设置保存后即时同步 Tavily/MCP 工具直连配置（不触发唤醒）。"""
+    try:
+        cuplivo_origin = str(request.headers.get("X-Cuplivo-Origin") or "").strip().rstrip("/")
+        if cuplivo_origin:
+            shared.CUPLIVO_ORIGIN = cuplivo_origin
+
+        raw_body = await request.body()
+        if not raw_body:
+            return JSONResponse(status_code=400, content={"error": "请求体不能为空"})
+        try:
+            body = json.loads(raw_body)
+        except (ValueError, TypeError):
+            return JSONResponse(status_code=400, content={"error": "请求体必须为合法 JSON 对象"})
+        if not isinstance(body, dict):
+            return JSONResponse(status_code=400, content={"error": "请求体必须为 JSON 对象"})
+
+        if isinstance(body.get("tool_config"), dict):
+            cfg = body["tool_config"]
+        elif any(
+            k in body
+            for k in (
+                "tavily_api_key",
+                "clear_tavily_api_key",
+                "tavily_max_results",
+                "mcp_tool_routes",
+                "clear_mcp_tool_routes",
+                "mcp_servers",
+                "clear_mcp_servers",
+            )
+        ):
+            cfg = body
+        else:
+            cfg = {}
+
+        await heartbeat_service.save_heartbeat_tool_config(cfg)
+        effective = await heartbeat_service.get_effective_tool_config()
+        tavily_ready, tavily_source = heartbeat_service.get_tavily_key_status(effective)
+        return {
+            "ok": True,
+            "tavily_ready": tavily_ready,
+            "tavily_key_source": tavily_source,
+        }
+    except Exception as exc:
+        return shared._api_failure("同步自主唤醒工具配置失败", error_type=type(exc).__name__)
 
 
 @router.post("/api/heartbeat/tick")
@@ -126,6 +178,34 @@ async def api_heartbeat_status():
             except Exception:
                 cooling_topics = []
 
+        tavily_ready = False
+        tavily_key_source = "none"
+        try:
+            tool_config = await heartbeat_service.get_effective_tool_config()
+            tavily_ready, tavily_key_source = heartbeat_service.get_tavily_key_status(tool_config)
+        except Exception:
+            tavily_ready, tavily_key_source = heartbeat_service.get_tavily_key_status(None)
+
+        snapshot_tool_names: list[str] = []
+        if target_sid and shared.DATABASE_ENABLED:
+            try:
+                envelope = await db_conversations.get_session_envelope_snapshot(target_sid) or {}
+                if isinstance(envelope, dict):
+                    raw_snap_tools = chat_routes._strip_secret_cards_tool(envelope.get("tools") or [])
+                    if isinstance(raw_snap_tools, list):
+                        for tool in raw_snap_tools:
+                            if isinstance(tool, dict):
+                                fn = tool.get("function")
+                                name = (fn.get("name") if isinstance(fn, dict) else None) or tool.get("name")
+                                if name:
+                                    snapshot_tool_names.append(str(name))
+            except Exception:
+                snapshot_tool_names = []
+
+        has_search_tool = any(n in ("search_web", "tavily_search") for n in snapshot_tool_names)
+        fetch_tool_ready = "fetch_url" in snapshot_tool_names
+        search_tool_ready = bool(tavily_ready and has_search_tool)
+
         return {
             "status": "ok",
             "enabled": shared.HEARTBEAT_ENABLED,
@@ -142,6 +222,11 @@ async def api_heartbeat_status():
             "surf_max_steps": surf_max_steps,
             "surf_quota_remaining": surf_quota_remaining,
             "cooling_topics": cooling_topics,
+            "tavily_ready": tavily_ready,
+            "tavily_key_source": tavily_key_source,
+            "snapshot_tool_names": snapshot_tool_names,
+            "search_tool_ready": search_tool_ready,
+            "fetch_tool_ready": fetch_tool_ready,
         }
     except Exception:
         return shared._api_failure("获取自主唤醒状态失败")

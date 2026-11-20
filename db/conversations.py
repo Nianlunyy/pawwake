@@ -1245,7 +1245,20 @@ async def save_session_envelope_snapshot(session_id: str, snapshot: dict):
             """INSERT INTO session_cache_state (session_id, envelope_snapshot, updated_at)
                VALUES ($1, $2::jsonb, NOW())
                ON CONFLICT (session_id)
-               DO UPDATE SET envelope_snapshot = $2::jsonb, updated_at = NOW()""",
+               DO UPDATE SET
+                 envelope_snapshot = CASE
+                   WHEN (
+                     NOT ($2::jsonb ? 'tools')
+                     OR jsonb_typeof($2::jsonb->'tools') <> 'array'
+                     OR jsonb_array_length($2::jsonb->'tools') = 0
+                   )
+                   AND session_cache_state.envelope_snapshot IS NOT NULL
+                   AND jsonb_typeof(session_cache_state.envelope_snapshot->'tools') = 'array'
+                   AND jsonb_array_length(session_cache_state.envelope_snapshot->'tools') > 0
+                   THEN jsonb_set($2::jsonb, '{tools}', session_cache_state.envelope_snapshot->'tools', true)
+                   ELSE $2::jsonb
+                 END,
+                 updated_at = NOW()""",
             session_id,
             snapshot_json,
         )
