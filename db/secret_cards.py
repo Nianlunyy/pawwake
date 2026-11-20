@@ -14,8 +14,8 @@ DIMENSION_LABELS = {
     "location": "地点",
     "prop": "道具",
 }
-ACTIVE_HAND_TTL_SECONDS = 2 * 3600
-COOLDOWN_ROUNDS = 3
+ACTIVE_HAND_TTL_SECONDS = 12 * 3600
+COOLDOWN_ROUNDS = 8
 
 
 def _utc_now(now_utc: Optional[datetime] = None) -> datetime:
@@ -519,8 +519,8 @@ async def draw_secret_cards(
 ) -> dict:
     """抽牌核心入口。
 
-    - force_redraw=False（AI 工具调用）：若 2 小时内已有生效手牌，直接原样返回，不重抽不递增局数。
-    - force_redraw=True（前端主动触发）或当前无有效手牌：current_round + 1，按 3 局冷却与兜底算法发牌并锁定 2 小时。
+    - force_redraw=False（AI 工具调用）：若 12 小时内已有生效手牌，直接原样返回，不重抽不递增局数。
+    - force_redraw=True（前端主动触发）或当前无有效手牌：current_round + 1，按 8 局冷却与兜底算法发牌并锁定 12 小时。
     """
     now = _utc_now(now_utc)
     norm_ratios = normalize_ratios(ratios)

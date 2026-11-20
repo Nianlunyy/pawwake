@@ -216,19 +216,19 @@ class SecretCardsTests(unittest.TestCase):
         ]
         rng = random.Random(42)
 
-        # 第 5 局要抽 2 张：优先池只有 id=1 (0) 和 id=5 (diff=4>3)，正好命中这两张
-        picked_pref = db_secret_cards.select_cards_for_round(candidates, 2, current_round=5, rng=rng)
+        # 第 10 局要抽 2 张：优先池只有 id=1 (0) 和 id=5 (diff=9>8)，正好命中这两张
+        picked_pref = db_secret_cards.select_cards_for_round(candidates, 2, current_round=10, rng=rng)
         picked_ids = {c["id"] for c in picked_pref}
         self.assertEqual(picked_ids, {1, 5})
         self.assertNotIn(6, picked_ids)
 
-        # 第 5 局若强行要抽 4 张：优先池 2 张不够，必须按 last_drawn_round 从小到大补齐 id=4(2)、id=3(3)，排除最晚的 id=2(4)
-        picked_fallback = db_secret_cards.select_cards_for_round(candidates, 4, current_round=5, rng=rng)
+        # 第 10 局若强行要抽 4 张：优先池 2 张不够，必须按 last_drawn_round 从小到大补齐 id=4(2)、id=3(3)，排除最晚的 id=2(4)
+        picked_fallback = db_secret_cards.select_cards_for_round(candidates, 4, current_round=10, rng=rng)
         self.assertEqual(len(picked_fallback), 4)
         self.assertEqual({c["id"] for c in picked_fallback}, {1, 5, 4, 3})
 
         # 超过可用总量（要 10 张只有 5 张启用）严禁报错，安全返回全部 5 张
-        picked_over = db_secret_cards.select_cards_for_round(candidates, 10, current_round=5, rng=rng)
+        picked_over = db_secret_cards.select_cards_for_round(candidates, 10, current_round=10, rng=rng)
         self.assertEqual(len(picked_over), 5)
         self.assertEqual(db_secret_cards.select_cards_for_round([], 2, current_round=1), [])
 
@@ -300,7 +300,7 @@ class SecretCardsTests(unittest.TestCase):
                 self.assertNotIn("cards", status_res)
                 self.assertNotIn("冰镇荔枝气泡", status_raw)
 
-                # 3. AI 工具防打架守卫：2 小时内调用 draw_secret_cards 必须原样返回当前手牌，不重抽不递增 round
+                # 3. AI 工具防打架守卫：12 小时内调用 draw_secret_cards 必须原样返回当前手牌，不重抽不递增 round
                 with patch.object(shared, "DATABASE_ENABLED", True):
                     ai_res = await mcp_server.draw_secret_cards(position=1, play=0)
                 self.assertTrue(ai_res["reused"])
@@ -328,10 +328,10 @@ class SecretCardsTests(unittest.TestCase):
                 self.assertEqual(ai_fresh["current_round"], 3)
                 self.assertEqual(ai_fresh["total_count"], 2)
 
-                # 7. 超过 2 小时过期后，AI 再调用会开启新一局 round=4
-                expired_ts = (t0 - timedelta(hours=3)).isoformat()
+                # 7. 超过 12 小时过期后，AI 再调用会开启新一局 round=4
+                expired_ts = (t0 - timedelta(hours=13)).isoformat()
                 store.deck_state["active_hand"]["expires_at"] = expired_ts
-                store.deck_state["active_hand"]["expires_at_ms"] = int((t0 - timedelta(hours=3)).timestamp() * 1000)
+                store.deck_state["active_hand"]["expires_at_ms"] = int((t0 - timedelta(hours=13)).timestamp() * 1000)
                 ai_after_exp = await db_secret_cards.draw_secret_cards(
                     count=2,
                     source="ai",

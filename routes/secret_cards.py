@@ -163,7 +163,7 @@ async def api_secret_deck_status():
 @router.post("/api/secret-cards/draw")
 @router.post("/api/secret-deck/draw")
 async def api_secret_deck_draw(body: dict = Body(default={})):
-    """前端阿狸主动点单发牌：最高优先级，覆盖并刷新 2 小时有效期，且严禁返回具体词条 content。"""
+    """前端阿狸主动点单发牌：最高优先级，覆盖并刷新 12 小时有效期，且严禁返回具体词条 content。"""
     try:
         payload = body if isinstance(body, dict) else {}
         ratios = payload.get("ratios")
@@ -208,7 +208,7 @@ async def api_secret_deck_clear():
 @router.post("/api/secret-cards/ai-draw")
 @router.post("/api/secret-deck/ai-draw")
 async def api_secret_deck_ai_draw(body: dict = Body(default={})):
-    """AI 工具抽牌入口：受 2 小时防打架守卫保护，若有效期内直接原样返回生效手牌。"""
+    """AI 工具抽牌入口：受 12 小时防打架守卫保护，若有效期内直接原样返回生效手牌。"""
     try:
         payload = body if isinstance(body, dict) else {}
         ratios = payload.get("ratios")
