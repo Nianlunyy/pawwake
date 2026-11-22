@@ -234,8 +234,9 @@ def format_active_hand_hint(active_hand: Any, now_utc: Optional[datetime] = None
     joined = "、".join(parts)
     return (
         f"<secret_wish_hint>暗牌心愿灵感：{joined}。"
-        "请仅在亲密氛围水到渠成时顺应情绪自然化入互动与细节，"
-        "切勿生硬报幕或点破牌面；若当前语境不合时宜可直接忽略。</secret_wish_hint>"
+        "请以细腻的感官厮磨、呼吸留白与张弛有度的节奏变化为主线，"
+        "待情动水到渠成时，将牌面化作心照不宣的动作细节自然融于兴致之中，"
+        "亦可随当下心境自在取舍。</secret_wish_hint>"
     )
 
 
