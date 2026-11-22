@@ -80,6 +80,15 @@ class _FakeConn:
             self.store.deck_state["active_hand"] = json.loads(raw_hand) if isinstance(raw_hand, str) else raw_hand
             self.store.deck_state["updated_at"] = datetime.now(timezone.utc)
             return "UPDATE 1"
+        if norm.startswith("UPDATE secret_cards SET last_drawn_round = 0"):
+            for c in self.store.cards:
+                c["last_drawn_round"] = 0
+            return f"UPDATE {len(self.store.cards)}"
+        if norm.startswith("UPDATE secret_deck_state SET current_round = 0, active_hand = NULL"):
+            self.store.deck_state["current_round"] = 0
+            self.store.deck_state["active_hand"] = None
+            self.store.deck_state["updated_at"] = datetime.now(timezone.utc)
+            return "UPDATE 1"
         return "OK"
 
     async def fetchrow(self, sql: str, *args):
@@ -347,6 +356,13 @@ class SecretCardsTests(unittest.TestCase):
                     {"dimension": "prop", "disabled_only": True}
                 )
                 self.assertEqual(bdel["deleted_count"], 1)
+
+                # 9. 一键重置翻牌历史：所有牌 last_drawn_round 归零，current_round 归零，active_hand 清空
+                reset_res = await secret_routes.api_secret_deck_reset_history()
+                self.assertEqual(reset_res["status"], "ok")
+                self.assertEqual(reset_res["current_round"], 0)
+                self.assertFalse(reset_res["active"])
+                self.assertTrue(all(c["last_drawn_round"] == 0 for c in store.cards))
 
         asyncio.run(run())
 

@@ -205,6 +205,16 @@ async def api_secret_deck_clear():
         return shared._api_failure("清空暗牌手牌失败")
 
 
+@router.post("/api/secret-cards/reset-history")
+@router.post("/api/secret-deck/reset-history")
+async def api_secret_deck_reset_history():
+    try:
+        sanitized = await db_secret_cards.reset_secret_deck_history()
+        return {"status": "ok", **sanitized}
+    except Exception:
+        return shared._api_failure("重置暗牌翻牌历史失败")
+
+
 @router.post("/api/secret-cards/ai-draw")
 @router.post("/api/secret-deck/ai-draw")
 async def api_secret_deck_ai_draw(body: dict = Body(default={})):

@@ -657,6 +657,30 @@ async def clear_active_hand() -> dict:
     )
 
 
+async def reset_secret_deck_history() -> dict:
+    """将所有暗牌的翻牌历史归零，并重置局数与当前生效手牌。"""
+    pool = await db_core.get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _ensure_deck_state_row(conn)
+            await conn.execute("UPDATE secret_cards SET last_drawn_round = 0")
+            await conn.execute(
+                """
+                UPDATE secret_deck_state
+                SET current_round = 0,
+                    active_hand = NULL,
+                    updated_at = NOW()
+                WHERE id = 1
+                """
+            )
+    pool_counts = await get_pool_counts()
+    return sanitize_hand_for_frontend(
+        None,
+        current_round=0,
+        pool_counts=pool_counts,
+    )
+
+
 async def sync_deck_from_client(payload: dict) -> dict:
     """供 Cuplivo Worker 同步当前 active_hand 与 current_round 到 Pawwake。"""
     if not isinstance(payload, dict):
