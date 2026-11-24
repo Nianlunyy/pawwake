@@ -89,7 +89,8 @@ MAX_COMMENTS = 5
 MAX_COMMENT_CHARS = 100
 MAX_TAGS = 10
 
-_ALLOWED_HOSTS = ("xhslink.com", "xiaohongshu.com")
+_ALLOWED_HOSTS = ("xhslink.com", "xhslink.cn", "xiaohongshu.com")
+_SHORT_HOSTS = ("xhslink.com", "xhslink.cn")
 _URL_RE = re.compile(
     r"https?://[^\s<>'\"`，。；：！？、\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]+",
     re.IGNORECASE,
@@ -730,7 +731,7 @@ def parse_note_url(url: str) -> tuple[str, str, str]:
 
 def _is_short_host(url: str) -> bool:
     host = (urlparse(url).hostname or "").strip().lower().rstrip(".")
-    return host == "xhslink.com" or host.endswith(".xhslink.com")
+    return any(host == short or host.endswith(f".{short}") for short in _SHORT_HOSTS)
 
 
 async def resolve_xhs_link(

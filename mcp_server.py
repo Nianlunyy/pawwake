@@ -442,7 +442,7 @@ async def draw_secret_cards(
 
 @server.tool(
     description=(
-        "读取阿狸分享的小红书笔记内容（支持 xhslink.com 短链、xiaohongshu.com 链接或分享文案），"
+        "读取阿狸分享的小红书笔记内容（支持 xhslink.com / xhslink.cn 短链、xiaohongshu.com 链接或分享文案），"
         "返回标题、作者、正文摘录与可选的精选评论。"
     )
 )

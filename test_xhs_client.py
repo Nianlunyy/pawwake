@@ -166,6 +166,13 @@ class XhsLinkParsingTests(unittest.TestCase):
             "https://xhslink.com/o/2aBcDeFgHiJ",
         )
 
+        cn_copy_text = "99 【测试分享 - 小红书】 http://xhslink.cn/o/9xYzAbCdEfG 复制打开"
+        self.assertEqual(
+            xhs_client.extract_xhs_url(cn_copy_text),
+            "http://xhslink.cn/o/9xYzAbCdEfG",
+        )
+        self.assertTrue(xhs_client._is_short_host("http://xhslink.cn/o/9xYzAbCdEfG"))
+
         glued = "看看这篇 http://xhslink.com/a/AbCdEf12345复制打开小红书"
         self.assertEqual(
             xhs_client.extract_xhs_url(glued),
