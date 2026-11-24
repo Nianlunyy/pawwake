@@ -194,6 +194,9 @@ REASONING_EFFORT = os.getenv("REASONING_EFFORT", "")
 # 适用于中转站按模型分组、不同模型需要不同 Key 的场景
 MEMORY_API_KEY = os.getenv("MEMORY_API_KEY", "")
 
+# 小红书网页版 Cookie（含 a1= 字段），用于读取分享的小红书笔记
+XHS_COOKIE = os.getenv("XHS_COOKIE", "").strip()
+
 SETTINGS_TYPES = {
     "API_BASE_URL": str,
     "API_KEY": str,
@@ -246,11 +249,13 @@ SETTINGS_TYPES = {
     "HEARTBEAT_WEATHER_CITY": lambda value: str(value).strip(),
     "HEARTBEAT_SURF_DAILY_LIMIT": lambda value: max(0, min(10, int(value))),
     "HEARTBEAT_SURF_MAX_STEPS": lambda value: max(2, min(10, int(value))),
+    "XHS_COOKIE": lambda value: str(value).strip(),
 }
 SETTINGS_ALLOW_EMPTY = {
     "CACHE_SUMMARY_MODEL", "DEFAULT_MODEL", "MEMORY_API_KEY", "MEMORY_PHRASES",
     "RERANK_MODEL", "RERANK_BASE_URL", "RERANK_API_KEY",
     "HEARTBEAT_SESSION_ID", "HEARTBEAT_WEATHER_CITY",
+    "XHS_COOKIE",
 }
 
 

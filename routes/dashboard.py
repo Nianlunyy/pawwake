@@ -19,7 +19,7 @@ from routes.memories import start_memory_embedding_backfill
 
 router = APIRouter()
 settings_router = APIRouter()
-_MASKED_KEYS = {"API_KEY", "EMBEDDING_API_KEY", "MEMORY_API_KEY", "RERANK_API_KEY"}
+_MASKED_KEYS = {"API_KEY", "EMBEDDING_API_KEY", "MEMORY_API_KEY", "RERANK_API_KEY", "XHS_COOKIE"}
 logger = logging.getLogger(__name__)
 
 @router.get("/dashboard/login", response_class=HTMLResponse)

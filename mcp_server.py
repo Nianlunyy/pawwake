@@ -1,10 +1,12 @@
 """Official MCP transport for Pawwake memory tools."""
 
+import os
 from datetime import date, datetime
 
 from mcp.server.mcpserver import MCPServer
 
 import shared
+import xhs_client
 from db import core as db_core
 from db import conversations as db_conversations
 from db import memories as db_memories
@@ -435,6 +437,42 @@ async def draw_secret_cards(
     return {
         "status": "ok",
         **result,
+    }
+
+
+@server.tool(
+    description=(
+        "读取阿狸分享的小红书笔记内容（支持 xhslink.com 短链、xiaohongshu.com 链接或分享文案），"
+        "返回标题、作者、正文摘录与可选的精选评论。"
+    )
+)
+async def read_xiaohongshu_note(url: str, include_comments: bool = False) -> dict:
+    if not isinstance(include_comments, bool):
+        raise ValueError("include_comments 必须是布尔值")
+    if not isinstance(url, str) or not url.strip():
+        return {
+            "status": "error",
+            "error_code": "invalid_url",
+            "message": xhs_client._error_message("invalid_url"),
+        }
+    cookie = (shared.XHS_COOKIE or os.getenv("XHS_COOKIE", "")).strip()
+    res = await xhs_client.fetch_note_detail(
+        url,
+        cookie=cookie,
+        include_comments=include_comments,
+    )
+    if res.get("status") != "ok":
+        return {
+            "status": "error",
+            "error_code": res.get("error_code", "fetch_failed"),
+            "message": res.get("message") or xhs_client._error_message("fetch_failed"),
+        }
+    return {
+        "status": "ok",
+        "note_id": res["note_id"],
+        "title": res["title"],
+        "author": res["author"],
+        "content": res["formatted_text"],
     }
 
 
