@@ -443,7 +443,8 @@ async def draw_secret_cards(
 @server.tool(
     description=(
         "读取阿狸分享的小红书笔记内容（支持 xhslink.com / xhslink.cn 短链、xiaohongshu.com 链接或分享文案），"
-        "返回标题、作者、正文摘录与可选的精选评论。"
+        "返回标题、作者、正文摘录。若阿狸想看评论区或大家评价，请将 include_comments 设为 true；"
+        "平时只读正文保持默认 false 即可。"
     )
 )
 async def read_xiaohongshu_note(url: str, include_comments: bool = False) -> dict:

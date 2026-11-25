@@ -330,10 +330,93 @@ class XhsFetchAndMcpTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["comment_status"], "ok")
         self.assertEqual(len(res["comments"]), xhs_client.MAX_COMMENTS)
         self.assertLessEqual(len(res["comments"][0]["content"]), xhs_client.MAX_COMMENT_CHARS + 1)
         self.assertIn("精选评论：", res["formatted_text"])
         self.assertIn("视频笔记", res["formatted_text"])
+
+    async def test_comment_status_feedback_empty_rejected_and_timeout(self):
+        nid = "65a1b2c3000000001e02a3b4"
+
+        def _make_handler(comment_handler):
+            def handler(request: httpx.Request) -> httpx.Response:
+                if request.url.path == "/api/sns/web/v1/feed":
+                    return httpx.Response(
+                        200,
+                        json={
+                            "success": True,
+                            "data": {
+                                "items": [
+                                    {
+                                        "note_card": {
+                                            "title": "标题",
+                                            "desc": "正文",
+                                            "type": "normal",
+                                            "user": {"nickname": "作者"},
+                                        }
+                                    }
+                                ]
+                            },
+                        },
+                    )
+                if request.url.path == "/api/sns/web/v2/comment/page":
+                    return comment_handler(request)
+                return httpx.Response(404)
+
+            return handler
+
+        # 1. Empty comment list
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                _make_handler(lambda req: httpx.Response(200, json={"success": True, "data": {"comments": []}}))
+            )
+        ) as client:
+            r_empty = await xhs_client.fetch_note_detail(
+                f"https://www.xiaohongshu.com/explore/{nid}",
+                cookie="a1=test_a1",
+                include_comments=True,
+                client=client,
+            )
+        self.assertEqual(r_empty["comment_status"], "empty")
+        self.assertIn("暂时还没有评论", r_empty["formatted_text"])
+
+        # 2. Rejected by comment endpoint
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                _make_handler(
+                    lambda req: httpx.Response(
+                        461,
+                        json={"success": False, "code": 300011, "msg": "需要验证"},
+                    )
+                )
+            )
+        ) as client:
+            r_err = await xhs_client.fetch_note_detail(
+                f"https://www.xiaohongshu.com/explore/{nid}",
+                cookie="a1=test_a1",
+                include_comments=True,
+                client=client,
+            )
+        self.assertEqual(r_err["comment_status"], "error")
+        self.assertIn("评论区暂时没能拉取到", r_err["formatted_text"])
+        self.assertIn("code=300011", r_err["formatted_text"])
+
+        # 3. Comment request timeout
+        def _timeout_comment(req: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("comment timeout", request=req)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_make_handler(_timeout_comment))
+        ) as client:
+            r_to = await xhs_client.fetch_note_detail(
+                f"https://www.xiaohongshu.com/explore/{nid}",
+                cookie="a1=test_a1",
+                include_comments=True,
+                client=client,
+            )
+        self.assertEqual(r_to["comment_status"], "skipped_timeout")
+        self.assertIn("评论区请求超时", r_to["formatted_text"])
 
     async def test_ssrf_redirect_blocked(self):
         called_targets: list[str] = []

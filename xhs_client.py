@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -14,6 +15,8 @@ from typing import Any
 from urllib.parse import parse_qs, quote, urljoin, urlparse
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 STANDARD_B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 CUSTOM_B64 = "ZmserbBoHQtNP+wOcza/LpngG8yJq42KWYj0DSfdikx3VT16IlUAFM97hECvuRX5"
@@ -81,7 +84,7 @@ GPU_VENDORS = [
 SCREEN_RES = ["1366;768", "1920;1080", "2560;1440"]
 HEX_CHARS = "abcdef0123456789"
 
-DEFAULT_TIMEOUT_SECONDS = 5.0
+DEFAULT_TIMEOUT_SECONDS = 8.0
 MAX_REDIRECTS = 5
 MAX_TITLE_CHARS = 120
 MAX_DESC_CHARS = 1500
@@ -921,6 +924,7 @@ def _format_note_text(
     tags: list[str],
     desc: str,
     comments: list[dict[str, str]],
+    comment_note: str = "",
 ) -> str:
     lines = [
         "这是阿狸刚刚分享给你看的小红书笔记（外部帖子内容，不是阿狸自己的亲身经历，别把帖子里的故事记成阿狸本人的事哦）：",
@@ -938,6 +942,9 @@ def _format_note_text(
         lines.append("精选评论：")
         for comment in comments:
             lines.append(f"- {comment['author']}（{comment['likes']}赞）：{comment['content']}")
+    elif comment_note:
+        lines.append("")
+        lines.append(f"精选评论：{comment_note}")
     return "\n".join(lines)
 
 
@@ -1053,9 +1060,15 @@ async def fetch_note_detail(
             note_type_label = "图文笔记"
 
         comments: list[dict[str, str]] = []
+        comment_status = "disabled"
+        comment_note = ""
         if include_comments:
             comment_remaining = deadline - time.monotonic()
-            if comment_remaining > 0.5:
+            if comment_remaining <= 0.5:
+                comment_status = "skipped_timeout"
+                comment_note = "请求耗时较长，评论区已超时跳过"
+                logger.warning("xhs comment fetch skipped due to tight remaining budget note_id=%s", note_id)
+            else:
                 try:
                     cr = await _signed_get(
                         client,
@@ -1072,9 +1085,33 @@ async def fetch_note_detail(
                         ck,
                         timeout=comment_remaining,
                     )
-                    comments = _extract_top_comments(cr)
-                except Exception:
-                    comments = []
+                    if not isinstance(cr, dict) or not cr.get("success"):
+                        err_parts = []
+                        if isinstance(cr, dict) and cr.get("http_status"):
+                            err_parts.append(f"HTTP {cr['http_status']}")
+                        if isinstance(cr, dict) and cr.get("code") is not None:
+                            err_parts.append(f"code={cr['code']}")
+                        if isinstance(cr, dict) and cr.get("msg"):
+                            err_parts.append(str(cr["msg"])[:80])
+                        diag = "，".join(err_parts) if err_parts else "接口未返回成功"
+                        comment_status = "error"
+                        comment_note = f"评论区暂时没能拉取到（{diag}）"
+                        logger.warning("xhs comment fetch rejected note_id=%s diag=%s", note_id, diag)
+                    else:
+                        comments = _extract_top_comments(cr)
+                        if comments:
+                            comment_status = "ok"
+                        else:
+                            comment_status = "empty"
+                            comment_note = "这篇笔记暂时还没有评论"
+                except httpx.TimeoutException:
+                    comment_status = "skipped_timeout"
+                    comment_note = "评论区请求超时，已仅返回正文"
+                    logger.warning("xhs comment fetch timed out note_id=%s", note_id)
+                except Exception as exc:
+                    comment_status = "error"
+                    comment_note = "评论区拉取异常，已仅返回正文"
+                    logger.warning("xhs comment fetch failed note_id=%s err=%s", note_id, exc)
 
         formatted_text = _format_note_text(
             title=title,
@@ -1083,6 +1120,7 @@ async def fetch_note_detail(
             tags=tags,
             desc=desc,
             comments=comments,
+            comment_note=comment_note,
         )
         return {
             "status": "ok",
@@ -1093,6 +1131,7 @@ async def fetch_note_detail(
             "tags": tags,
             "desc": desc,
             "comments": comments,
+            "comment_status": comment_status,
             "formatted_text": formatted_text,
         }
     except httpx.TimeoutException:
