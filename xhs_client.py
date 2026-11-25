@@ -621,6 +621,7 @@ async def _signed_get(
     query = build_signed_query(params)
     sig = sign_headers("GET", uri, ck, params=params or {})
     headers = {**base_headers(cookie_str), **sig, **(extra_headers or {})}
+    headers.pop("content-type", None)
     url = base + uri + (("?" + query) if query else "")
     resp = await client.get(url, headers=headers, timeout=timeout)
     text = resp.text
@@ -1083,6 +1084,7 @@ async def fetch_note_detail(
                         },
                         cookie_str,
                         ck,
+                        extra_headers={"referer": f"{WWW}/explore/{note_id}"},
                         timeout=comment_remaining,
                     )
                     if not isinstance(cr, dict) or not cr.get("success"):

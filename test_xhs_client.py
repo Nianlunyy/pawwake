@@ -314,6 +314,11 @@ class XhsFetchAndMcpTests(unittest.IsolatedAsyncioTestCase):
                     },
                 )
             if request.url.path == "/api/sns/web/v2/comment/page":
+                self.assertNotIn("content-type", request.headers)
+                self.assertEqual(
+                    request.headers.get("referer"),
+                    f"https://www.xiaohongshu.com/explore/{nid}",
+                )
                 return httpx.Response(
                     200,
                     json={"success": True, "data": {"comments": comments_data}},
