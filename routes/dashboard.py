@@ -13,6 +13,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 import auth
 import recall_rerank
 import shared
+import xhs_client
 from db import core as db_core
 from db import search as db_search
 from routes.memories import start_memory_embedding_backfill
@@ -447,3 +448,29 @@ async def save_settings(request: Request):
         }
     except Exception:
         return shared._api_failure("保存设置失败")
+
+
+@settings_router.post("/api/xhs/check-login")
+async def check_xhs_cookie(request: Request):
+    """检测当前或传入的小红书 Cookie 是否有效（绝不回传明文 Cookie）。"""
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        raw_cookie = str((body or {}).get("cookie") or "").strip()
+        if not raw_cookie or _is_masked(raw_cookie):
+            cookie = (shared.XHS_COOKIE or os.getenv("XHS_COOKIE", "")).strip()
+        else:
+            cookie = raw_cookie
+        res = await xhs_client.check_xhs_login(cookie)
+        return {
+            "status": "ok",
+            "logged_in": bool(res.get("logged_in")),
+            "nickname": res.get("nickname") or "",
+            "user_id": res.get("user_id") or "",
+            "red_id": res.get("red_id") or "",
+            "error_code": res.get("error_code") or "",
+        }
+    except Exception:
+        return shared._api_failure("检测小红书 Cookie 失败")

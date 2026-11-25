@@ -2880,6 +2880,37 @@ async function loadHeartbeatStatus() {
     }
 }
 
+async function checkXhsCookie() {
+    const btn = document.getElementById('check-xhs-cookie-btn');
+    const resultEl = document.getElementById('xhs-check-result');
+    const inputEl = document.getElementById('set-XHS_COOKIE');
+    if (btn) btn.disabled = true;
+    if (resultEl) resultEl.textContent = '检测中...';
+    try {
+        const resp = await fetch('/api/xhs/check-login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cookie: inputEl ? inputEl.value : '' }),
+        });
+        const data = await resp.json();
+        if (data.error) {
+            if (resultEl) resultEl.textContent = '检测失败: ' + data.error;
+            return;
+        }
+        if (data.logged_in) {
+            const who = data.nickname || data.user_id || '已登录账号';
+            if (resultEl) resultEl.textContent = `有效（${who}）`;
+        } else {
+            const code = data.error_code ? `（${data.error_code}）` : '';
+            if (resultEl) resultEl.textContent = `未登录或已失效${code}`;
+        }
+    } catch (e) {
+        if (resultEl) resultEl.textContent = '检测异常: ' + e.message;
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
 async function saveSettings() {
     const btn = document.getElementById('save-settings-btn');
     const dimEl = document.getElementById('set-EMBEDDING_DIM');

@@ -228,7 +228,20 @@ def _is_community_or_external_tool(tool_name: str, tool_config: dict | None = No
     name_l = str(tool_name or "").strip().lower()
     if not name_l:
         return False
-    if any(kw in name_l for kw in ("lutopia", "forum", "community", "bbs", "tieba", "reddit", "moltbook")):
+    if any(
+        kw in name_l
+        for kw in (
+            "lutopia",
+            "forum",
+            "community",
+            "bbs",
+            "tieba",
+            "reddit",
+            "moltbook",
+            "xiaohongshu",
+            "xhs",
+        )
+    ):
         return True
     routes = (tool_config or {}).get("mcp_tool_routes") or {}
     if tool_name in routes:

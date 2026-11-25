@@ -440,27 +440,27 @@ async def draw_secret_cards(
     }
 
 
+def _get_xhs_cookie() -> str:
+    return (shared.XHS_COOKIE or os.getenv("XHS_COOKIE", "")).strip()
+
+
 @server.tool(
     description=(
         "读取阿狸分享的小红书笔记内容（支持 xhslink.com / xhslink.cn 短链、xiaohongshu.com 链接或分享文案），"
-        "返回标题、作者、正文摘录。若阿狸想看评论区或大家评价，请将 include_comments 设为 true；"
-        "平时只读正文保持默认 false 即可。"
+        "返回标题、作者、标签与正文摘录。"
     )
 )
-async def read_xiaohongshu_note(url: str, include_comments: bool = False) -> dict:
-    if not isinstance(include_comments, bool):
-        raise ValueError("include_comments 必须是布尔值")
+async def read_xiaohongshu_note(url: str) -> dict:
     if not isinstance(url, str) or not url.strip():
         return {
             "status": "error",
             "error_code": "invalid_url",
             "message": xhs_client._error_message("invalid_url"),
         }
-    cookie = (shared.XHS_COOKIE or os.getenv("XHS_COOKIE", "")).strip()
     res = await xhs_client.fetch_note_detail(
         url,
-        cookie=cookie,
-        include_comments=include_comments,
+        cookie=_get_xhs_cookie(),
+        include_comments=False,
     )
     if res.get("status") != "ok":
         return {
@@ -473,6 +473,72 @@ async def read_xiaohongshu_note(url: str, include_comments: bool = False) -> dic
         "note_id": res["note_id"],
         "title": res["title"],
         "author": res["author"],
+        "content": res["formatted_text"],
+    }
+
+
+@server.tool(
+    description=(
+        "逛一逛小红书：不传 keyword 时看首页推荐流，传 keyword 时按关键词搜索笔记（sort 可选 general/time/hot）。"
+        "每次最多返回 8 条标题和链接，挑中感兴趣的再调用 read_xiaohongshu_note 读正文。"
+    )
+)
+async def browse_xiaohongshu(
+    keyword: str = "",
+    sort: str = "general",
+    limit: int = 8,
+) -> dict:
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 8:
+        raise ValueError("limit 必须是 1 到 8 的整数")
+    res = await xhs_client.browse_notes(
+        keyword=keyword,
+        sort=sort,
+        limit=limit,
+        cookie=_get_xhs_cookie(),
+    )
+    if res.get("status") != "ok":
+        return {
+            "status": "error",
+            "error_code": res.get("error_code", "fetch_failed"),
+            "message": res.get("message") or "小红书列表暂时没能刷出来。",
+        }
+    return {
+        "status": "ok",
+        "count": res["count"],
+        "content": res["formatted_text"],
+    }
+
+
+@server.tool(
+    description=(
+        "查看指定小红书主页的最新笔记列表（支持主页链接、xhslink 短链或 user_id）。"
+        "每次最多返回 8 条标题和链接，想看哪篇正文再调用 read_xiaohongshu_note。"
+    )
+)
+async def get_xiaohongshu_user_notes(target: str, limit: int = 8) -> dict:
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 8:
+        raise ValueError("limit 必须是 1 到 8 的整数")
+    if not isinstance(target, str) or not target.strip():
+        return {
+            "status": "error",
+            "error_code": "invalid_user_target",
+            "message": "请提供小红书主页链接或 user_id。",
+        }
+    res = await xhs_client.fetch_user_notes(
+        target=target,
+        limit=limit,
+        cookie=_get_xhs_cookie(),
+    )
+    if res.get("status") != "ok":
+        return {
+            "status": "error",
+            "error_code": res.get("error_code", "fetch_failed"),
+            "message": res.get("message") or "暂时没能拿到这个主页的笔记列表。",
+        }
+    return {
+        "status": "ok",
+        "user_id": res["user_id"],
+        "count": res["count"],
         "content": res["formatted_text"],
     }
 

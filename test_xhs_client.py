@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 from starlette.requests import Request
 
+import heartbeat_service
 import mcp_server
 import shared
 import xhs_client
@@ -515,13 +516,6 @@ class XhsFetchAndMcpTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(blank["error_code"], "invalid_url")
             self.assertIn("阿狸", blank["message"])
 
-            # Non-bool include_comments rejected cleanly
-            with self.assertRaises(ValueError):
-                await mcp_server.read_xiaohongshu_note(
-                    "https://xhslink.com/o/abc",
-                    include_comments="true",  # type: ignore[arg-type]
-                )
-
             # Successful call passes cookie from shared.XHS_COOKIE
             with patch(
                 "xhs_client.fetch_note_detail",
@@ -537,28 +531,150 @@ class XhsFetchAndMcpTests(unittest.IsolatedAsyncioTestCase):
             ) as mock_fetch:
                 ok_res = await mcp_server.read_xiaohongshu_note(
                     "https://xhslink.com/o/abc",
-                    include_comments=True,
                 )
             mock_fetch.assert_awaited_once_with(
                 "https://xhslink.com/o/abc",
                 cookie="a1=mcp_cookie",
-                include_comments=True,
+                include_comments=False,
             )
             self.assertEqual(ok_res["status"], "ok")
             self.assertEqual(ok_res["note_id"], "65a1b2c3000000001e02a3b4")
             self.assertEqual(ok_res["content"], "这是阿狸刚刚分享给你看的小红书笔记")
 
-            # Verify MCP tool description avoids "用户" and "AI"
+            # Verify MCP tool descriptions avoid "用户" and "AI"
             tools = await mcp_server.server.list_tools()
-            xhs_tool = next((t for t in tools if t.name == "read_xiaohongshu_note"), None)
-            self.assertIsNotNone(xhs_tool)
-            desc = xhs_tool.description or ""
-            self.assertIn("阿狸", desc)
-            self.assertNotIn("用户", desc)
-            self.assertNotIn("AI", desc)
+            for name in (
+                "read_xiaohongshu_note",
+                "browse_xiaohongshu",
+                "get_xiaohongshu_user_notes",
+            ):
+                tool_obj = next((t for t in tools if t.name == name), None)
+                self.assertIsNotNone(tool_obj, f"missing tool {name}")
+                desc = tool_obj.description or ""
+                self.assertNotIn("用户", desc)
+                self.assertNotIn("AI", desc)
         finally:
             shared.DATABASE_ENABLED = orig_db
             shared.MEMORY_ENABLED = orig_mem
+            shared.XHS_COOKIE = orig_cookie
+
+    async def test_phase2_browse_user_notes_and_heartbeat_quota(self):
+        # 1. Homefeed & keyword search
+        def browse_handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/sns/web/v1/homefeed":
+                items = [
+                    {
+                        "id": f"65a1b2c3000000001e02a30{i}",
+                        "xsec_token": f"tok_{i}",
+                        "note_card": {
+                            "display_title": f"推荐笔记 {i}",
+                            "type": "normal",
+                            "user": {"nickname": f"博主{i}"},
+                            "interact_info": {"liked_count": str(10 + i)},
+                        },
+                    }
+                    for i in range(12)
+                ]
+                return httpx.Response(200, json={"success": True, "data": {"items": items}})
+            if request.url.path == "/api/sns/web/v1/search/notes":
+                body = json.loads(request.content.decode("utf-8"))
+                self.assertEqual(body["keyword"], "手冲咖啡")
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": {
+                            "items": [
+                                {
+                                    "id": "65a1b2c3000000001e02a399",
+                                    "model_type": "note",
+                                    "xsec_token": "tok_search",
+                                    "note_card": {
+                                        "display_title": "手冲水温指南",
+                                        "type": "video",
+                                        "user": {"nickname": "咖啡师"},
+                                        "interact_info": {"liked_count": "256"},
+                                    },
+                                },
+                                {"id": "hot_tag", "model_type": "hot_query"},
+                            ]
+                        },
+                    },
+                )
+            if request.url.path == "/api/sns/web/v1/user_posted":
+                self.assertEqual(request.url.params.get("user_id"), "5f1234567890abcdef123456")
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": {
+                            "notes": [
+                                {
+                                    "note_id": "65a1b2c3000000001e02a388",
+                                    "xsec_token": "tok_user",
+                                    "display_title": "今天去公园",
+                                    "user": {"nickname": "阿狸关注的人"},
+                                    "interact_info": {"liked_count": "18"},
+                                }
+                            ]
+                        },
+                    },
+                )
+            return httpx.Response(404)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(browse_handler)) as client:
+            home_res = await xhs_client.browse_notes(cookie="a1=ok", limit=8, client=client)
+            self.assertEqual(home_res["status"], "ok")
+            self.assertEqual(home_res["count"], 8)
+            self.assertIn("https://www.xiaohongshu.com/explore/65a1b2c3000000001e02a300?xsec_token=tok_0", home_res["formatted_text"])
+            self.assertNotIn("用户", home_res["formatted_text"])
+            self.assertNotIn("AI", home_res["formatted_text"])
+
+            search_res = await xhs_client.browse_notes("手冲咖啡", sort="hot", cookie="a1=ok", client=client)
+            self.assertEqual(search_res["status"], "ok")
+            self.assertEqual(search_res["count"], 1)
+            self.assertIn("手冲水温指南", search_res["formatted_text"])
+
+            user_res = await xhs_client.fetch_user_notes(
+                "https://www.xiaohongshu.com/user/profile/5f1234567890abcdef123456?xsec_token=utok",
+                cookie="a1=ok",
+                client=client,
+            )
+            self.assertEqual(user_res["status"], "ok")
+            self.assertEqual(user_res["count"], 1)
+            self.assertIn("今天去公园", user_res["formatted_text"])
+
+        # 2. Heartbeat surf quota recognizes local Xiaohongshu MCP tools
+        for tool_name in (
+            "read_xiaohongshu_note",
+            "browse_xiaohongshu",
+            "get_xiaohongshu_user_notes",
+        ):
+            self.assertTrue(heartbeat_service._is_community_or_external_tool(tool_name))
+
+        # 3. MCP wrappers work cleanly
+        orig_cookie = shared.XHS_COOKIE
+        try:
+            shared.XHS_COOKIE = "a1=mcp_ok"
+            with patch(
+                "xhs_client.browse_notes",
+                new=AsyncMock(return_value={"status": "ok", "count": 2, "formatted_text": "列表"}),
+            ):
+                mcp_b = await mcp_server.browse_xiaohongshu(keyword="咖啡", sort="hot", limit=5)
+            self.assertEqual(mcp_b["status"], "ok")
+            self.assertEqual(mcp_b["count"], 2)
+
+            with patch(
+                "xhs_client.fetch_user_notes",
+                new=AsyncMock(return_value={"status": "ok", "user_id": "u1", "count": 1, "formatted_text": "主页"}),
+            ):
+                mcp_u = await mcp_server.get_xiaohongshu_user_notes("5f1234567890abcdef123456")
+            self.assertEqual(mcp_u["status"], "ok")
+            self.assertEqual(mcp_u["user_id"], "u1")
+
+            with self.assertRaises(ValueError):
+                await mcp_server.browse_xiaohongshu(limit=20)
+        finally:
             shared.XHS_COOKIE = orig_cookie
 
 
@@ -623,7 +739,29 @@ class XhsDashboardSettingsTests(unittest.IsolatedAsyncioTestCase):
             js_src = (ROOT / "static" / "js" / "dashboard.js").read_text(encoding="utf-8")
             self.assertIn('id="set-XHS_COOKIE"', html_src)
             self.assertIn('id="set-XHS_COOKIE-hint"', html_src)
+            self.assertIn('id="check-xhs-cookie-btn"', html_src)
             self.assertIn("'XHS_COOKIE'", js_src)
+            self.assertIn("function checkXhsCookie()", js_src)
+
+            # Test check_xhs_cookie endpoint uses shared.XHS_COOKIE when masked
+            check_req = Request(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/api/xhs/check-login",
+                    "headers": [(b"content-type", b"application/json")],
+                }
+            )
+            check_req._json = {"cookie": masked_val}
+            shared.XHS_COOKIE = "a1=real_secret_cookie"
+            with patch(
+                "xhs_client.check_xhs_login",
+                new=AsyncMock(return_value={"logged_in": True, "nickname": "阿狸小号", "user_id": "u123"}),
+            ) as mock_check:
+                check_res = await dashboard_routes.check_xhs_cookie(check_req)
+            mock_check.assert_awaited_once_with("a1=real_secret_cookie")
+            self.assertTrue(check_res["logged_in"])
+            self.assertEqual(check_res["nickname"], "阿狸小号")
         finally:
             shared.XHS_COOKIE = orig_cookie
             if orig_env is None:

@@ -794,6 +794,10 @@
                         <label>小红书 Cookie (XHS_COOKIE)</label>
                         <input type="text" id="set-XHS_COOKIE" class="input" placeholder="粘贴小红书网页版完整 Cookie（需包含 a1=）" autocomplete="off">
                         <small class="form-hint" id="set-XHS_COOKIE-hint">打码显示，不修改可保持原样；清空保存即删除</small>
+                        <div style="margin-top:8px; display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+                            <button type="button" class="btn btn-secondary" id="check-xhs-cookie-btn" onclick="checkXhsCookie()">测试 Cookie 是否有效</button>
+                            <small class="form-hint" id="xhs-check-result" style="margin:0;"></small>
+                        </div>
                     </div>
                 </div>
 
@@ -814,6 +818,6 @@
         </main>
     </div>
 
-    <script src="/static/js/dashboard.js?v=4.5.1"></script>
+    <script src="/static/js/dashboard.js?v=4.5.2"></script>
 </body>
 </html>

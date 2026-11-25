@@ -91,6 +91,7 @@ MAX_DESC_CHARS = 1500
 MAX_COMMENTS = 5
 MAX_COMMENT_CHARS = 100
 MAX_TAGS = 10
+MAX_LIST_ITEMS = 8
 
 _ALLOWED_HOSTS = ("xhslink.com", "xhslink.cn", "xiaohongshu.com")
 _SHORT_HOSTS = ("xhslink.com", "xhslink.cn")
@@ -1196,6 +1197,407 @@ async def check_xhs_login(
         return {"logged_in": False, "error_code": "timeout"}
     except Exception:
         return {"logged_in": False, "error_code": "fetch_failed"}
+    finally:
+        if owns_client and client is not None:
+            await client.aclose()
+
+
+_SORT_MAP = {
+    "general": "general",
+    "time": "time_descending",
+    "hot": "popularity_descending",
+}
+_USER_PROFILE_PATH_RE = re.compile(r"^/user/profile/([0-9A-Za-z_-]{12,36})(?:/|$)")
+_USER_ID_RE = re.compile(r"^[0-9a-fA-F]{16,32}$")
+
+
+def _gen_search_id() -> str:
+    big = (int(time.time() * 1000) << 64) + (secrets.randbelow(0x7FFFFFFE) + 1)
+    b36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+    chars: list[str] = []
+    while big > 0:
+        big, rem = divmod(big, 36)
+        chars.append(b36[rem])
+    return "".join(reversed(chars)) or "0"
+
+
+def _build_note_url(note_id: str, xsec_token: str = "", xsec_source: str = "pc_feed") -> str:
+    base = f"{WWW}/explore/{note_id}"
+    if xsec_token:
+        return f"{base}?xsec_token={py_quote(xsec_token, '')}&xsec_source={py_quote(xsec_source, '')}"
+    return base
+
+
+def _normalize_feed_items(
+    raw_items: Any,
+    *,
+    limit: int = MAX_LIST_ITEMS,
+    xsec_source: str = "pc_feed",
+) -> list[dict[str, str]]:
+    if not isinstance(raw_items, list):
+        return []
+    cap = max(1, min(MAX_LIST_ITEMS, int(limit or MAX_LIST_ITEMS)))
+    items: list[dict[str, str]] = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        nc = raw.get("note_card") or raw.get("noteCard") or raw
+        if not isinstance(nc, dict):
+            continue
+        note_id = str(raw.get("id") or nc.get("note_id") or nc.get("id") or "").strip()
+        if not note_id:
+            continue
+        user = nc.get("user") if isinstance(nc.get("user"), dict) else {}
+        interact = nc.get("interact_info") or nc.get("interactInfo") or {}
+        if not isinstance(interact, dict):
+            interact = {}
+        xsec_token = str(raw.get("xsec_token") or nc.get("xsec_token") or "").strip()
+        title = _truncate_text(
+            str(nc.get("display_title") or nc.get("title") or "").strip() or "无标题",
+            60,
+        )
+        author = _truncate_text(
+            str(user.get("nickname") or user.get("nick_name") or "").strip() or "未知作者",
+            30,
+        )
+        likes = str(interact.get("liked_count") or interact.get("likedCount") or "0").strip() or "0"
+        raw_type = str(nc.get("type") or raw.get("model_type") or "").strip().lower()
+        note_type = "视频" if raw_type == "video" else "图文"
+        items.append(
+            {
+                "note_id": note_id,
+                "title": title,
+                "author": author,
+                "likes": likes,
+                "note_type": note_type,
+                "url": _build_note_url(note_id, xsec_token=xsec_token, xsec_source=xsec_source),
+            }
+        )
+        if len(items) >= cap:
+            break
+    return items
+
+
+def _format_feed_list(header: str, items: list[dict[str, str]]) -> str:
+    if not items:
+        return f"{header}\n暂时没有找到符合条件的笔记。"
+    lines = [
+        f"{header}（外部帖子列表，不是阿狸自己的亲身经历；想看哪一篇的正文，可以用对应链接调用 read_xiaohongshu_note）：",
+        "",
+    ]
+    for idx, item in enumerate(items, start=1):
+        lines.append(
+            f"{idx}. 《{item['title']}》 — {item['author']}（{item['likes']}赞，{item['note_type']}）\n"
+            f"   链接：{item['url']}"
+        )
+    return "\n".join(lines)
+
+
+def _validate_cookie(cookie: str) -> tuple[str, dict[str, str]] | dict[str, Any]:
+    cookie_str = (cookie or "").strip()
+    if not cookie_str:
+        return {
+            "status": "error",
+            "error_code": "missing_cookie",
+            "message": _error_message("missing_cookie"),
+        }
+    ck = parse_cookies(cookie_str)
+    if not ck.get("a1"):
+        return {
+            "status": "error",
+            "error_code": "invalid_cookie",
+            "message": _error_message("invalid_cookie"),
+        }
+    return cookie_str, ck
+
+
+async def browse_notes(
+    keyword: str = "",
+    *,
+    sort: str = "general",
+    limit: int = MAX_LIST_ITEMS,
+    cookie: str,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    """Browse Xiaohongshu homefeed recommendations or search notes by keyword."""
+    validated = _validate_cookie(cookie)
+    if isinstance(validated, dict):
+        return validated
+    cookie_str, ck = validated
+
+    clean_keyword = (keyword or "").strip()
+    sort_key = _SORT_MAP.get((sort or "general").strip().lower(), "general")
+    cap = max(1, min(MAX_LIST_ITEMS, int(limit or MAX_LIST_ITEMS)))
+
+    owns_client = client is None
+    if owns_client:
+        client = httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout, connect=min(2.0, timeout)),
+            follow_redirects=False,
+        )
+    try:
+        if clean_keyword:
+            payload = {
+                "keyword": clean_keyword,
+                "page": 1,
+                "page_size": 20,
+                "search_id": _gen_search_id(),
+                "sort": sort_key,
+                "note_type": 0,
+                "ext_flags": [],
+                "filters": [
+                    {"tags": [sort_key], "type": "sort_type"},
+                    {"tags": ["不限"], "type": "filter_note_type"},
+                    {"tags": ["不限"], "type": "filter_note_time"},
+                    {"tags": ["不限"], "type": "filter_note_range"},
+                    {"tags": ["不限"], "type": "filter_pos_distance"},
+                ],
+                "geo": "",
+                "image_formats": IMG_FORMATS,
+            }
+            r = await _signed_post(
+                client,
+                EDITH,
+                "/api/sns/web/v1/search/notes",
+                payload,
+                cookie_str,
+                ck,
+                timeout=timeout,
+            )
+            raw_items = [
+                it
+                for it in ((r.get("data") or {}).get("items") or [])
+                if isinstance(it, dict) and it.get("id") and (it.get("note_card") or it.get("model_type") == "note")
+            ]
+            header = f"小红书关键词「{clean_keyword}」搜索结果"
+            source_tag = "pc_search"
+        else:
+            payload = {
+                "cursor_score": "",
+                "num": 20,
+                "refresh_type": 1,
+                "note_index": 0,
+                "unread_begin_note_id": "",
+                "unread_end_note_id": "",
+                "unread_note_count": 0,
+                "category": "homefeed_recommend",
+                "search_key": "",
+                "need_num": 10,
+                "image_formats": IMG_FORMATS,
+                "need_filter_image": False,
+            }
+            r = await _signed_post(
+                client,
+                EDITH,
+                "/api/sns/web/v1/homefeed",
+                payload,
+                cookie_str,
+                ck,
+                timeout=timeout,
+            )
+            raw_items = (r.get("data") or {}).get("items") or []
+            header = "小红书首页推荐列表"
+            source_tag = "pc_feed"
+
+        if str(r.get("code")) == "-100":
+            return {
+                "status": "error",
+                "error_code": "cookie_expired",
+                "message": _error_message("cookie_expired"),
+            }
+        if not r.get("success"):
+            logger.warning("xhs browse failed keyword=%r code=%s msg=%s", clean_keyword, r.get("code"), r.get("msg"))
+            return {
+                "status": "error",
+                "error_code": "fetch_failed",
+                "message": "小红书列表暂时没能刷出来（可能是 Cookie 过期了或临时受限），晚点再看看吧。",
+            }
+
+        items = _normalize_feed_items(raw_items, limit=cap, xsec_source=source_tag)
+        return {
+            "status": "ok",
+            "keyword": clean_keyword,
+            "count": len(items),
+            "items": items,
+            "formatted_text": _format_feed_list(header, items),
+        }
+    except httpx.TimeoutException:
+        return {
+            "status": "error",
+            "error_code": "timeout",
+            "message": "小红书列表请求超时了，晚点再刷试试看。",
+        }
+    except Exception as exc:
+        logger.warning("xhs browse exception: %s", exc)
+        return {
+            "status": "error",
+            "error_code": "fetch_failed",
+            "message": "小红书列表暂时没能刷出来，晚点再看看吧。",
+        }
+    finally:
+        if owns_client and client is not None:
+            await client.aclose()
+
+
+def _parse_user_profile_url(url: str) -> tuple[str, str]:
+    if not _is_allowed_xhs_url(url):
+        return "", ""
+    parsed = urlparse(url)
+    m = _USER_PROFILE_PATH_RE.match(parsed.path or "")
+    if not m:
+        return "", ""
+    query = parse_qs(parsed.query)
+    xsec_token = (query.get("xsec_token") or query.get("xsecToken") or [""])[0].strip()
+    return m.group(1), xsec_token
+
+
+async def _resolve_user_target(
+    target: str,
+    *,
+    client: httpx.AsyncClient,
+    timeout: float,
+) -> tuple[str, str]:
+    raw = (target or "").strip()
+    if not raw:
+        return "", ""
+    if _USER_ID_RE.fullmatch(raw):
+        return raw, ""
+    url = extract_xhs_url(raw)
+    if not url:
+        return "", ""
+    uid, token = _parse_user_profile_url(url)
+    if uid and not _is_short_host(url):
+        return uid, token
+
+    current_url = url
+    deadline = time.monotonic() + timeout
+    browser_headers = {
+        "User-Agent": UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    }
+    for _ in range(MAX_REDIRECTS):
+        if not _is_allowed_xhs_url(current_url):
+            return "", ""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise httpx.TimeoutException("user target resolve timeout")
+        resp = await client.get(
+            current_url,
+            headers=browser_headers,
+            follow_redirects=False,
+            timeout=remaining,
+        )
+        if resp.status_code in (301, 302, 303, 307, 308):
+            location = resp.headers.get("location") or resp.headers.get("Location") or ""
+            if not location:
+                break
+            next_url = urljoin(current_url, location.strip())
+            if not _is_allowed_xhs_url(next_url):
+                return "", ""
+            current_url = next_url
+            uid, token = _parse_user_profile_url(current_url)
+            if uid:
+                return uid, token
+            continue
+        break
+    return _parse_user_profile_url(current_url)
+
+
+async def fetch_user_notes(
+    target: str,
+    *,
+    limit: int = MAX_LIST_ITEMS,
+    cookie: str,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    """Fetch recent posted notes of a Xiaohongshu user by user_id or profile link."""
+    validated = _validate_cookie(cookie)
+    if isinstance(validated, dict):
+        return validated
+    cookie_str, ck = validated
+
+    cap = max(1, min(MAX_LIST_ITEMS, int(limit or MAX_LIST_ITEMS)))
+    deadline = time.monotonic() + max(0.5, float(timeout))
+    owns_client = client is None
+    if owns_client:
+        client = httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout, connect=min(2.0, timeout)),
+            follow_redirects=False,
+        )
+    try:
+        user_id, xsec_token = await _resolve_user_target(
+            target,
+            client=client,
+            timeout=max(0.5, deadline - time.monotonic()),
+        )
+        if not user_id:
+            return {
+                "status": "error",
+                "error_code": "invalid_user_target",
+                "message": "没能识别出有效的小红书主页链接或 user_id，可以请阿狸确认一下后再试。",
+            }
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {
+                "status": "error",
+                "error_code": "timeout",
+                "message": "小红书主页请求超时了，晚点再看看吧。",
+            }
+        r = await _signed_get(
+            client,
+            EDITH,
+            "/api/sns/web/v1/user_posted",
+            {
+                "num": 20,
+                "cursor": "",
+                "user_id": user_id,
+                "image_formats": "jpg,webp,avif",
+                "xsec_token": xsec_token,
+                "xsec_source": "pc_note",
+            },
+            cookie_str,
+            ck,
+            extra_headers={"referer": f"{WWW}/user/profile/{user_id}"},
+            timeout=remaining,
+        )
+        if str(r.get("code")) == "-100":
+            return {
+                "status": "error",
+                "error_code": "cookie_expired",
+                "message": _error_message("cookie_expired"),
+            }
+        if not r.get("success"):
+            logger.warning("xhs user_posted failed user_id=%s code=%s msg=%s", user_id, r.get("code"), r.get("msg"))
+            return {
+                "status": "error",
+                "error_code": "fetch_failed",
+                "message": "暂时没能拿到这个小红书主页的笔记列表，可能 Cookie 过期了或主页受限。",
+            }
+        raw_notes = (r.get("data") or {}).get("notes") or []
+        items = _normalize_feed_items(raw_notes, limit=cap, xsec_source="pc_note")
+        return {
+            "status": "ok",
+            "user_id": user_id,
+            "count": len(items),
+            "items": items,
+            "formatted_text": _format_feed_list("该小红书主页的最新笔记", items),
+        }
+    except httpx.TimeoutException:
+        return {
+            "status": "error",
+            "error_code": "timeout",
+            "message": "小红书主页请求超时了，晚点再看看吧。",
+        }
+    except Exception as exc:
+        logger.warning("xhs user_posted exception: %s", exc)
+        return {
+            "status": "error",
+            "error_code": "fetch_failed",
+            "message": "暂时没能拿到这个小红书主页的笔记列表，晚点再看看吧。",
+        }
     finally:
         if owns_client and client is not None:
             await client.aclose()
