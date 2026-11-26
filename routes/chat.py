@@ -20,6 +20,7 @@ from starlette.background import BackgroundTask
 import shared
 import partition_engine
 import memory_pipeline
+import thought_guard
 from db import core as db_core
 from db import search as db_search
 from db import conversations as db_conversations
@@ -33,6 +34,7 @@ FALLBACK_PHASE1_TIMEOUT = 60
 FALLBACK_PHASE2_TIMEOUT = 90
 UPSTREAM_KEEPALIVE_INTERVAL = float(os.getenv("UPSTREAM_KEEPALIVE_INTERVAL", "15.0"))
 UPSTREAM_WAIT_CAP = float(os.getenv("UPSTREAM_WAIT_CAP", "240.0"))
+THOUGHT_LEAK_COOLDOWN_SECONDS = float(os.getenv("CHAT_THOUGHT_LEAK_COOLDOWN_SECONDS", "2.0"))
 
 
 def _format_seconds(val: float) -> str:
@@ -1150,24 +1152,117 @@ async def _chat_completions_body(request: Request, pending_reminder_claims: list
                     assistant_tool_calls = None
                     assistant_reasoning = None
                     parsed_wake_alarm = None
-                    try:
-                        msg_obj = resp_data["choices"][0]["message"]
-                        raw_assistant_msg = msg_obj.get("content") or ""
-                        if "<next_wake" in raw_assistant_msg.lower() or "<topic" in raw_assistant_msg.lower():
+                    _ns_is_post_tool = bool(_final_msgs and _final_msgs[-1].get("role") == "tool")
+                    _ns_has_tools = bool(body.get("tools"))
+
+                    def _parse_nonstream_resp(data_obj: dict):
+                        m_obj = (data_obj.get("choices") or [{}])[0].get("message")
+                        if not isinstance(m_obj, dict):
+                            return None, "", None, None, None, False
+                        raw_before = m_obj.get("content")
+                        vis_text, ext_reason = thought_guard.extract_nonstream_message_content(m_obj)
+                        wake_spec = None
+                        if "<next_wake" in vis_text.lower() or "<topic" in vis_text.lower():
                             import heartbeat_service as _hb_service
-                            assistant_msg, parsed_wake_alarm = _hb_service.parse_and_strip_next_wake(raw_assistant_msg)
-                            assistant_msg, _ = _hb_service.parse_and_strip_topic(assistant_msg)
-                            msg_obj["content"] = assistant_msg
-                        else:
-                            assistant_msg = raw_assistant_msg
-                        if msg_obj.get("tool_calls"):
-                            assistant_tool_calls = msg_obj["tool_calls"]
-                            print(f"🔧 Response 包含 {len(assistant_tool_calls)} 个工具调用")
-                        if msg_obj.get("reasoning_content"):
-                            assistant_reasoning = msg_obj["reasoning_content"]
-                            print(f"🧠 Response 包含 reasoning_content ({len(assistant_reasoning)}字符)")
-                    except (KeyError, IndexError):
-                        pass
+                            vis_text, wake_spec = _hb_service.parse_and_strip_next_wake(vis_text)
+                            vis_text, _ = _hb_service.parse_and_strip_topic(vis_text)
+                        if m_obj.get("content") != vis_text:
+                            m_obj["content"] = vis_text
+                        if ext_reason and not m_obj.get("reasoning_content"):
+                            m_obj["reasoning_content"] = ext_reason
+                        tcs = m_obj.get("tool_calls") or None
+                        had_raw = bool(raw_before)
+                        return m_obj, vis_text, tcs, (ext_reason or None), wake_spec, had_raw
+
+                    msg_obj, assistant_msg, assistant_tool_calls, assistant_reasoning, parsed_wake_alarm, had_raw_content = _parse_nonstream_resp(resp_data)
+
+                    # 拦截非流式工具循环异常英文推理草稿 / 思考块误占正文（保护前缀缓存：原前缀冷却后最多重试 1 次，失败绝不落库）
+                    _ns_is_leaked = (
+                        _ns_has_tools
+                        and not assistant_tool_calls
+                        and thought_guard.is_leaked_tool_reasoning_draft(
+                            assistant_msg,
+                            declared_tools=body.get("tools"),
+                            after_tool_result=_ns_is_post_tool,
+                            user_message=user_message or "",
+                        )
+                    )
+                    _ns_is_thought_only = (
+                        _ns_has_tools
+                        and _ns_is_post_tool
+                        and not assistant_tool_calls
+                        and not assistant_msg
+                        and had_raw_content
+                        and bool(assistant_reasoning)
+                    )
+                    if _ns_is_leaked or _ns_is_thought_only:
+                        leak_kind = "leaked_tool_reasoning" if _ns_is_leaked else "thought_only_drop"
+                        preview = (assistant_msg or assistant_reasoning or "")[:120].replace("\n", " ")
+                        print(
+                            f"🛡️ {req_prefix}非流式拦截异常思考泄露 ({leak_kind})，"
+                            f"冷却 {THOUGHT_LEAK_COOLDOWN_SECONDS:.1f}s 后原前缀保守重试 (1/1) | 片段: {preview!r}",
+                            flush=True,
+                        )
+                        if THOUGHT_LEAK_COOLDOWN_SECONDS > 0:
+                            await asyncio.sleep(THOUGHT_LEAK_COOLDOWN_SECONDS)
+                        retry_body = dict(body)
+                        if (
+                            isinstance(retry_body.get("google"), dict)
+                            and isinstance(retry_body["google"].get("thinking_config"), dict)
+                        ):
+                            retry_body["google"] = {
+                                "thinking_config": {
+                                    "thinking_level": "low",
+                                    "include_thoughts": True,
+                                }
+                            }
+                        retry_resp = await _post_chat_completion_with_429_retry(
+                            client,
+                            shared.API_BASE_URL,
+                            shared.API_KEY,
+                            retry_body,
+                            tag="非流式思考泄露重试",
+                            max_retries=1 if shared.is_vertex_endpoint() else 0,
+                            req_id=req_id,
+                        )
+                        recovered = False
+                        if retry_resp.status_code == 200:
+                            r_data = retry_resp.json()
+                            _, r_msg_text, r_tcs, r_reason, r_wake, _ = _parse_nonstream_resp(r_data)
+                            r_still_leaked = (
+                                not r_tcs
+                                and thought_guard.is_leaked_tool_reasoning_draft(
+                                    r_msg_text,
+                                    declared_tools=body.get("tools"),
+                                    after_tool_result=_ns_is_post_tool,
+                                    user_message=user_message or "",
+                                )
+                            )
+                            if r_tcs or (r_msg_text and not r_still_leaked):
+                                resp_data = r_data
+                                assistant_msg = r_msg_text
+                                assistant_tool_calls = r_tcs
+                                assistant_reasoning = r_reason
+                                parsed_wake_alarm = r_wake
+                                recovered = True
+                                print(f"✅ {req_prefix}非流式思考泄露重试恢复成功", flush=True)
+                        if not recovered:
+                            print(f"🛑 {req_prefix}非流式思考泄露重试未恢复，拒绝落库并返回 502", flush=True)
+                            return JSONResponse(
+                                status_code=502,
+                                content={
+                                    "error": {
+                                        "message": "上游返回异常推理草稿，重试未恢复，请稍后重试",
+                                        "type": "thought_leak_intercepted",
+                                        "code": 502,
+                                    }
+                                },
+                            )
+
+                    if assistant_tool_calls:
+                        print(f"🔧 Response 包含 {len(assistant_tool_calls)} 个工具调用")
+                    if assistant_reasoning:
+                        print(f"🧠 Response 包含 reasoning_content ({len(assistant_reasoning)}字符)")
 
                     await _mark_pending_seen(session_id, pending_fragment_ids, pending_memory_ids)
                     delivered_ok = True
@@ -1396,7 +1491,14 @@ async def _stream_and_capture_inner(
     stream_succeeded = False
     saw_terminal = False  # 见到 data: [DONE] 或 finish_reason 才算 SSE 完整结束
     captured_finish_reason = None  # 保留最终 finish_reason 供兜底逻辑判断
-    held_done_bytes = None  # malformed 时拦截 [DONE]，等兜底完成后再放行
+    held_done_bytes = None  # malformed / 思考泄露拦截 [DONE]，等兜底完成后再放行
+    _req_msgs = body.get("messages") or []
+    _stream_has_tools = bool(body.get("tools"))
+    _stream_is_post_tool = bool(_req_msgs and _req_msgs[-1].get("role") == "tool")
+    _stream_user_is_english = thought_guard.text_is_primarily_english(user_message or "")
+    # 仅在带 tools 的回合启用流式前缀缓冲守卫：中文或代码块首块即放行（零延迟），纯英文内部推理草稿暂存拦截
+    hold_buffer_active = _stream_has_tools and (_stream_is_post_tool or not _stream_user_is_english)
+    held_stream_lines: list[bytes] = []
     rid = req_id or (str(body.get("req_id") or "") if isinstance(body, dict) else "")
     req_prefix = f"req={rid} " if rid else ""
     req_start_time = time.monotonic()
@@ -1536,9 +1638,14 @@ async def _stream_and_capture_inner(
                     stripped_line = line.strip()
                     if stripped_line == "data: [DONE]":
                         _mark_terminal()
-                        if captured_finish_reason == "malformed_function_call" or (not full_response and not accumulated_tool_calls):
+                        if (
+                            captured_finish_reason == "malformed_function_call"
+                            or (not full_response and not accumulated_tool_calls)
+                            or (hold_buffer_active and held_stream_lines and not accumulated_tool_calls)
+                        ):
                             held_done_bytes = (line + "\n").encode("utf-8")
-                            print("🛡️ malformed/空正文已拦截 [DONE]，等兜底完成后放行")
+                            if not (hold_buffer_active and held_stream_lines):
+                                print("🛡️ malformed/空正文已拦截 [DONE]，等兜底完成后放行")
                         else:
                             yield (line + "\n").encode("utf-8")
                         continue
@@ -1569,7 +1676,7 @@ async def _stream_and_capture_inner(
                                     continue
                             delta = first_choice.get("delta", {})
                             content = delta.get("content", "")
-                            is_thinking_chunk = "extra_content" in delta and content
+                            is_thinking_chunk = thought_guard.is_thinking_part(delta) and bool(content)
 
                             # === 监工排查专用日志 ===
                             if content and not is_thinking_chunk:
@@ -1592,9 +1699,39 @@ async def _stream_and_capture_inner(
                                 rewritten_line = "data: " + json.dumps(data, ensure_ascii=False)
                                 yield (rewritten_line + "\n").encode("utf-8")
                             else:
+                                line_bytes = (line + "\n").encode("utf-8")
+                                if "tool_calls" in delta and hold_buffer_active:
+                                    for b_line in held_stream_lines:
+                                        yield b_line
+                                    held_stream_lines.clear()
+                                    hold_buffer_active = False
                                 if content:
                                     full_response.append(content)
-                                yield (line + "\n").encode("utf-8")
+                                    if hold_buffer_active:
+                                        held_stream_lines.append(line_bytes)
+                                        joined_so_far = "".join(full_response)
+                                        should_flush = (
+                                            not thought_guard.has_suspicious_stream_prefix(joined_so_far)
+                                            or (
+                                                not _stream_is_post_tool
+                                                and len(joined_so_far) >= 300
+                                                and not thought_guard.has_reasoning_signal_in_prefix(
+                                                    joined_so_far, body.get("tools")
+                                                )
+                                            )
+                                        )
+                                        if should_flush:
+                                            for b_line in held_stream_lines:
+                                                yield b_line
+                                            held_stream_lines.clear()
+                                            hold_buffer_active = False
+                                    else:
+                                        yield line_bytes
+                                elif hold_buffer_active and held_stream_lines:
+                                    # 正文仍在暂存观察期时，后续 finish_reason / usage 帧按原序一同暂存
+                                    held_stream_lines.append(line_bytes)
+                                else:
+                                    yield line_bytes
 
                             reasoning = delta.get("reasoning_content", "")
                             if reasoning and not is_thinking_chunk:
@@ -1646,6 +1783,37 @@ async def _stream_and_capture_inner(
     assistant_reasoning = "".join(full_reasoning) if full_reasoning else None
     assistant_tool_calls = list(accumulated_tool_calls.values()) if accumulated_tool_calls else None
 
+    # 流式前缀缓冲守卫结算：确认是否为工具循环异常英文推理草稿
+    is_thought_leak = (
+        stream_succeeded
+        and _stream_has_tools
+        and not assistant_tool_calls
+        and bool(assistant_msg)
+        and thought_guard.is_leaked_tool_reasoning_draft(
+            assistant_msg,
+            declared_tools=body.get("tools"),
+            after_tool_result=_stream_is_post_tool,
+            user_message=user_message or "",
+        )
+    )
+    if held_stream_lines:
+        if is_thought_leak:
+            preview = assistant_msg[:120].replace("\n", " ")
+            print(
+                f"🛡️ {req_prefix}流式拦截到工具循环异常英文推理草稿（未透传给客户端），启动原前缀保守重试 | 片段: {preview!r}",
+                flush=True,
+            )
+            held_stream_lines.clear()
+            full_response.clear()
+            assistant_msg = ""
+        else:
+            for b_line in held_stream_lines:
+                yield b_line
+            held_stream_lines.clear()
+    elif is_thought_leak:
+        # 极端情况（如已提前放行后才出现草稿特征）：记录并阻断落库，避免污染历史上下文
+        print(f"🛡️ {req_prefix}流式结束后检测到异常英文推理草稿特征，标记阻断落库", flush=True)
+
     # 状态码门禁：若上游本身返回非 200（如 429、500 等），错误已在流中原样透传，严格禁止触发补刀，
     # 立即打印错误日志并结束生成器，防止 429 连环加剧造成死循环
     if not stream_succeeded:
@@ -1674,10 +1842,15 @@ async def _stream_and_capture_inner(
     # =========================================================================
     is_malformed = (captured_finish_reason == "malformed_function_call")
     is_empty_reply = (not assistant_msg and not assistant_tool_calls)
+    is_intercepted_thought_leak = is_thought_leak and not assistant_msg
 
-    if is_malformed or is_empty_reply:
+    if is_malformed or is_empty_reply or is_intercepted_thought_leak:
         phase = "兜底"
-        _reason = "malformed_function_call" if is_malformed else "空正文且无 tool_calls"
+        _reason = (
+            "leaked_tool_reasoning"
+            if is_intercepted_thought_leak
+            else ("malformed_function_call" if is_malformed else "空正文且无 tool_calls")
+        )
         usage_str = "已收到" if (saw_stream_usage or bool(stream_usage)) else "未收到"
         if not captured_finish_reason:
             thought_chars = len(assistant_reasoning) if assistant_reasoning else 0
@@ -1743,8 +1916,10 @@ async def _stream_and_capture_inner(
                         except Exception:
                             logger.warning("取消兜底后台任务异常", exc_info=True)
 
-            async for ping in _drain_keepalive_during(asyncio.sleep(0.8)):  # 缓冲防 Vertex 429 频控
-                yield ping
+            _cooldown_sec = THOUGHT_LEAK_COOLDOWN_SECONDS if is_intercepted_thought_leak else 0.8
+            if _cooldown_sec > 0:
+                async for ping in _drain_keepalive_during(asyncio.sleep(_cooldown_sec)):  # 缓冲防 Vertex 429 频控
+                    yield ping
 
             has_tools = bool(body.get("tools"))
             rescued_ok = False
@@ -1767,7 +1942,7 @@ async def _stream_and_capture_inner(
                             _post_chat_completion_with_429_retry(
                                 retry_client, shared.API_BASE_URL, shared.API_KEY, retry_body,
                                 tag="工具挽救",
-                                max_retries=2 if shared.is_vertex_endpoint() else 0,
+                                max_retries=(1 if is_intercepted_thought_leak else 2) if shared.is_vertex_endpoint() else 0,
                                 req_id=rid,
                             )
                         )
@@ -1780,10 +1955,23 @@ async def _stream_and_capture_inner(
                             first_c = retry_data.get("choices", [{}])[0]
                             r_msg = first_c.get("message", {})
                             r_tool_calls = r_msg.get("tool_calls")
-                            r_content = r_msg.get("content") or ""
-                            # 切除非流式思考链小作文标签（<thought>.*?</thought> 或 <think>.*?</think>）
-                            r_content = re.sub(r'<(thought|think)>.*?</\1>', '', r_content, flags=re.DOTALL).strip()
+                            r_content, r_reasoning = thought_guard.extract_nonstream_message_content(r_msg)
+                            if r_reasoning and not assistant_reasoning:
+                                assistant_reasoning = r_reasoning
                             r_finish = first_c.get("finish_reason")
+                            r_is_still_leaked = (
+                                not r_tool_calls
+                                and bool(r_content)
+                                and thought_guard.is_leaked_tool_reasoning_draft(
+                                    r_content,
+                                    declared_tools=body.get("tools"),
+                                    after_tool_result=_stream_is_post_tool,
+                                    user_message=user_message or "",
+                                )
+                            )
+                            if r_is_still_leaked:
+                                print(f"🛑 {req_prefix}阶段一重试仍返回异常英文推理草稿，拒绝透传与落库", flush=True)
+                                r_content = ""
 
                             # 成功挽救真实的工具调用！推送给客户端执行工具
                             if r_tool_calls:
@@ -1840,8 +2028,9 @@ async def _stream_and_capture_inner(
                     logger.warning("兜底阶段一（工具挽救）异常，继续尝试阶段二", exc_info=True)
 
             # --- 阶段二：若无 tools 或工具挽救失败，无感剥离 tools 生成纯文本 ---
-            # 注意：绝不向 messages 追加提示，仅底层取消 tools 定义，模型自然输出文本且不破人设
-            if not rescued_ok:
+            # 注意：绝不向 messages 追加提示，仅底层取消 tools 定义，模型自然输出文本且不破人设；
+            # 思考泄露场景严格限制最多重试 1 次且不剥离 tools（保护前缀缓存 + 防 429）。
+            if not rescued_ok and not is_intercepted_thought_leak:
                 try:
                     print("🩹 工具挽救未果，平稳退化为无工具自然作答", flush=True)
                     text_body = dict(body)
@@ -1868,9 +2057,7 @@ async def _stream_and_capture_inner(
                         if text_resp.status_code == 200:
                             text_data = text_resp.json()
                             text_c = text_data.get("choices", [{}])[0]
-                            text_content = text_c.get("message", {}).get("content") or ""
-                            # 切除非流式思考链小作文标签
-                            text_content = re.sub(r'<(thought|think)>.*?</\1>', '', text_content, flags=re.DOTALL).strip()
+                            text_content, _ = thought_guard.extract_nonstream_message_content(text_c.get("message", {}))
                             if text_content:
                                 text_preview = text_content[:200] + ("..." if len(text_content) > 200 else "")
                                 print(f"🩹 降级纯文本成功: 补发 {len(text_content)} 字符 | 上游usage: {usage_str} | 内容: {text_preview}", flush=True)
@@ -1902,7 +2089,7 @@ async def _stream_and_capture_inner(
             print(f"🩹 兜底结束: 发送保活 {keepalive_count} 次 | 总耗时 {fallback_duration:.2f}s", flush=True)
 
     # 兜底全部失败且未向客户端发出任何正文或工具调用时，在放行 [DONE] 之前发 SSE 错误帧
-    if (is_malformed or is_empty_reply) and not assistant_msg and not assistant_tool_calls:
+    if (is_malformed or is_empty_reply or is_intercepted_thought_leak) and not assistant_msg and not assistant_tool_calls:
         yield ('data: {"error":{"message":"上游暂时不可用，兜底未成功，请稍后重试","type":"fallback_failed","code":502}}\n\n').encode("utf-8")
         if held_done_bytes is None:
             held_done_bytes = b"data: [DONE]\n\n"
@@ -1912,7 +2099,7 @@ async def _stream_and_capture_inner(
         yield held_done_bytes
 
     # 兜底全部失败、无任何内容送达时，不调用记忆入库与后台落库，行为与上游 429 重试耗尽一致
-    if (is_malformed or is_empty_reply) and not assistant_msg and not assistant_tool_calls:
+    if (is_malformed or is_empty_reply or is_intercepted_thought_leak) and not assistant_msg and not assistant_tool_calls:
         if stream_state is not None:
             stream_state["terminal"] = False
             stream_state["completed"] = True
@@ -1954,15 +2141,18 @@ async def _stream_and_capture_inner(
             print(f"📊 {req_prefix}Stream Token: {pt} + {ct} = {tt}")
 
     if shared.conversation_persistence_enabled() and (user_message or tool_messages):
-        asyncio.create_task(
-            memory_pipeline.process_memories_background(session_id, user_message, assistant_msg, model,
-                                        context_messages=extraction_context_messages,
-                                        context_round_count=extraction_round_count,
-                                        skip_conversation_log=skip_conversation_log,
-                                        tool_messages=tool_messages, assistant_tool_calls=assistant_tool_calls,
-                                        assistant_reasoning=assistant_reasoning,
-                                        assistant_usage=stream_usage if stream_usage else None)
-        )
+        if is_thought_leak and not assistant_tool_calls and not is_intercepted_thought_leak:
+            print(f"🛑 {req_prefix}异常英文推理草稿已阻断落库，防止污染历史上下文", flush=True)
+        else:
+            asyncio.create_task(
+                memory_pipeline.process_memories_background(session_id, user_message, assistant_msg, model,
+                                            context_messages=extraction_context_messages,
+                                            context_round_count=extraction_round_count,
+                                            skip_conversation_log=skip_conversation_log,
+                                            tool_messages=tool_messages, assistant_tool_calls=assistant_tool_calls,
+                                            assistant_reasoning=assistant_reasoning,
+                                            assistant_usage=stream_usage if stream_usage else None)
+            )
 
     if stream_state is not None:
         stream_state["completed"] = True

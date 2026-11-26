@@ -819,7 +819,6 @@ _INTERNAL_MSG_KEYS = {
     "_source_message_id",
 }
 _WEEKDAY_SHORT = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-_MAX_HISTORY_PROACTIVE_EVENTS = 2
 
 
 def _strip_internal_fields(msg: dict, drop_tool_calls: bool = False) -> dict:
@@ -928,20 +927,20 @@ def merge_consecutive_assistant_messages(messages: list) -> list:
     return merged
 
 
-def _prepare_zone_messages(msgs: list, *, drop_tool_calls: bool = False, drop_empty_assistant: bool = False) -> list:
-    """清洗分区内消息：限定最近少量 proactive_event、加绝对场景头、剥离内部字段、合并连续 assistant。"""
-    event_indices = [
-        idx for idx, m in enumerate(msgs)
-        if isinstance(m, dict) and m.get("message_type") == "proactive_event"
-    ]
-    kept_event_indices = set(event_indices[-_MAX_HISTORY_PROACTIVE_EVENTS:])
-
+def _prepare_zone_messages(
+    msgs: list,
+    *,
+    drop_tool_calls: bool = False,
+    drop_empty_assistant: bool = False,
+    drop_proactive_events: bool = False,
+) -> list:
+    """清洗分区内消息：A区按需剥离 proactive_event/tool_calls，B区纯追加以保护前缀缓存，加绝对场景头、剥离内部字段、合并连续 assistant。"""
     cleaned = []
-    for idx, msg in enumerate(msgs):
+    for msg in msgs:
         if drop_tool_calls and msg.get("role") == "tool":
             continue
         msg_type = msg.get("message_type") or "normal"
-        if msg_type == "proactive_event" and idx not in kept_event_indices:
+        if drop_proactive_events and msg_type == "proactive_event":
             continue
         m = _strip_internal_fields(msg, drop_tool_calls=drop_tool_calls)
         if drop_empty_assistant and m.get("role") == "assistant":
@@ -1132,8 +1131,13 @@ async def build_partitioned_messages(
         result.append({"role": "user", "content": blocks})
         result.append({"role": "assistant", "content": "好的，我已了解之前的对话内容。"})
 
-    # A区：剥离tool消息和tool_calls，合并连续assistant后打BP
-    cleaned_a = _prepare_zone_messages(a_msgs, drop_tool_calls=True, drop_empty_assistant=True)
+    # A区：剥离tool消息、tool_calls与历史proactive_event手账，合并连续assistant后打BP
+    cleaned_a = _prepare_zone_messages(
+        a_msgs,
+        drop_tool_calls=True,
+        drop_empty_assistant=True,
+        drop_proactive_events=True,
+    )
 
     # A区：从末尾往前找第一条非tool消息打BP
     for j in range(len(cleaned_a) - 1, -1, -1):

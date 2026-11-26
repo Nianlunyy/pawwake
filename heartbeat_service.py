@@ -25,6 +25,7 @@ import httpx
 
 import partition_engine
 import shared
+import thought_guard
 from db import conversations as db_conversations
 from db import core as db_core
 from routes import chat as chat_routes
@@ -43,6 +44,8 @@ HEARTBEAT_BACKGROUND_TIMEOUT = float(os.getenv("HEARTBEAT_BACKGROUND_TIMEOUT", "
 MAX_TOOL_STEPS = 3
 TOOL_TIME_BUDGET_SECONDS = 60.0
 TOOL_STEP_PACING_SECONDS = float(os.getenv("HEARTBEAT_TOOL_STEP_PACING_SECONDS", "2.5"))
+THOUGHT_LEAK_MAX_RETRIES = 1
+THOUGHT_LEAK_COOLDOWN_SECONDS = float(os.getenv("HEARTBEAT_THOUGHT_LEAK_COOLDOWN_SECONDS", "3.0"))
 MIN_WAKE_MINUTES = 12
 MAX_WAKE_MINUTES = 720
 LONG_TERM_ALARM_LEAD_MINUTES = 45
@@ -1551,12 +1554,15 @@ async def _run_heartbeat_tick_locked(
     loop_messages = list(built_messages)
     tool_round = 0
     forced_wrap_up = False
+    thought_leak_retries = 0
+    retry_with_low_thinking = False
     tools_used: list[str] = []
     search_citations: dict[str, dict] = {}
     search_item_count = 0
     reasoning_parts: list[str] = []
     step_usages: list[dict] = []
     final_msg_obj: dict = {}
+    final_visible_content = ""
 
     async def _finalize_failed_tick():
         await _record_heartbeat_attempt_safe(session_id, gate["now_utc"])
@@ -1581,6 +1587,18 @@ async def _run_heartbeat_tick_locked(
 
         req_body = dict(base_req_body)
         req_body["messages"] = loop_messages
+        if retry_with_low_thinking:
+            retry_with_low_thinking = False
+            if (
+                isinstance(req_body.get("google"), dict)
+                and isinstance(req_body["google"].get("thinking_config"), dict)
+            ):
+                req_body["google"] = {
+                    "thinking_config": {
+                        "thinking_level": "low",
+                        "include_thoughts": True,
+                    }
+                }
         step_timeout = max(5.0, min(timeout_seconds, deadline_mono - time.monotonic()))
 
         try:
@@ -1626,13 +1644,58 @@ async def _run_heartbeat_tick_locked(
             )
 
         msg_obj = (resp_data.get("choices") or [{}])[0].get("message") or {}
-        step_reasoning = msg_obj.get("reasoning_content") or msg_obj.get("reasoning") or ""
+        visible_content, step_reasoning = thought_guard.extract_nonstream_message_content(msg_obj)
         if step_reasoning:
-            reasoning_parts.append(str(step_reasoning))
+            reasoning_parts.append(step_reasoning)
 
         tool_calls = msg_obj.get("tool_calls") or []
         if not tool_calls:
+            is_leaked_draft = bool(snapshot_tools) and thought_guard.is_leaked_tool_reasoning_draft(
+                visible_content,
+                declared_tools=snapshot_tools,
+                after_tool_result=(tool_round > 0),
+                is_heartbeat=True,
+            )
+            is_thought_only_drop = (
+                bool(snapshot_tools)
+                and tool_round > 0
+                and not visible_content
+                and bool(msg_obj.get("content"))
+                and bool(step_reasoning)
+            )
+            if is_leaked_draft or is_thought_only_drop:
+                leak_kind = "leaked_tool_reasoning" if is_leaked_draft else "thought_only_drop"
+                preview = (visible_content or step_reasoning)[:120].replace("\n", " ")
+                rem_after_step = deadline_mono - time.monotonic()
+                if (
+                    not forced_wrap_up
+                    and thought_leak_retries < THOUGHT_LEAK_MAX_RETRIES
+                    and rem_after_step > max(20.0, THOUGHT_LEAK_COOLDOWN_SECONDS + 12.0)
+                ):
+                    thought_leak_retries += 1
+                    retry_with_low_thinking = True
+                    print(
+                        f"🛡️ req={req_id} 自主唤醒检测到异常思考泄露 ({leak_kind}, round={tool_round})，"
+                        f"冷却 {THOUGHT_LEAK_COOLDOWN_SECONDS:.1f}s 后原前缀保守重试 ({thought_leak_retries}/{THOUGHT_LEAK_MAX_RETRIES}) | 片段: {preview!r}",
+                        flush=True,
+                    )
+                    if THOUGHT_LEAK_COOLDOWN_SECONDS > 0:
+                        await asyncio.sleep(THOUGHT_LEAK_COOLDOWN_SECONDS)
+                    continue
+                print(
+                    f"🛑 req={req_id} 自主唤醒拦截异常英文推理草稿 ({leak_kind}, round={tool_round})，静默熔断放弃本次推送（零落库）| 片段: {preview!r}",
+                    flush=True,
+                )
+                await _finalize_failed_tick()
+                return {
+                    "status": "aborted_thought_leak",
+                    "reason": leak_kind,
+                    "session_id": session_id,
+                    "tool_round": tool_round,
+                    "retries": thought_leak_retries,
+                }
             final_msg_obj = msg_obj
+            final_visible_content = visible_content
             break
 
         # 熔断硬拦截：已达步数上限 / 60s 安全阈值 / 强制收尾轮仍返回 tool_calls -> 绝不继续执行工具
@@ -1640,6 +1703,7 @@ async def _run_heartbeat_tick_locked(
         if forced_wrap_up or tool_round >= effective_max_tool_steps or elapsed_so_far >= TOOL_TIME_BUDGET_SECONDS:
             print(f"🛑 req={req_id} 自主唤醒工具调用触达熔断红线 (round={tool_round}, max={effective_max_tool_steps}, elapsed={elapsed_so_far:.1f}s)，代码层拦截 tool_calls")
             final_msg_obj = msg_obj
+            final_visible_content = visible_content
             break
 
         # 工具执行前确认主聊天未占线、会话基线未推进
@@ -1655,7 +1719,7 @@ async def _run_heartbeat_tick_locked(
 
         loop_messages.append({
             "role": "assistant",
-            "content": msg_obj.get("content") or "",
+            "content": visible_content,
             "tool_calls": tool_calls,
         })
 
@@ -1716,13 +1780,36 @@ async def _run_heartbeat_tick_locked(
             loop_messages[-1]["content"] = (loop_messages[-1].get("content") or "") + f"\n\n{TOOL_FORCE_WRAP_UP_NOTICE}"
             print(f"⏳ req={req_id} 触发工具探索优雅收尾提示 (round={tool_round}/{effective_max_tool_steps}, elapsed={elapsed_after_tools:.1f}s)")
 
-    raw_content = final_msg_obj.get("content") or ""
-    # 1. 先剥离思考标签，再解析 <next_wake> 隐式闹钟与 <topic> 话题标签、再分离 <event_capsule> 与常规微信正文
-    raw_without_thoughts = _THOUGHT_TAG_RE.sub("", raw_content).strip()
+    raw_without_thoughts = final_visible_content
+    # 1. 已剥离思考标记/多 part 思考块，再解析 <next_wake> 隐式闹钟与 <topic> 话题标签、再分离 <event_capsule> 与常规微信正文
     text_no_wake, next_wake_spec = parse_and_strip_next_wake(raw_without_thoughts)
     text_no_topic, explicit_topic = parse_and_strip_topic(text_no_wake)
     capsules, remaining_text = parse_event_capsules_and_chat(text_no_topic)
     cleaned_chat, chat_is_silent = _strip_thoughts_and_check_silent(remaining_text)
+    if (
+        not capsules
+        and cleaned_chat
+        and not chat_is_silent
+        and bool(snapshot_tools)
+        and thought_guard.is_leaked_tool_reasoning_draft(
+            cleaned_chat,
+            declared_tools=snapshot_tools,
+            after_tool_result=(tool_round > 0),
+            is_heartbeat=True,
+        )
+    ):
+        print(
+            f"🛑 req={req_id} 自主唤醒落库前兜底拦截异常英文推理草稿，静默放弃推送（零落库）",
+            flush=True,
+        )
+        await _finalize_failed_tick()
+        return {
+            "status": "aborted_thought_leak",
+            "reason": "post_parse_leaked_tool_reasoning",
+            "session_id": session_id,
+            "tool_round": tool_round,
+            "retries": thought_leak_retries,
+        }
     if final_msg_obj.get("tool_calls") and not capsules and chat_is_silent:
         print(f"🤫 req={req_id} 工具熔断后无有效正文或胶囊，静默收尾")
         await _record_heartbeat_attempt_safe(session_id, gate["now_utc"])
