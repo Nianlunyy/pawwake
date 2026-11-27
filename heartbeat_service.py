@@ -38,7 +38,7 @@ _active_background_tasks: set[asyncio.Task] = set()
 # 同步等待上限严格卡在 75s，远离 Cloudflare/Render 100s HTTP 超时线；
 # 后台异步模式（Worker Cron 使用 ?background=1）响应已在 <100ms 提前返回，允许更充裕的思考时间。
 HEARTBEAT_UPSTREAM_TIMEOUT = float(os.getenv("HEARTBEAT_UPSTREAM_TIMEOUT", "75.0"))
-HEARTBEAT_BACKGROUND_TIMEOUT = float(os.getenv("HEARTBEAT_BACKGROUND_TIMEOUT", "210.0"))
+HEARTBEAT_BACKGROUND_TIMEOUT = float(os.getenv("HEARTBEAT_BACKGROUND_TIMEOUT", "240.0"))
 
 # 二阶段/三阶段后台工具探索步数与耗时熔断阈值（不篡改顶层 tools，靠 tool_result 系统强提示优雅收尾）
 MAX_TOOL_STEPS = 3
@@ -54,8 +54,8 @@ def _resolve_tool_time_budget(timeout_seconds: float) -> float:
         return base_budget
     if timeout_seconds <= HEARTBEAT_UPSTREAM_TIMEOUT:
         return base_budget
-    # Background mode: allow generous multi-round tool calls while reserving >=60s for final reply
-    return min(150.0, max(base_budget, float(timeout_seconds) - 60.0))
+    # Background mode: allow generous multi-round tool calls while reserving >=90s for final reply
+    return min(150.0, max(base_budget, float(timeout_seconds) - 90.0))
 THOUGHT_LEAK_MAX_RETRIES = 1
 THOUGHT_LEAK_COOLDOWN_SECONDS = float(os.getenv("HEARTBEAT_THOUGHT_LEAK_COOLDOWN_SECONDS", "3.0"))
 MIN_WAKE_MINUTES = 12
@@ -1603,7 +1603,7 @@ async def _run_heartbeat_tick_locked(
 
         req_body = dict(base_req_body)
         req_body["messages"] = loop_messages
-        if retry_with_low_thinking:
+        if retry_with_low_thinking or forced_wrap_up:
             retry_with_low_thinking = False
             if (
                 isinstance(req_body.get("google"), dict)
@@ -1615,6 +1615,8 @@ async def _run_heartbeat_tick_locked(
                         "include_thoughts": True,
                     }
                 }
+            elif "reasoning_effort" in req_body:
+                req_body["reasoning_effort"] = "low"
         step_timeout = max(5.0, min(timeout_seconds, deadline_mono - time.monotonic()))
 
         try:
@@ -1629,12 +1631,12 @@ async def _run_heartbeat_tick_locked(
                     req_id=req_id,
                 )
         except httpx.TimeoutException as exc:
-            logger.warning("Heartbeat upstream timeout (%.1fs): %s", step_timeout, exc)
+            logger.warning("req=%s Heartbeat upstream timeout (%.1fs): %s", req_id, step_timeout, exc)
             await _finalize_failed_tick()
             return {"status": "upstream_timeout", "session_id": session_id}
 
         if response.status_code != 200:
-            logger.warning("Heartbeat upstream HTTP %s: %s", response.status_code, response.text[:300])
+            logger.warning("req=%s Heartbeat upstream HTTP %s: %s", req_id, response.status_code, response.text[:300])
             await _finalize_failed_tick()
             return {"status": "upstream_error", "code": response.status_code, "session_id": session_id}
 

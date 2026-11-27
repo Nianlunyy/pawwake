@@ -646,8 +646,8 @@ class HeartbeatPhase3Tests(unittest.TestCase):
         with patch.object(heartbeat_service, "TOOL_TIME_BUDGET_SECONDS", 60.0), \
              patch.object(heartbeat_service, "HEARTBEAT_UPSTREAM_TIMEOUT", 75.0):
             self.assertEqual(heartbeat_service._resolve_tool_time_budget(75.0), 60.0)
-            self.assertEqual(heartbeat_service._resolve_tool_time_budget(210.0), 150.0)
-            self.assertEqual(heartbeat_service._resolve_tool_time_budget(150.0), 90.0)
+            self.assertEqual(heartbeat_service._resolve_tool_time_budget(240.0), 150.0)
+            self.assertEqual(heartbeat_service._resolve_tool_time_budget(180.0), 90.0)
         with patch.object(heartbeat_service, "TOOL_TIME_BUDGET_SECONDS", 42.0):
             self.assertEqual(heartbeat_service._resolve_tool_time_budget(210.0), 42.0)
 
