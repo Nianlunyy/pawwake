@@ -1603,7 +1603,7 @@ async def _run_heartbeat_tick_locked(
 
         req_body = dict(base_req_body)
         req_body["messages"] = loop_messages
-        if retry_with_low_thinking or forced_wrap_up:
+        if retry_with_low_thinking:
             retry_with_low_thinking = False
             if (
                 isinstance(req_body.get("google"), dict)
@@ -1685,20 +1685,37 @@ async def _run_heartbeat_tick_locked(
                 leak_kind = "leaked_tool_reasoning" if is_leaked_draft else "thought_only_drop"
                 preview = (visible_content or step_reasoning)[:120].replace("\n", " ")
                 rem_after_step = deadline_mono - time.monotonic()
-                if (
-                    not forced_wrap_up
+                can_retry_leak = (
+                    (is_thought_only_drop or not forced_wrap_up)
                     and thought_leak_retries < THOUGHT_LEAK_MAX_RETRIES
                     and rem_after_step > max(20.0, THOUGHT_LEAK_COOLDOWN_SECONDS + 12.0)
-                ):
+                )
+                if can_retry_leak:
                     thought_leak_retries += 1
-                    retry_with_low_thinking = True
-                    print(
-                        f"🛡️ req={req_id} 自主唤醒检测到异常思考泄露 ({leak_kind}, round={tool_round})，"
-                        f"冷却 {THOUGHT_LEAK_COOLDOWN_SECONDS:.1f}s 后原前缀保守重试 ({thought_leak_retries}/{THOUGHT_LEAK_MAX_RETRIES}) | 片段: {preview!r}",
-                        flush=True,
-                    )
-                    if THOUGHT_LEAK_COOLDOWN_SECONDS > 0:
-                        await asyncio.sleep(THOUGHT_LEAK_COOLDOWN_SECONDS)
+                    if is_thought_only_drop and loop_messages:
+                        # 仅输出思考块未输出正文时，保留原 thinking_config 与前缀缓存，仅在末尾补充明示输出正文的提示
+                        drop_notice = (
+                            "\n\n[系统提示：你刚才仅输出了内部思考而未输出正文。"
+                            "请直接输出给用户的中文回复或 <event_capsule>，不要只输出思考内容。]"
+                        )
+                        last_msg = dict(loop_messages[-1])
+                        if isinstance(last_msg.get("content"), str) and drop_notice not in last_msg["content"]:
+                            last_msg["content"] = last_msg["content"] + drop_notice
+                            loop_messages[-1] = last_msg
+                        print(
+                            f"🛡️ req={req_id} 自主唤醒检测到空正文纯思考 ({leak_kind}, round={tool_round})，"
+                            f"保留缓存并在末条消息提示后重试 ({thought_leak_retries}/{THOUGHT_LEAK_MAX_RETRIES}) | 片段: {preview!r}",
+                            flush=True,
+                        )
+                    else:
+                        retry_with_low_thinking = True
+                        print(
+                            f"🛡️ req={req_id} 自主唤醒检测到异常思考泄露 ({leak_kind}, round={tool_round})，"
+                            f"冷却 {THOUGHT_LEAK_COOLDOWN_SECONDS:.1f}s 后原前缀保守重试 ({thought_leak_retries}/{THOUGHT_LEAK_MAX_RETRIES}) | 片段: {preview!r}",
+                            flush=True,
+                        )
+                        if THOUGHT_LEAK_COOLDOWN_SECONDS > 0:
+                            await asyncio.sleep(THOUGHT_LEAK_COOLDOWN_SECONDS)
                     continue
                 print(
                     f"🛑 req={req_id} 自主唤醒拦截异常英文推理草稿 ({leak_kind}, round={tool_round})，静默熔断放弃本次推送（零落库）| 片段: {preview!r}",

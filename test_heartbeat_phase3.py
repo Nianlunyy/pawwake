@@ -793,6 +793,87 @@ class HeartbeatPhase3Tests(unittest.TestCase):
 
         asyncio.run(run_all())
 
+    def test_thought_only_drop_rescued_even_during_forced_wrap_up(self):
+        async def run_all():
+            now = datetime(2026, 4, 6, 6, 0, tzinfo=timezone.utc)
+            stats_due = {
+                "last_normal_at": now - timedelta(hours=3),
+                "last_user_content": "在干嘛",
+                "unread_proactive_chat": 0,
+                "unread_proactive_event": 0,
+                "latest_id": 10,
+                "pending_alarm": None,
+            }
+            snapshot = {
+                "model": "google/gemini-4-carbon",
+                "thinking_level": "high",
+                "tools": [{"type": "function", "function": {"name": "search_web", "parameters": {"type": "object"}}}],
+            }
+            db_rows = [{"id": 10, "role": "user", "content": "在干嘛", "created_at": now - timedelta(hours=3)}]
+            calls = []
+
+            async def fake_post(client, base_url, api_key, req_body, **kwargs):
+                calls.append(req_body)
+                if len(calls) == 1:
+                    return FakeResponse(200, {
+                        "choices": [{
+                            "message": {
+                                "content": "",
+                                "tool_calls": [{"id": "tc_1", "function": {"name": "search_web", "arguments": "{}"}}],
+                            }
+                        }]
+                    })
+                if len(calls) == 2:
+                    # Model returns <think>...</think> only with empty visible text during forced_wrap_up
+                    return FakeResponse(200, {
+                        "choices": [{
+                            "message": {
+                                "content": "<think>**My Midday Plan** Alright, let me check.</think>",
+                            }
+                        }]
+                    })
+                return FakeResponse(200, {
+                    "choices": [{"message": {"content": "刚忙完过来看看你~"}}]
+                })
+
+            from contextlib import ExitStack
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(shared, "DATABASE_ENABLED", True))
+                stack.enter_context(patch.object(shared, "HEARTBEAT_ENABLED", True))
+                stack.enter_context(patch.object(shared, "HEARTBEAT_SESSION_ID", "s1"))
+                stack.enter_context(patch.object(shared, "API_KEY", "k"))
+                stack.enter_context(patch.object(shared, "HEARTBEAT_SURF_DAILY_LIMIT", 0))
+                stack.enter_context(patch.object(shared, "CACHE_PARTITION_ENABLED", False))
+                stack.enter_context(patch.object(shared, "is_vertex_endpoint", return_value=True))
+                stack.enter_context(patch.object(shared, "get_system_prompt", new=AsyncMock(return_value="人设")))
+                stack.enter_context(patch.object(db_conversations, "get_heartbeat_session_stats", new=AsyncMock(return_value=stats_due)))
+                stack.enter_context(patch.object(db_conversations, "get_session_envelope_snapshot", new=AsyncMock(return_value=snapshot)))
+                stack.enter_context(patch.object(db_conversations, "get_partition_conversation_messages", new=AsyncMock(return_value=(db_rows, None, 0, False))))
+                stack.enter_context(patch.object(db_conversations, "get_latest_message_meta", new=AsyncMock(return_value={"id": 10})))
+                stack.enter_context(patch.object(db_conversations, "get_active_proactive_topics", new=AsyncMock(return_value=[])))
+                mock_save = stack.enter_context(patch.object(db_conversations, "save_message", new=AsyncMock(return_value=601)))
+                stack.enter_context(patch.object(db_conversations, "record_heartbeat_attempt", new=AsyncMock()))
+                stack.enter_context(patch.object(db_conversations, "upsert_proactive_topic", new=AsyncMock()))
+                stack.enter_context(patch.object(heartbeat_service, "TOOL_STEP_PACING_SECONDS", 0.0))
+                stack.enter_context(patch.object(heartbeat_service, "THOUGHT_LEAK_COOLDOWN_SECONDS", 0.0))
+                stack.enter_context(patch.object(heartbeat_service, "fetch_local_weather", new=AsyncMock(return_value="")))
+                stack.enter_context(patch.object(heartbeat_service, "execute_background_tool_call", new=AsyncMock(return_value='{"ok": true}')))
+                stack.enter_context(patch.object(shared, "post_chat_completion", side_effect=fake_post))
+                res = await heartbeat_service.run_heartbeat_tick(
+                    now_utc=now,
+                    jitter_fn=lambda: 1.0,
+                    timeout_seconds=240.0,
+                )
+                self.assertEqual(res["status"], "delivered")
+                self.assertEqual(len(calls), 3)
+                mock_save.assert_awaited_once()
+                # thinking_config kept intact to preserve prefix cache
+                self.assertEqual(calls[1]["google"]["thinking_config"]["thinking_level"], "high")
+                self.assertEqual(calls[2]["google"]["thinking_config"]["thinking_level"], "high")
+                self.assertIn("仅输出了内部思考", calls[2]["messages"][-1]["content"])
+
+        asyncio.run(run_all())
+
 
 if __name__ == "__main__":
     unittest.main()
