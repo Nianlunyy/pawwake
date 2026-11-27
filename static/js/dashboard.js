@@ -2832,7 +2832,10 @@ async function loadHeartbeatStatus() {
             return;
         }
         const sid = data.session_id || '(未锁定)';
-        const gateText = data.gate_status || (data.enabled ? 'unknown' : 'skipped_disabled');
+        let gateText = data.gate_status || (data.enabled ? 'unknown' : 'skipped_disabled');
+        if (gateText === 'skipped_cooldown' && data.elapsed_minutes != null && data.required_minutes != null) {
+            gateText = `${gateText} (已冷却 ${data.elapsed_minutes}/${data.required_minutes} 分钟)`;
+        }
         gateEl.textContent = `${gateText} · 会话: ${sid}`;
 
         const unreadChat = data.unread_proactive_chat ?? 0;

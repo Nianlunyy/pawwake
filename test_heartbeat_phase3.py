@@ -642,6 +642,39 @@ class HeartbeatPhase3Tests(unittest.TestCase):
 
         asyncio.run(run_all())
 
+    def test_tool_time_budget_scales_for_background_mode(self):
+        with patch.object(heartbeat_service, "TOOL_TIME_BUDGET_SECONDS", 60.0), \
+             patch.object(heartbeat_service, "HEARTBEAT_UPSTREAM_TIMEOUT", 75.0):
+            self.assertEqual(heartbeat_service._resolve_tool_time_budget(75.0), 60.0)
+            self.assertEqual(heartbeat_service._resolve_tool_time_budget(210.0), 150.0)
+            self.assertEqual(heartbeat_service._resolve_tool_time_budget(150.0), 90.0)
+        with patch.object(heartbeat_service, "TOOL_TIME_BUDGET_SECONDS", 42.0):
+            self.assertEqual(heartbeat_service._resolve_tool_time_budget(210.0), 42.0)
+
+    def test_heartbeat_status_exposes_cooldown_fields(self):
+        async def run_all():
+            from routes import heartbeat as hb_routes
+            fake_gate = {
+                "allowed": False,
+                "status": "skipped_cooldown",
+                "elapsed_minutes": 18.5,
+                "required_minutes": 45.0,
+                "context_kind": "normal",
+                "stats": {"unread_proactive_chat": 0, "unread_proactive_event": 0},
+            }
+            with patch.object(shared, "DATABASE_ENABLED", False), \
+                 patch.object(shared, "HEARTBEAT_ENABLED", True), \
+                 patch.object(heartbeat_service, "resolve_target_session_id", new=AsyncMock(return_value="s1")), \
+                 patch.object(heartbeat_service, "evaluate_heartbeat_gate", new=AsyncMock(return_value=fake_gate)), \
+                 patch.object(heartbeat_service, "get_effective_tool_config", new=AsyncMock(return_value={})):
+                res = await hb_routes.api_heartbeat_status()
+                self.assertEqual(res["gate_status"], "skipped_cooldown")
+                self.assertEqual(res["elapsed_minutes"], 18.5)
+                self.assertEqual(res["required_minutes"], 45.0)
+                self.assertEqual(res["cooldown_context"], "normal")
+
+        asyncio.run(run_all())
+
 
 if __name__ == "__main__":
     unittest.main()

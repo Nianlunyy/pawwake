@@ -38,12 +38,24 @@ _active_background_tasks: set[asyncio.Task] = set()
 # 同步等待上限严格卡在 75s，远离 Cloudflare/Render 100s HTTP 超时线；
 # 后台异步模式（Worker Cron 使用 ?background=1）响应已在 <100ms 提前返回，允许更充裕的思考时间。
 HEARTBEAT_UPSTREAM_TIMEOUT = float(os.getenv("HEARTBEAT_UPSTREAM_TIMEOUT", "75.0"))
-HEARTBEAT_BACKGROUND_TIMEOUT = float(os.getenv("HEARTBEAT_BACKGROUND_TIMEOUT", "150.0"))
+HEARTBEAT_BACKGROUND_TIMEOUT = float(os.getenv("HEARTBEAT_BACKGROUND_TIMEOUT", "210.0"))
 
 # 二阶段/三阶段后台工具探索步数与耗时熔断阈值（不篡改顶层 tools，靠 tool_result 系统强提示优雅收尾）
 MAX_TOOL_STEPS = 3
-TOOL_TIME_BUDGET_SECONDS = 60.0
+TOOL_TIME_BUDGET_SECONDS = float(os.getenv("HEARTBEAT_TOOL_TIME_BUDGET_SECONDS", "60.0"))
 TOOL_STEP_PACING_SECONDS = float(os.getenv("HEARTBEAT_TOOL_STEP_PACING_SECONDS", "2.5"))
+
+
+def _resolve_tool_time_budget(timeout_seconds: float) -> float:
+    """Resolve effective tool-loop time budget based on sync vs background timeout."""
+    base_budget = float(TOOL_TIME_BUDGET_SECONDS)
+    # Honor explicit env override or test monkeypatch when changed from default 60s
+    if abs(base_budget - 60.0) > 1e-6:
+        return base_budget
+    if timeout_seconds <= HEARTBEAT_UPSTREAM_TIMEOUT:
+        return base_budget
+    # Background mode: allow generous multi-round tool calls while reserving >=60s for final reply
+    return min(150.0, max(base_budget, float(timeout_seconds) - 60.0))
 THOUGHT_LEAK_MAX_RETRIES = 1
 THOUGHT_LEAK_COOLDOWN_SECONDS = float(os.getenv("HEARTBEAT_THOUGHT_LEAK_COOLDOWN_SECONDS", "3.0"))
 MIN_WAKE_MINUTES = 12
@@ -1551,6 +1563,7 @@ async def _run_heartbeat_tick_locked(
 
     tick_start = time.monotonic()
     deadline_mono = tick_start + timeout_seconds
+    effective_tool_time_budget = _resolve_tool_time_budget(timeout_seconds)
     loop_messages = list(built_messages)
     tool_round = 0
     forced_wrap_up = False
@@ -1698,10 +1711,13 @@ async def _run_heartbeat_tick_locked(
             final_visible_content = visible_content
             break
 
-        # 熔断硬拦截：已达步数上限 / 60s 安全阈值 / 强制收尾轮仍返回 tool_calls -> 绝不继续执行工具
+        # 熔断硬拦截：已达步数上限 / 安全耗时预算 / 强制收尾轮仍返回 tool_calls -> 绝不继续执行工具
         elapsed_so_far = time.monotonic() - tick_start
-        if forced_wrap_up or tool_round >= effective_max_tool_steps or elapsed_so_far >= TOOL_TIME_BUDGET_SECONDS:
-            print(f"🛑 req={req_id} 自主唤醒工具调用触达熔断红线 (round={tool_round}, max={effective_max_tool_steps}, elapsed={elapsed_so_far:.1f}s)，代码层拦截 tool_calls")
+        if forced_wrap_up or tool_round >= effective_max_tool_steps or elapsed_so_far >= effective_tool_time_budget:
+            print(
+                f"🛑 req={req_id} 自主唤醒工具调用触达熔断红线 "
+                f"(round={tool_round}, max={effective_max_tool_steps}, elapsed={elapsed_so_far:.1f}s, budget={effective_tool_time_budget:.0f}s)，代码层拦截 tool_calls"
+            )
             final_msg_obj = msg_obj
             final_visible_content = visible_content
             break
@@ -1730,7 +1746,7 @@ async def _run_heartbeat_tick_locked(
                 tools_used.append(tc_name)
                 if _is_community_or_external_tool(tc_name, tool_config):
                     round_used_community_tool = True
-            rem_tool_budget = max(5.0, min(20.0, TOOL_TIME_BUDGET_SECONDS - (time.monotonic() - tick_start)))
+            rem_tool_budget = max(5.0, min(20.0, effective_tool_time_budget - (time.monotonic() - tick_start)))
             if tc_name in ("search_web", "tavily_search"):
                 remaining_search_budget = max(0, heartbeat_search_turn_budget - search_item_count)
                 if remaining_search_budget <= 0:
@@ -1775,7 +1791,7 @@ async def _run_heartbeat_tick_locked(
                 loop_messages[-1]["content"] = cur_tool_content + f"\n\n{TONE_SANITIZER_NOTICE}"
 
         elapsed_after_tools = time.monotonic() - tick_start
-        if tool_round >= effective_max_tool_steps or elapsed_after_tools >= TOOL_TIME_BUDGET_SECONDS:
+        if tool_round >= effective_max_tool_steps or elapsed_after_tools >= effective_tool_time_budget:
             forced_wrap_up = True
             loop_messages[-1]["content"] = (loop_messages[-1].get("content") or "") + f"\n\n{TOOL_FORCE_WRAP_UP_NOTICE}"
             print(f"⏳ req={req_id} 触发工具探索优雅收尾提示 (round={tool_round}/{effective_max_tool_steps}, elapsed={elapsed_after_tools:.1f}s)")
