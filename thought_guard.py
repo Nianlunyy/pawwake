@@ -155,12 +155,12 @@ def extract_nonstream_message_content(msg_obj: dict | None) -> tuple[str, str]:
                     text_val = part.get("content")
                 if not isinstance(text_val, str) or not text_val:
                     continue
-                if is_thinking_part(part):
+                if is_thinking_part(part) and not _THOUGHT_TAG_RE.search(text_val):
                     reasoning_parts.append(text_val.strip())
                 else:
                     visible_parts.append(text_val)
     elif isinstance(raw_content, str) and raw_content:
-        if is_thinking_part(msg_obj):
+        if is_thinking_part(msg_obj) and not _THOUGHT_TAG_RE.search(raw_content):
             reasoning_parts.append(raw_content.strip())
         else:
             visible_parts.append(raw_content)

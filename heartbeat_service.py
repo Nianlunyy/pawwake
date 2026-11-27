@@ -1661,7 +1661,9 @@ async def _run_heartbeat_tick_locked(
                 )
             )
 
-        msg_obj = (resp_data.get("choices") or [{}])[0].get("message") or {}
+        first_choice = (resp_data.get("choices") or [{}])[0]
+        msg_obj = first_choice.get("message") or {}
+        step_finish_reason = first_choice.get("finish_reason")
         visible_content, step_reasoning = thought_guard.extract_nonstream_message_content(msg_obj)
         if step_reasoning:
             reasoning_parts.append(step_reasoning)
@@ -1684,6 +1686,11 @@ async def _run_heartbeat_tick_locked(
             if is_leaked_draft or is_thought_only_drop:
                 leak_kind = "leaked_tool_reasoning" if is_leaked_draft else "thought_only_drop"
                 preview = (visible_content or step_reasoning)[:120].replace("\n", " ")
+                raw_c_str = msg_obj.get("content") if isinstance(msg_obj.get("content"), str) else ""
+                diag_info = (
+                    f"finish={step_finish_reason}, keys={list(msg_obj.keys())}, "
+                    f"content_len={len(raw_c_str)}, has_close_think={'</think>' in raw_c_str.lower() or '</thought>' in raw_c_str.lower()}"
+                )
                 rem_after_step = deadline_mono - time.monotonic()
                 can_retry_leak = (
                     (is_thought_only_drop or not forced_wrap_up)
@@ -1703,14 +1710,14 @@ async def _run_heartbeat_tick_locked(
                             last_msg["content"] = last_msg["content"] + drop_notice
                             loop_messages[-1] = last_msg
                         print(
-                            f"🛡️ req={req_id} 自主唤醒检测到空正文纯思考 ({leak_kind}, round={tool_round})，"
+                            f"🛡️ req={req_id} 自主唤醒检测到空正文纯思考 ({leak_kind}, round={tool_round}, {diag_info})，"
                             f"保留缓存并在末条消息提示后重试 ({thought_leak_retries}/{THOUGHT_LEAK_MAX_RETRIES}) | 片段: {preview!r}",
                             flush=True,
                         )
                     else:
                         retry_with_low_thinking = True
                         print(
-                            f"🛡️ req={req_id} 自主唤醒检测到异常思考泄露 ({leak_kind}, round={tool_round})，"
+                            f"🛡️ req={req_id} 自主唤醒检测到异常思考泄露 ({leak_kind}, round={tool_round}, {diag_info})，"
                             f"冷却 {THOUGHT_LEAK_COOLDOWN_SECONDS:.1f}s 后原前缀保守重试 ({thought_leak_retries}/{THOUGHT_LEAK_MAX_RETRIES}) | 片段: {preview!r}",
                             flush=True,
                         )
@@ -1718,7 +1725,7 @@ async def _run_heartbeat_tick_locked(
                             await asyncio.sleep(THOUGHT_LEAK_COOLDOWN_SECONDS)
                     continue
                 print(
-                    f"🛑 req={req_id} 自主唤醒拦截异常英文推理草稿 ({leak_kind}, round={tool_round})，静默熔断放弃本次推送（零落库）| 片段: {preview!r}",
+                    f"🛑 req={req_id} 自主唤醒拦截异常英文推理草稿 ({leak_kind}, round={tool_round}, {diag_info})，静默熔断放弃本次推送（零落库）| 片段: {preview!r}",
                     flush=True,
                 )
                 await _finalize_failed_tick()

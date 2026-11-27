@@ -96,6 +96,32 @@ class ThoughtGuardUnitTests(unittest.TestCase):
         self.assertEqual(vis4, "")
         self.assertIn("Unclosed internal reasoning", rsn4)
 
+        # Case 5: Vertex/Gemini non-stream gateway merges <think>...</think> + Chinese reply
+        # into a single message string while still carrying extra_content.google.thought=True
+        msg5 = {
+            "role": "assistant",
+            "content": "<think> **My Internal Monologue** Alright, let's reply. </think>\n\n阿狸中午好呀，吃过饭了吗？",
+            "extra_content": {"google": {"thought": True}},
+        }
+        vis5, rsn5 = thought_guard.extract_nonstream_message_content(msg5)
+        self.assertEqual(vis5, "阿狸中午好呀，吃过饭了吗？")
+        self.assertEqual(rsn5, "**My Internal Monologue** Alright, let's reply.")
+
+        # Case 6: Same merged <think>...</think> + reply inside a multipart text dict with extra_content
+        msg6 = {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "<think>Internal plan</think>下午记得喝水哦",
+                    "extra_content": {"google": {"thought": True}},
+                }
+            ],
+        }
+        vis6, rsn6 = thought_guard.extract_nonstream_message_content(msg6)
+        self.assertEqual(vis6, "下午记得喝水哦")
+        self.assertEqual(rsn6, "Internal plan")
+
     def test_detects_leaked_english_tool_reasoning_drafts(self):
         # Exact 14:25 incident
         self.assertTrue(
