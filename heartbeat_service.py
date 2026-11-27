@@ -653,6 +653,9 @@ async def evaluate_heartbeat_gate(
 
     if not effective_has_due_alarm:
         ctx_mult, ctx_kind = classify_user_context_multiplier(stats.get("last_user_content", ""))
+        # 睡前结束语(closing)仅在互动后 3 小时内有效，避免隔夜唤醒失败后继续被昨晚的“晚安”拉长冷却
+        if ctx_kind == "closing" and interaction_gap_minutes >= 180.0:
+            ctx_mult, ctx_kind = 1.0, "normal"
         step_mult = unread_backoff_multiplier(unread_chat)
         jitter = float(jitter_fn()) if jitter_fn else random.uniform(0.85, 1.15)
         base_min = max(1, int(shared.HEARTBEAT_BASE_COOLDOWN_MINUTES))
@@ -1711,9 +1714,16 @@ async def _run_heartbeat_tick_locked(
             final_visible_content = visible_content
             break
 
-        # 熔断硬拦截：已达步数上限 / 安全耗时预算 / 强制收尾轮仍返回 tool_calls -> 绝不继续执行工具
+        # 熔断与优雅收尾：
+        # 1. 若尚未发出强制收尾提示、且仍有充足剩余总预算(>15s)，不直接执行新工具，而是回填截断提示让模型最后收尾输出一次
+        # 2. 若已处于强制收尾轮仍返回 tool_calls，或剩余总预算不足，则硬拦截绝不继续
         elapsed_so_far = time.monotonic() - tick_start
-        if forced_wrap_up or tool_round >= effective_max_tool_steps or elapsed_so_far >= effective_tool_time_budget:
+        rem_total_budget = deadline_mono - time.monotonic()
+        hit_budget_or_steps = (
+            tool_round >= effective_max_tool_steps
+            or elapsed_so_far >= effective_tool_time_budget
+        )
+        if forced_wrap_up or (hit_budget_or_steps and rem_total_budget <= 15.0):
             print(
                 f"🛑 req={req_id} 自主唤醒工具调用触达熔断红线 "
                 f"(round={tool_round}, max={effective_max_tool_steps}, elapsed={elapsed_so_far:.1f}s, budget={effective_tool_time_budget:.0f}s)，代码层拦截 tool_calls"
@@ -1721,6 +1731,28 @@ async def _run_heartbeat_tick_locked(
             final_msg_obj = msg_obj
             final_visible_content = visible_content
             break
+        if hit_budget_or_steps:
+            forced_wrap_up = True
+            loop_messages.append({
+                "role": "assistant",
+                "content": visible_content,
+                "tool_calls": tool_calls,
+            })
+            abort_notice_payload = json.dumps(
+                {"ok": False, "notice": TOOL_FORCE_WRAP_UP_NOTICE},
+                ensure_ascii=False,
+            )
+            for tc in tool_calls:
+                loop_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id") or f"hb_tc_{len(loop_messages)}",
+                    "content": abort_notice_payload,
+                })
+            print(
+                f"⏳ req={req_id} 自主唤醒触达时间/步数上限 (round={tool_round}, elapsed={elapsed_so_far:.1f}s/{effective_tool_time_budget:.0f}s)，"
+                f"跳过本轮工具并强制要求收尾输出（剩余 {rem_total_budget:.1f}s）"
+            )
+            continue
 
         # 工具执行前确认主聊天未占线、会话基线未推进
         if chat_routes.is_session_chat_busy(session_id):

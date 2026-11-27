@@ -675,6 +675,124 @@ class HeartbeatPhase3Tests(unittest.TestCase):
 
         asyncio.run(run_all())
 
+    def test_stale_closing_multiplier_expires_after_three_hours(self):
+        async def run_all():
+            now = datetime(2026, 4, 6, 10, 0, tzinfo=timezone.utc)  # 18:00 local
+            # 1 hour ago -> closing 2.2x applies (45 * 2.2 = 99m > 60m -> skipped_cooldown)
+            stats_recent = {
+                "last_normal_at": now - timedelta(hours=1),
+                "last_user_content": "晚安啦去睡了",
+                "unread_proactive_chat": 0,
+                "unread_proactive_event": 0,
+                "latest_id": 10,
+                "pending_alarm": None,
+            }
+            # 7 hours ago (last user msg at night), failed proactive attempt 1 hour ago -> closing expired -> 1.0x (45m < 60m -> allowed)
+            stats_overnight = {
+                "last_normal_at": now - timedelta(hours=7),
+                "last_proactive_at": now - timedelta(hours=1),
+                "last_user_content": "晚安啦去睡了",
+                "unread_proactive_chat": 0,
+                "unread_proactive_event": 0,
+                "latest_id": 10,
+                "pending_alarm": None,
+            }
+            with patch.object(shared, "DATABASE_ENABLED", True), \
+                 patch.object(shared, "HEARTBEAT_ENABLED", True), \
+                 patch.object(shared, "API_KEY", "k"), \
+                 patch.object(shared, "HEARTBEAT_BASE_COOLDOWN_MINUTES", 45), \
+                 patch.object(shared, "HEARTBEAT_QUIET_START", "00:00"), \
+                 patch.object(shared, "HEARTBEAT_QUIET_END", "08:00"), \
+                 patch.object(heartbeat_service.chat_routes, "is_session_chat_busy", return_value=False):
+                with patch.object(db_conversations, "get_heartbeat_session_stats", new=AsyncMock(return_value=stats_recent)):
+                    g1 = await heartbeat_service.evaluate_heartbeat_gate("s1", now_utc=now, jitter_fn=lambda: 1.0)
+                    self.assertFalse(g1["allowed"])
+                    self.assertEqual(g1["context_kind"], "closing")
+                with patch.object(db_conversations, "get_heartbeat_session_stats", new=AsyncMock(return_value=stats_overnight)):
+                    g2 = await heartbeat_service.evaluate_heartbeat_gate("s1", now_utc=now, jitter_fn=lambda: 1.0)
+                    self.assertTrue(g2["allowed"])
+                    self.assertEqual(g2["context_kind"], "normal")
+
+        asyncio.run(run_all())
+
+    def test_budget_hit_gives_graceful_wrap_up_chance_before_circuit_breaker(self):
+        async def run_all():
+            now = datetime(2026, 4, 6, 6, 0, tzinfo=timezone.utc)
+            stats_due = {
+                "last_normal_at": now - timedelta(hours=3),
+                "last_user_content": "在干嘛",
+                "unread_proactive_chat": 0,
+                "unread_proactive_event": 0,
+                "latest_id": 10,
+                "pending_alarm": None,
+            }
+            snapshot = {
+                "model": "google/gemini-3.5-flash",
+                "tools": [{"type": "function", "function": {"name": "search_web", "parameters": {"type": "object"}}}],
+            }
+            db_rows = [{"id": 10, "role": "user", "content": "在干嘛", "created_at": now - timedelta(hours=3)}]
+            calls = []
+            real_mono = heartbeat_service.time.monotonic
+            mono_state = {"offset": 0.0}
+
+            def fake_monotonic():
+                return real_mono() + mono_state["offset"]
+
+            async def fake_post(client, base_url, api_key, req_body, **kwargs):
+                calls.append(req_body)
+                if len(calls) == 1:
+                    # Simulate round 0 taking 155s (> 150s background tool budget, well within 210s total timeout)
+                    mono_state["offset"] += 155.0
+                    return FakeResponse(200, {
+                        "choices": [{
+                            "message": {
+                                "content": "",
+                                "tool_calls": [{"id": "tc_late", "function": {"name": "search_web", "arguments": "{}"}}],
+                            }
+                        }]
+                    })
+                return FakeResponse(200, {
+                    "choices": [{"message": {"content": "刚查完资料，跟你说一声~"}}]
+                })
+
+            from contextlib import ExitStack
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(shared, "DATABASE_ENABLED", True))
+                stack.enter_context(patch.object(shared, "HEARTBEAT_ENABLED", True))
+                stack.enter_context(patch.object(shared, "HEARTBEAT_SESSION_ID", "s1"))
+                stack.enter_context(patch.object(shared, "API_KEY", "k"))
+                stack.enter_context(patch.object(shared, "CACHE_PARTITION_ENABLED", False))
+                stack.enter_context(patch.object(shared, "is_vertex_endpoint", return_value=False))
+                stack.enter_context(patch.object(shared, "get_system_prompt", new=AsyncMock(return_value="人设")))
+                stack.enter_context(patch.object(db_conversations, "get_heartbeat_session_stats", new=AsyncMock(return_value=stats_due)))
+                stack.enter_context(patch.object(db_conversations, "get_session_envelope_snapshot", new=AsyncMock(return_value=snapshot)))
+                stack.enter_context(patch.object(db_conversations, "get_partition_conversation_messages", new=AsyncMock(return_value=(db_rows, None, 0, False))))
+                stack.enter_context(patch.object(db_conversations, "get_latest_message_meta", new=AsyncMock(return_value={"id": 10})))
+                stack.enter_context(patch.object(db_conversations, "get_active_proactive_topics", new=AsyncMock(return_value=[])))
+                mock_save = stack.enter_context(patch.object(db_conversations, "save_message", new=AsyncMock(return_value=501)))
+                stack.enter_context(patch.object(db_conversations, "record_heartbeat_attempt", new=AsyncMock()))
+                stack.enter_context(patch.object(db_conversations, "upsert_proactive_topic", new=AsyncMock()))
+                stack.enter_context(patch.object(heartbeat_service, "TOOL_TIME_BUDGET_SECONDS", 60.0))
+                stack.enter_context(patch.object(heartbeat_service, "TOOL_STEP_PACING_SECONDS", 0.0))
+                stack.enter_context(patch.object(heartbeat_service, "fetch_local_weather", new=AsyncMock(return_value="")))
+                mock_exec_tool = stack.enter_context(patch.object(heartbeat_service, "execute_background_tool_call", new=AsyncMock()))
+                stack.enter_context(patch.object(heartbeat_service.time, "monotonic", side_effect=fake_monotonic))
+                stack.enter_context(patch.object(shared, "post_chat_completion", side_effect=fake_post))
+                res = await heartbeat_service.run_heartbeat_tick(
+                    now_utc=now,
+                    jitter_fn=lambda: 1.0,
+                    timeout_seconds=210.0,
+                )
+                self.assertEqual(res["status"], "delivered")
+                self.assertEqual(len(calls), 2)
+                mock_exec_tool.assert_not_awaited()
+                mock_save.assert_awaited_once()
+                last_msg = calls[1]["messages"][-1]
+                self.assertEqual(last_msg["role"], "tool")
+                self.assertIn("已达步数/时间安全上限", last_msg["content"])
+
+        asyncio.run(run_all())
+
 
 if __name__ == "__main__":
     unittest.main()
